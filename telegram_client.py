@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -141,11 +142,18 @@ def ai_number(
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} в {AI_CONFIG_PATH.name} должен быть числом")
     result = float(value)
-    if not minimum <= result <= maximum:
+    if not math.isfinite(result) or not minimum <= result <= maximum:
         raise ValueError(
             f"{key} в {AI_CONFIG_PATH.name} должен быть от {minimum:g} до {maximum:g}"
         )
     return result
+
+
+def ai_positive_int(settings: Mapping[str, Any], key: str, default: int) -> int:
+    value = settings.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 4000:
+        raise ValueError(f"{key} в {AI_CONFIG_PATH.name} должен быть целым числом от 1 до 4000")
+    return value
 
 
 def load_ai_config() -> AIConfig:
@@ -170,8 +178,8 @@ def load_ai_config() -> AIConfig:
         "system_prompt",
     )
     temperature = ai_number(settings, "temperature", 0.7, 0, 2)
-    max_output_tokens = int(
-        ai_number(settings, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS, 1, 4000)
+    max_output_tokens = ai_positive_int(
+        settings, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS
     )
 
     if not api_key:

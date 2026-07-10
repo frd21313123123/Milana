@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from telegram_client import load_ai_settings, split_telegram_text
+from telegram_client import ai_positive_int, load_ai_settings, split_telegram_text
 
 
 class SplitTelegramTextTests(unittest.TestCase):
@@ -33,6 +33,10 @@ class SplitTelegramTextTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "JSON-объект"):
                 load_ai_settings(path)
+
+    def test_max_output_tokens_must_be_an_integer(self) -> None:
+        with self.assertRaisesRegex(ValueError, "целым числом"):
+            ai_positive_int({"max_output_tokens": 1.5}, "max_output_tokens", 1200)
 
 
 if __name__ == "__main__":
