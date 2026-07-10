@@ -14,6 +14,14 @@ from openai import AsyncOpenAI, OpenAIError
 from telethon import TelegramClient, events, functions, utils
 from telethon.errors import FloodWaitError, RPCError
 
+from milana_schedule import (
+    DAY_KEYS,
+    build_schedule_prompt,
+    format_current_status,
+    format_day_schedule,
+    load_routine,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -149,6 +157,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Отвечать через OpenAI на все входящие текстовые сообщения",
     )
 
+    schedule = subparsers.add_parser(
+        "schedule",
+        help="Показать текущее состояние расписания Миланы",
+    )
+    schedule.add_argument(
+        "--brief",
+        action="store_true",
+        help="Вывести текущее состояние одной строкой",
+    )
+    schedule.add_argument(
+        "--day",
+        choices=DAY_KEYS,
+        help="Показать расписание выбранного дня (mon–sun)",
+    )
+
     return parser
 
 
@@ -275,6 +298,7 @@ def split_telegram_text(text: str, limit: int = 4000) -> list[str]:
 
 async def run_ai_bot(client: TelegramClient) -> None:
     config = load_ai_config()
+    routine = load_routine()
     openai_client = AsyncOpenAI(api_key=config.api_key)
     me = await client.get_me()
     response_lock = asyncio.Lock()
@@ -322,7 +346,10 @@ async def run_ai_bot(client: TelegramClient) -> None:
                 async with client.action(action_target, "typing"):
                     response = await openai_client.responses.create(
                         model=config.model,
-                        instructions=config.instructions,
+                        instructions=(
+                            f"{config.instructions}\n\n"
+                            f"{build_schedule_prompt(routine)}"
+                        ),
                         input=text,
                         max_output_tokens=1200,
                     )
@@ -351,6 +378,7 @@ async def run_ai_bot(client: TelegramClient) -> None:
         f"текстовые сообщения, модель={config.model}. "
         "Для остановки нажмите Ctrl+C."
     )
+    print(format_current_status(routine, brief=True))
     try:
         await client(functions.account.UpdateStatusRequest(offline=False))
     except (RPCError, OSError) as exc:
@@ -372,6 +400,14 @@ async def run_ai_bot(client: TelegramClient) -> None:
 
 
 async def run(args: argparse.Namespace) -> None:
+    if args.command == "schedule":
+        routine = load_routine()
+        if args.day:
+            print(format_day_schedule(routine, args.day))
+        else:
+            print(format_current_status(routine, brief=args.brief))
+        return
+
     config = load_config()
     client = TelegramClient(str(config.session_path), config.api_id, config.api_hash)
 

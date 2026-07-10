@@ -1,0 +1,35 @@
+{
+  "mode": "student",
+  "timezone": {
+    "name": "Asia/Yekaterinburg",
+    "utc_offset": "+05:00"
+  },
+  "weekday": {
+    "wake": "07:30",
+    "sleep": "23:30",
+    "main_hours": 6,
+    "walk_hours": 1,
+    "personal_hours": 2,
+    "commute_minutes": 40,
+    "breaks_minutes": 60
+  },
+  "weekend": {
+    "wake": "09:30",
+    "sleep": "00:30",
+    "main_hours": 0,
+    "walk_hours": 2,
+    "personal_hours": 5,
+    "commute_minutes": 0,
+    "breaks_minutes": 90
+  },
+  "sport_hours": 0.5,
+  "custom_events": {
+    "mon": [],
+    "tue": [],
+    "wed": [],
+    "thu": [],
+    "fri": [],
+    "sat": [],
+    "sun": []
+  }
+}
