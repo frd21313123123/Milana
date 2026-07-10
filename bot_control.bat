@@ -30,7 +30,7 @@ cls
 title Milana AI control
 echo Milana AI control
 echo.
-call :show_schedule
+call "%ROOT%show_schedule.bat"
 echo.
 echo 1. Start bot
 echo 2. Stop bot
@@ -57,15 +57,12 @@ if not exist "%SCRIPT%" (
     goto done
 )
 
-call :read_pid
-if defined BOT_PID (
-    call :is_running %BOT_PID%
-    if not errorlevel 1 (
-        echo Bot is already running. PID: %BOT_PID%
-        goto done
-    )
-    del /q "%PID_FILE%" >nul 2>&1
+call :find_bot_pids
+if defined BOT_PIDS (
+    echo Bot is already running. PID(s):%BOT_PIDS%
+    goto done
 )
+if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
 
 "%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath '%PYTHON%' -ArgumentList '-u', '%SCRIPT%', 'ai-bot' -WorkingDirectory '%ROOT%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id"
 if errorlevel 1 (
@@ -78,58 +75,40 @@ echo Bot started. PID: %BOT_PID%
 echo Output log: %OUT_LOG%
 echo Error log: %ERR_LOG%
 echo.
-call :show_schedule
+call "%ROOT%show_schedule.bat"
 goto done
 
 :stop
-call :read_pid
-if not defined BOT_PID (
-    echo Bot is not running under this control file.
+call :find_bot_pids
+if not defined BOT_PIDS (
+    if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
+    echo Bot is not running.
     echo.
-    call :show_schedule
+    call "%ROOT%show_schedule.bat"
     goto done
 )
 
-call :is_running %BOT_PID%
-if errorlevel 1 (
-    echo Stale PID file removed.
-    del /q "%PID_FILE%" >nul 2>&1
-    echo.
-    call :show_schedule
-    goto done
-)
-
-taskkill /PID %BOT_PID% /T /F >nul 2>&1
-if errorlevel 1 (
-    echo Failed to stop PID %BOT_PID%.
-    goto done
+for %%P in (%BOT_PIDS%) do (
+    taskkill /PID %%P /T /F >nul 2>&1
 )
 del /q "%PID_FILE%" >nul 2>&1
-echo Bot stopped.
+echo Bot stopped. PID(s):%BOT_PIDS%
 echo.
-call :show_schedule
+call "%ROOT%show_schedule.bat"
 goto done
 
 :status
-call :read_pid
-if not defined BOT_PID (
+call :find_bot_pids
+if not defined BOT_PIDS (
+    if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
     echo Bot status: stopped.
     echo.
-    call :show_schedule
+    call "%ROOT%show_schedule.bat"
     goto done
 )
-
-call :is_running %BOT_PID%
-if errorlevel 1 (
-    echo Bot status: stopped ^(stale PID file removed^).
-    del /q "%PID_FILE%" >nul 2>&1
-    echo.
-    call :show_schedule
-    goto done
-)
-echo Bot status: running. PID: %BOT_PID%
+echo Bot status: running. PID(s):%BOT_PIDS%
 echo.
-call :show_schedule
+call "%ROOT%show_schedule.bat"
 goto done
 
 :logs
@@ -153,17 +132,13 @@ exit /b 0
 "%PS%" -NoProfile -Command "if (Get-Process -Id %~1 -ErrorAction SilentlyContinue) { exit 0 }; exit 1" >nul 2>&1
 exit /b %errorlevel%
 
-:show_schedule
-if not exist "%PYTHON%" (
-    echo Schedule unavailable: Python environment not found.
-    exit /b 0
+:find_bot_pids
+setlocal EnableDelayedExpansion
+set "FOUND_PIDS="
+for /f "delims=" %%P in ('%PS% -NoProfile -Command "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; foreach ($process in $processes) { if ($process.CommandLine -and $process.CommandLine -match '(?i)telegram_client\.py' -and $process.CommandLine -match '(?i)ai-bot') { $process.ProcessId } }"') do (
+    set "FOUND_PIDS=!FOUND_PIDS! %%P"
 )
-if not exist "%SCHEDULE_SCRIPT%" (
-    echo Schedule unavailable: %SCHEDULE_SCRIPT%
-    exit /b 0
-)
-"%PYTHON%" "%SCHEDULE_SCRIPT%" --brief
-if errorlevel 1 echo Failed to read Milana schedule.
+endlocal & set "BOT_PIDS=%FOUND_PIDS%"
 exit /b 0
 
 :menu_pause
