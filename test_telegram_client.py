@@ -14,6 +14,7 @@ from openai import BadRequestError
 from milana_schedule import load_routine
 from telegram_client import (
     AIConfig,
+    MessageFlowConfig,
     MilanaMessageResponder,
     MilanaPresenceController,
     ai_number,
@@ -22,6 +23,7 @@ from telegram_client import (
     display_name,
     load_env_file,
     load_ai_settings,
+    load_message_flow_config,
     message_text,
     normalize_target,
     positive_int,
@@ -54,7 +56,33 @@ class AdvancingClock:
         self.value += timedelta(seconds=seconds)
 
 
-def make_responder(clock: AdvancingClock, *, memory=None, randint=None):
+class GatedClock(AdvancingClock):
+    def __init__(self, value: datetime) -> None:
+        super().__init__(value)
+        self.sleep_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+
+    async def sleep(self, seconds: float) -> None:
+        self.delays.append(seconds)
+        release = asyncio.Event()
+        await self.sleep_calls.put((seconds, release))
+        await release.wait()
+        self.value += timedelta(seconds=seconds)
+
+
+def structured_response(*messages: str, output=None):
+    return SimpleNamespace(
+        output_text=json.dumps({"messages": list(messages)}, ensure_ascii=False),
+        output=[] if output is None else output,
+    )
+
+
+def make_responder(
+    clock: AdvancingClock,
+    *,
+    memory=None,
+    randint=None,
+    message_flow: MessageFlowConfig | None = None,
+):
     client = MagicMock()
     client.side_effect = AsyncMock(return_value=None)
     client.send_read_acknowledge = AsyncMock()
@@ -63,7 +91,7 @@ def make_responder(clock: AdvancingClock, *, memory=None, randint=None):
 
     openai_client = MagicMock()
     openai_client.responses.create = AsyncMock(
-        return_value=SimpleNamespace(output_text="Готовый ответ")
+        return_value=structured_response("Готовый ответ")
     )
     config = AIConfig(
         api_key="test-key",
@@ -71,6 +99,7 @@ def make_responder(clock: AdvancingClock, *, memory=None, randint=None):
         instructions="Тестовая инструкция",
         temperature=0.2,
         max_output_tokens=100,
+        message_flow=message_flow or MessageFlowConfig(),
     )
     responder = MilanaMessageResponder(
         client,
@@ -160,6 +189,45 @@ class SplitTelegramTextTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ai_number({"temperature": value}, "temperature", 0.7, 0, 2)
 
+    def test_message_flow_config_defaults_custom_values_and_validation(self) -> None:
+        self.assertEqual(load_message_flow_config({}), MessageFlowConfig())
+        configured = load_message_flow_config(
+            {
+                "message_flow": {
+                    "input_quiet_seconds": 1.5,
+                    "input_max_wait_seconds": 6,
+                    "max_reply_messages": 3,
+                    "inter_message_min_delay_seconds": 0.5,
+                    "inter_message_max_delay_seconds": 2,
+                }
+            }
+        )
+        self.assertEqual(configured.input_quiet_seconds, 1.5)
+        self.assertEqual(configured.max_reply_messages, 3)
+
+        invalid_settings = [
+            {"message_flow": []},
+            {"message_flow": {"unknown": 1}},
+            {"message_flow": {"input_quiet_seconds": -0.1}},
+            {"message_flow": {"input_max_wait_seconds": float("inf")}},
+            {
+                "message_flow": {
+                    "input_quiet_seconds": 3,
+                    "input_max_wait_seconds": 2,
+                }
+            },
+            {"message_flow": {"max_reply_messages": True}},
+            {
+                "message_flow": {
+                    "inter_message_min_delay_seconds": 3,
+                    "inter_message_max_delay_seconds": 1,
+                }
+            },
+        ]
+        for settings in invalid_settings:
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                load_message_flow_config(settings)
+
     def test_env_loader_handles_comments_quotes_and_does_not_override_environment(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
@@ -221,6 +289,40 @@ class SplitTelegramTextTests(unittest.TestCase):
 
 
 class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_typing_action_covers_generation_and_sending(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock)
+        event = make_event(clock.value)
+        action_active = False
+
+        class TrackedTypingAction:
+            async def __aenter__(self) -> None:
+                nonlocal action_active
+                action_active = True
+
+            async def __aexit__(self, exc_type, exc, traceback) -> None:
+                nonlocal action_active
+                action_active = False
+
+        client.action.return_value = TrackedTypingAction()
+
+        async def generate_while_typing(**kwargs):
+            self.assertTrue(action_active)
+            return structured_response("Готовый ответ")
+
+        async def reply_while_typing(text: str):
+            self.assertTrue(action_active)
+            return SimpleNamespace(id=301)
+
+        openai_client.responses.create.side_effect = generate_while_typing
+        event.reply.side_effect = reply_while_typing
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        client.action.assert_called_once_with("peer", "typing")
+        self.assertFalse(action_active)
+
     async def test_different_chats_generate_answers_concurrently(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, _, openai_client = make_responder(clock)
@@ -233,7 +335,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             if len(started_chats) == 2:
                 both_generations_started.set()
             await release_generations.wait()
-            return SimpleNamespace(output_text="Готовый ответ", output=[])
+            return structured_response("Готовый ответ")
 
         openai_client.responses.create.side_effect = generate_after_both_started
         responder._wait_before_reading = AsyncMock()
@@ -262,6 +364,544 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             release_generations.set()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def test_two_messages_during_quiet_window_share_one_model_call(self) -> None:
+        clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        first = make_event(clock.value, text="Первое сообщение", message_id=300)
+        second = make_event(clock.value, text="Второе сообщение", message_id=301)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(first)
+            _, first_quiet = await asyncio.wait_for(clock.sleep_calls.get(), timeout=1)
+            same_worker = await responder.submit(second)
+            _, final_quiet = await asyncio.wait_for(clock.sleep_calls.get(), timeout=1)
+            self.assertIs(worker, same_worker)
+            self.assertFalse(first_quiet.is_set())
+            final_quiet.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        openai_client.responses.create.assert_awaited_once()
+        request_input = openai_client.responses.create.await_args.kwargs["input"]
+        serialized = str(request_input)
+        self.assertEqual(serialized.count("Первое сообщение"), 1)
+        self.assertEqual(serialized.count("Второе сообщение"), 1)
+        self.assertLess(serialized.index("Первое сообщение"), serialized.index("Второе сообщение"))
+        first.reply.assert_not_awaited()
+        second.reply.assert_awaited_once_with("Готовый ответ")
+        client.send_read_acknowledge.assert_awaited_once_with(
+            "peer",
+            message=second.message,
+            max_id=second.id,
+        )
+
+    async def test_input_quiet_window_never_exceeds_maximum_deadline(self) -> None:
+        started_at = datetime(2026, 7, 13, 21, 0, tzinfo=YEKT)
+        clock = GatedClock(started_at)
+        responder, _, openai_client = make_responder(clock)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+
+        with patch("builtins.print"):
+            worker = await responder.submit(
+                make_event(clock.value, text="batch-0", message_id=300)
+            )
+            requested_delay, _ = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(requested_delay, 2)
+
+            # Every arrival comes before the current two-second quiet period ends,
+            # so it resets quiet time while the absolute eight-second cap stays put.
+            for index, elapsed in enumerate((1.5, 3.0, 4.5, 6.0, 7.5), start=1):
+                clock.value = started_at + timedelta(seconds=elapsed)
+                same_worker = await responder.submit(
+                    make_event(
+                        clock.value,
+                        text=f"batch-{index}",
+                        message_id=300 + index,
+                    )
+                )
+                self.assertIs(worker, same_worker)
+                requested_delay, release = await asyncio.wait_for(
+                    clock.sleep_calls.get(), timeout=1
+                )
+
+            self.assertEqual(requested_delay, 0.5)
+            release.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        self.assertEqual(clock.value, started_at + timedelta(seconds=8))
+        self.assertEqual(clock.delays, [2, 2, 2, 2, 2, 0.5])
+        openai_client.responses.create.assert_awaited_once()
+
+    async def test_stale_telegram_date_still_resets_quiet_from_local_arrival(self) -> None:
+        started_at = datetime(2026, 7, 13, 21, 0, tzinfo=YEKT)
+        clock = GatedClock(started_at)
+        responder, _, openai_client = make_responder(clock)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        first = make_event(started_at, text="Первая часть", message_id=300)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(first)
+            first_delay, _ = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(first_delay, 2)
+
+            clock.value = started_at + timedelta(seconds=1.9)
+            second = make_event(
+                started_at,
+                text="Задержанная в доставке часть",
+                message_id=301,
+            )
+            await responder.submit(second)
+            reset_delay, finish_reset_quiet = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(reset_delay, 2)
+            finish_reset_quiet.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        openai_client.responses.create.assert_awaited_once()
+        second.reply.assert_awaited_once_with("Готовый ответ")
+
+    async def test_message_during_quiet_cleanup_starts_a_fresh_quiet_wait(self) -> None:
+        class SlowCancelEvent(asyncio.Event):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cleanup_started = asyncio.Event()
+                self.release_cleanup = asyncio.Event()
+
+            async def wait(self):
+                try:
+                    return await super().wait()
+                except asyncio.CancelledError:
+                    self.cleanup_started.set()
+                    await self.release_cleanup.wait()
+                    raise
+
+        clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        schedule_started = asyncio.Event()
+        release_schedule = asyncio.Event()
+
+        async def hold_schedule(*args, **kwargs):
+            schedule_started.set()
+            await release_schedule.wait()
+
+        responder._wait_before_reading = AsyncMock(side_effect=hold_schedule)
+        responder._wait_for_full_online_window = AsyncMock()
+        first = make_event(clock.value, text="Первая часть", message_id=300)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(first)
+            await asyncio.wait_for(schedule_started.wait(), timeout=1)
+            slow_signal = SlowCancelEvent()
+            async with responder._chat_states_lock:
+                responder._chat_states[100].changed = slow_signal
+            release_schedule.set()
+
+            first_delay, finish_first_quiet = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(first_delay, 2)
+            finish_first_quiet.set()
+            await asyncio.wait_for(slow_signal.cleanup_started.wait(), timeout=1)
+
+            second = make_event(
+                clock.value,
+                text="Пришла во время cleanup",
+                message_id=301,
+            )
+            await responder.submit(second)
+            slow_signal.release_cleanup.set()
+
+            second_delay, finish_second_quiet = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(second_delay, 2)
+            openai_client.responses.create.assert_not_awaited()
+            finish_second_quiet.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        openai_client.responses.create.assert_awaited_once()
+        second.reply.assert_awaited_once_with("Готовый ответ")
+
+    async def test_large_out_of_order_batch_is_sorted_deduplicated_and_multimodal(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, client, openai_client = make_responder(clock, message_flow=flow)
+        schedule_started = asyncio.Event()
+        release_schedule = asyncio.Event()
+
+        async def hold_first_batch(*args, **kwargs) -> None:
+            schedule_started.set()
+            await release_schedule.wait()
+
+        responder._wait_before_reading = AsyncMock(side_effect=hold_first_batch)
+        responder._wait_for_full_online_window = AsyncMock()
+
+        texts_by_index = [f"batch-{index:04d}" for index in range(35)]
+        events_by_id = {
+            1000 + index: make_event(
+                clock.value + timedelta(seconds=40 if index == 33 else index),
+                text=text,
+                message_id=1000 + index,
+                photo=index in {4, 31},
+                image_bytes=f"image-{index}".encode(),
+            )
+            for index, text in enumerate(texts_by_index)
+        }
+        submitted = [events_by_id[message_id] for message_id in reversed(events_by_id)]
+        duplicate = make_event(
+            clock.value + timedelta(seconds=99),
+            text="duplicate-must-not-reach-model",
+            message_id=1012,
+        )
+
+        with patch("builtins.print"):
+            worker = await responder.submit(submitted[0])
+            await asyncio.wait_for(schedule_started.wait(), timeout=1)
+            for event in [*submitted[1:], duplicate]:
+                self.assertIs(worker, await responder.submit(event))
+            release_schedule.set()
+            await asyncio.wait_for(worker, timeout=2)
+
+        openai_client.responses.create.assert_awaited_once()
+        request_input = openai_client.responses.create.await_args.kwargs["input"]
+        observed_texts: list[str] = []
+        image_items = 0
+        for item in request_input:
+            if item.get("role") != "user":
+                continue
+            content = item["content"]
+            if isinstance(content, str):
+                user_text = content
+            else:
+                image_items += sum(
+                    part.get("type") == "input_image" for part in content
+                )
+                user_text = next(
+                    part["text"] for part in content if part.get("type") == "input_text"
+                )
+            observed_texts.append(user_text.split(": ", 1)[-1])
+
+        expected_texts = [*texts_by_index[:33], texts_by_index[34], texts_by_index[33]]
+        self.assertEqual(observed_texts, expected_texts)
+        self.assertEqual(image_items, 2)
+        self.assertNotIn("duplicate-must-not-reach-model", str(request_input))
+        events_by_id[1033].reply.assert_awaited_once()
+        for message_id, event in events_by_id.items():
+            if message_id != 1033:
+                event.reply.assert_not_awaited()
+        client.send_read_acknowledge.assert_awaited_once_with(
+            "peer",
+            message=events_by_id[1034].message,
+            max_id=1034,
+        )
+        events_by_id[1004].message.download_media.assert_awaited_once()
+        events_by_id[1031].message.download_media.assert_awaited_once()
+
+    async def test_one_broken_photo_does_not_discard_the_rest_of_the_batch(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, _, openai_client = make_responder(clock, message_flow=flow)
+        schedule_started = asyncio.Event()
+        release_schedule = asyncio.Event()
+
+        async def hold_batch(*args, **kwargs):
+            schedule_started.set()
+            await release_schedule.wait()
+
+        responder._wait_before_reading = AsyncMock(side_effect=hold_batch)
+        responder._wait_for_full_online_window = AsyncMock()
+        first = make_event(clock.value, text="До фото", message_id=300)
+        broken_photo = make_event(
+            clock.value + timedelta(seconds=1),
+            text="Подпись у недоступного фото",
+            message_id=301,
+            photo=True,
+        )
+        broken_photo.message.download_media.side_effect = OSError("download failed")
+        last = make_event(
+            clock.value + timedelta(seconds=2),
+            text="После фото",
+            message_id=302,
+        )
+
+        with patch("builtins.print"):
+            worker = await responder.submit(first)
+            await asyncio.wait_for(schedule_started.wait(), timeout=1)
+            await responder.submit(broken_photo)
+            await responder.submit(last)
+            release_schedule.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        openai_client.responses.create.assert_awaited_once()
+        request_input = openai_client.responses.create.await_args.kwargs["input"]
+        serialized = str(request_input)
+        for text in ("До фото", "Подпись у недоступного фото", "После фото"):
+            self.assertEqual(serialized.count(text), 1)
+        self.assertNotIn("input_image", serialized)
+        last.reply.assert_awaited_once_with("Готовый ответ")
+
+    async def test_message_received_during_schedule_wait_joins_the_same_batch(self) -> None:
+        clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        first = make_event(clock.value, text="Первая часть", message_id=300)
+        second = make_event(clock.value, text="Вторая часть", message_id=301)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(first)
+            _, schedule_release = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            same_worker = await responder.submit(second)
+            self.assertIs(worker, same_worker)
+            schedule_release.set()
+            quiet_delay, quiet_release = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(quiet_delay, 2)
+            openai_client.responses.create.assert_not_awaited()
+            quiet_release.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        openai_client.responses.create.assert_awaited_once()
+        request_input = str(openai_client.responses.create.await_args.kwargs["input"])
+        self.assertEqual(request_input.count("Первая часть"), 1)
+        self.assertEqual(request_input.count("Вторая часть"), 1)
+        first.reply.assert_not_awaited()
+        second.reply.assert_awaited_once_with("Готовый ответ")
+
+    async def test_shutdown_cancels_waiting_workers_and_rejects_new_events(self) -> None:
+        clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(event)
+            await asyncio.wait_for(clock.sleep_calls.get(), timeout=1)
+            await responder.shutdown()
+
+        self.assertTrue(worker.done())
+        self.assertEqual(responder._chat_states, {})
+        openai_client.responses.create.assert_not_awaited()
+        with self.assertRaises(RuntimeError):
+            await responder.submit(make_event(clock.value, message_id=301))
+
+    async def test_message_during_generation_cancels_stale_draft_and_diary(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, _, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        stale_generation_started = asyncio.Event()
+        stale_generation_cancelled = asyncio.Event()
+        release_stale_generation = asyncio.Event()
+        diary_call = SimpleNamespace(
+            type="function_call",
+            name="write_diary",
+            arguments='{"content":"Устаревшая запись"}',
+            call_id="stale-diary",
+        )
+        call_number = 0
+
+        async def generate(**kwargs):
+            nonlocal call_number
+            call_number += 1
+            if call_number == 1:
+                return structured_response("Черновик", output=[diary_call])
+            if call_number == 2:
+                stale_generation_started.set()
+                try:
+                    await release_stale_generation.wait()
+                except asyncio.CancelledError:
+                    stale_generation_cancelled.set()
+                    raise
+                return structured_response("Устаревший ответ")
+            return structured_response("Актуальный ответ")
+
+        openai_client.responses.create.side_effect = generate
+        first = make_event(clock.value, text="Первый вопрос", message_id=300)
+        second = make_event(clock.value, text="Дополнение", message_id=301)
+        second.reply.return_value = SimpleNamespace(id=401)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(first)
+            try:
+                await asyncio.wait_for(stale_generation_started.wait(), timeout=1)
+                await responder.submit(second)
+                await asyncio.wait_for(worker, timeout=1)
+            finally:
+                release_stale_generation.set()
+                if not worker.done():
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+        self.assertTrue(stale_generation_cancelled.is_set())
+        self.assertEqual(openai_client.responses.create.await_count, 3)
+        fresh_input = openai_client.responses.create.await_args_list[-1].kwargs["input"]
+        serialized = str(fresh_input)
+        self.assertEqual(serialized.count("Первый вопрос"), 1)
+        self.assertEqual(serialized.count("Дополнение"), 1)
+        self.assertNotIn("stale-diary", serialized)
+        first.reply.assert_not_awaited()
+        second.reply.assert_awaited_once_with("Актуальный ответ")
+        self.assertEqual(responder.memory.get_diary(), [])
+        self.assertEqual(
+            [
+                item.content
+                for item in responder.memory.get_chat_history(100)
+                if item.role == "assistant"
+            ],
+            ["Актуальный ответ"],
+        )
+
+    async def test_structured_semantic_messages_are_sent_and_stored_separately(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, client, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        openai_client.responses.create.return_value = structured_response(
+            "Первая мысль",
+            "Вторая мысль",
+        )
+        event = make_event(clock.value)
+        event.reply.return_value = SimpleNamespace(id=401)
+        client.send_message.return_value = SimpleNamespace(id=402)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Первая мысль")
+        client.send_message.assert_awaited_once_with(100, "Вторая мысль")
+        request = openai_client.responses.create.await_args.kwargs
+        self.assertEqual(
+            request["text"]["format"]["schema"]["properties"]["messages"]["maxItems"],
+            responder.config.message_flow.max_reply_messages,
+        )
+        assistant_messages = [
+            item
+            for item in responder.memory.get_chat_history(100)
+            if item.role == "assistant"
+        ]
+        self.assertEqual(
+            [(item.content, item.telegram_message_id) for item in assistant_messages],
+            [("Первая мысль", 401), ("Вторая мысль", 402)],
+        )
+
+    async def test_new_input_during_inter_part_delay_stops_series_and_continues(self) -> None:
+        clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=1,
+            inter_message_max_delay_seconds=1,
+        )
+        responder, client, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        openai_client.responses.create.side_effect = [
+            structured_response("Отправленный префикс", "Устаревший остаток"),
+            structured_response("Новое продолжение"),
+        ]
+        first = make_event(clock.value, text="Начальный вопрос", message_id=300)
+        second = make_event(clock.value, text="Уточнение", message_id=301)
+        first.reply.return_value = SimpleNamespace(id=501)
+        second.reply.return_value = SimpleNamespace(id=502)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(first)
+            _, inter_part_release = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            try:
+                await responder.submit(second)
+                await asyncio.wait_for(worker, timeout=1)
+            finally:
+                inter_part_release.set()
+                if not worker.done():
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+        first.reply.assert_awaited_once_with("Отправленный префикс")
+        second.reply.assert_awaited_once_with("Новое продолжение")
+        client.send_message.assert_not_awaited()
+        self.assertEqual(openai_client.responses.create.await_count, 2)
+        continuation_input = openai_client.responses.create.await_args_list[-1].kwargs[
+            "input"
+        ]
+        self.assertEqual(str(continuation_input).count("Отправленный префикс"), 1)
+        assistant_parts = [
+            item.content
+            for item in responder.memory.get_chat_history(100)
+            if item.role == "assistant"
+        ]
+        self.assertEqual(assistant_parts, ["Отправленный префикс", "Новое продолжение"])
+
+    async def test_partial_send_stores_only_successful_prefix(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, client, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        responder.presence.finish_response = AsyncMock(
+            wraps=responder.presence.finish_response
+        )
+        openai_client.responses.create.return_value = structured_response(
+            "Успешный префикс",
+            "Неотправленный остаток",
+        )
+        event = make_event(clock.value)
+        event.reply.return_value = SimpleNamespace(id=601)
+        client.send_message.side_effect = OSError("Telegram недоступен")
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Успешный префикс")
+        client.send_message.assert_awaited_once_with(100, "Неотправленный остаток")
+        responder.presence.finish_response.assert_awaited_once_with(answered=True)
+        assistant_messages = [
+            item
+            for item in responder.memory.get_chat_history(100)
+            if item.role == "assistant"
+        ]
+        self.assertEqual(
+            [(item.content, item.telegram_message_id) for item in assistant_messages],
+            [("Успешный префикс", 601)],
+        )
+
     async def test_waits_before_reading_and_uses_current_schedule_prompt(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)
@@ -270,7 +910,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await responder.process(event)
 
-        self.assertEqual(clock.delays, [2])
+        self.assertEqual(clock.delays, [2, 2])
         client.send_read_acknowledge.assert_awaited_once()
         openai_client.responses.create.assert_awaited_once()
         event.reply.assert_awaited_once_with("Готовый ответ")
@@ -305,7 +945,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             clock.release.set()
             await task
 
-        self.assertEqual(clock.delays, [7 * 60 * 60 + 45 * 60 + 15])
+        self.assertEqual(clock.delays, [7 * 60 * 60 + 45 * 60 + 15, 2])
         client.send_read_acknowledge.assert_awaited_once()
         event.reply.assert_awaited_once_with("Готовый ответ")
         instructions = openai_client.responses.create.await_args.kwargs["instructions"]
@@ -319,7 +959,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await responder.process(event)
 
-        self.assertEqual(clock.delays, [2])
+        self.assertEqual(clock.delays, [2, 2])
         client.send_read_acknowledge.assert_awaited_once()
         openai_client.responses.create.assert_not_awaited()
         event.reply.assert_not_awaited()
@@ -371,7 +1011,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             await responder.process(make_event(clock.value, message_id=300))
             await responder.process(make_event(clock.value, message_id=301))
 
-        self.assertEqual(clock.delays, [60, 10])
+        self.assertEqual(clock.delays, [60, 2, 10, 2])
 
     async def test_online_delay_finishes_before_reading_and_generation(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -391,7 +1031,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         async def generate_immediately(**kwargs):
             generation_started_at.append(clock.value)
-            return SimpleNamespace(output_text="Готовый ответ")
+            return structured_response("Готовый ответ")
 
         client.send_read_acknowledge.side_effect = acknowledge_after_timer
         openai_client.responses.create.side_effect = generate_immediately
@@ -399,10 +1039,10 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"):
             await responder.process(event)
 
-        expected_start = event.message.date + timedelta(seconds=10)
+        expected_start = event.message.date + timedelta(seconds=12)
         self.assertEqual(read_at, [expected_start])
         self.assertEqual(generation_started_at, [expected_start])
-        self.assertEqual(clock.delays, [10])
+        self.assertEqual(clock.delays, [10, 2])
         client.send_read_acknowledge.assert_awaited_once()
         event.reply.assert_awaited_once_with("Готовый ответ")
 
@@ -461,7 +1101,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             clock.value = datetime(2026, 7, 13, 23, 35, tzinfo=YEKT)
             await responder.process(make_event(clock.value, message_id=301))
 
-        self.assertEqual(clock.delays[-1], 1)
+        self.assertEqual(clock.delays[-2:], [1, 2])
         self.assertEqual(
             responder.presence.sleep_deferred_until,
             clock.value + timedelta(minutes=30),
@@ -599,9 +1239,9 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             call_id="call-1",
         )
         openai_client.responses.create.side_effect = [
-            SimpleNamespace(output_text="", output=[diary_call]),
-            SimpleNamespace(output_text="Запомнила", output=[]),
-            SimpleNamespace(output_text="Ответ в другом чате", output=[]),
+            structured_response("Записываю", output=[diary_call]),
+            structured_response("Запомнила"),
+            structured_response("Ответ в другом чате"),
         ]
 
         with patch("builtins.print"):
@@ -706,7 +1346,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         )
         openai_client.responses.create.side_effect = [
             error,
-            SimpleNamespace(output_text="Ответ без temperature", output=[]),
+            structured_response("Ответ без temperature"),
         ]
 
         event = make_event(clock.value)
@@ -722,6 +1362,328 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             openai_client.responses.create.await_args_list[1].kwargs,
         )
         event.reply.assert_awaited_once_with("Ответ без temperature")
+
+    async def test_retries_as_one_plain_message_when_structured_output_is_unsupported(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        error = BadRequestError(
+            "Structured Outputs are not supported with this model.",
+            response=httpx.Response(400, request=request),
+            body={"param": "text.format"},
+        )
+        openai_client.responses.create.side_effect = [
+            error,
+            SimpleNamespace(output_text="Обычный ответ", output=[]),
+        ]
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        self.assertIn("text", openai_client.responses.create.await_args_list[0].kwargs)
+        self.assertNotIn("text", openai_client.responses.create.await_args_list[1].kwargs)
+        self.assertIn(
+            "Верни только один готовый текст Telegram-сообщения без JSON",
+            openai_client.responses.create.await_args_list[1].kwargs["instructions"],
+        )
+        event.reply.assert_awaited_once_with("Обычный ответ")
+
+    async def test_structured_schema_error_is_not_misread_as_unsupported(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        error = BadRequestError(
+            "Invalid schema: required must include every property.",
+            response=httpx.Response(400, request=request),
+            body={"param": "text.format"},
+        )
+        openai_client.responses.create.side_effect = error
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        openai_client.responses.create.assert_awaited_once()
+        self.assertIn("text", openai_client.responses.create.await_args.kwargs)
+        self.assertIsNone(responder._supports_structured_reply)
+        event.reply.assert_not_awaited()
+
+    async def test_shutdown_cancels_in_flight_generation(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, _, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_generation(**kwargs):
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return structured_response("Уже не будет отправлено")
+
+        openai_client.responses.create.side_effect = blocked_generation
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(event)
+            try:
+                await asyncio.wait_for(started.wait(), timeout=1)
+                await responder.shutdown()
+            finally:
+                release.set()
+                if not worker.done():
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+        self.assertTrue(worker.done())
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(responder._chat_states, {})
+        event.reply.assert_not_awaited()
+
+    async def test_shutdown_cancels_in_flight_summary(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, _, _ = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        summary_started = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        release_summary = asyncio.Event()
+
+        async def blocked_summary(chat_key):
+            summary_started.set()
+            try:
+                await release_summary.wait()
+            except asyncio.CancelledError:
+                summary_cancelled.set()
+                raise
+
+        responder._maybe_update_chat_summary = blocked_summary
+        event = make_event(clock.value)
+        event.reply.return_value = SimpleNamespace(id=401)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(event)
+            try:
+                await asyncio.wait_for(summary_started.wait(), timeout=1)
+                await responder.shutdown()
+            finally:
+                release_summary.set()
+                if not worker.done():
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+        self.assertTrue(worker.done())
+        self.assertTrue(summary_cancelled.is_set())
+        event.reply.assert_awaited_once_with("Готовый ответ")
+
+    async def test_schedule_closing_during_begin_response_prevents_first_send(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, _, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        schedule_open = True
+        waiting_for_reopen = asyncio.Event()
+        reopen = asyncio.Event()
+
+        async def wait_for_open_window(*, continues_conversation=False):
+            if not schedule_open:
+                waiting_for_reopen.set()
+                await reopen.wait()
+
+        async def close_schedule():
+            nonlocal schedule_open
+            schedule_open = False
+
+        responder._wait_for_full_online_window = wait_for_open_window
+        responder._full_online_window_is_open = MagicMock(
+            side_effect=lambda **kwargs: schedule_open
+        )
+        responder.presence.begin_response = AsyncMock(side_effect=close_schedule)
+        responder.presence.finish_response = AsyncMock(return_value=None)
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(event)
+            try:
+                await asyncio.wait_for(waiting_for_reopen.wait(), timeout=1)
+                event.reply.assert_not_awaited()
+                responder.presence.finish_response.assert_awaited_once_with(
+                    answered=False
+                )
+                await responder.shutdown()
+            finally:
+                reopen.set()
+                if not worker.done():
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+        openai_client.responses.create.assert_awaited_once()
+        event.reply.assert_not_awaited()
+
+    async def test_post_send_memory_and_diary_errors_still_count_as_answered(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, _, _ = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        responder.presence.finish_response = AsyncMock(
+            wraps=responder.presence.finish_response
+        )
+        original_add_message = responder.memory.add_message
+
+        def fail_only_assistant(chat_id, role, content, **kwargs):
+            if role == "assistant":
+                raise RuntimeError("SQLite write failed")
+            return original_add_message(chat_id, role, content, **kwargs)
+
+        event = make_event(clock.value)
+        event.reply.return_value = SimpleNamespace(id=401)
+
+        with (
+            patch.object(
+                responder.memory,
+                "add_message",
+                side_effect=fail_only_assistant,
+            ),
+            patch.object(
+                responder,
+                "_commit_staged_diary",
+                side_effect=RuntimeError("Diary write failed"),
+            ) as commit_diary,
+            patch("builtins.print"),
+        ):
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Готовый ответ")
+        responder.presence.finish_response.assert_awaited_once_with(answered=True)
+        commit_diary.assert_called_once()
+        self.assertEqual(
+            [item.role for item in responder.memory.get_chat_history(100)],
+            ["user"],
+        )
+
+    async def test_structured_refusal_is_sent_as_one_message(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        openai_client.responses.create.return_value = SimpleNamespace(
+            output_text="",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="refusal", refusal="Не могу помочь")],
+                )
+            ],
+        )
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Не могу помочь")
+
+    async def test_blank_structured_items_are_removed_before_sending(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            max_reply_messages=2,
+            inter_message_min_delay_seconds=0,
+            inter_message_max_delay_seconds=0,
+        )
+        responder, client, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        openai_client.responses.create.return_value = SimpleNamespace(
+            output_text=json.dumps(
+                {"messages": ["  Первая часть  ", "", "   ", "Вторая часть"]},
+                ensure_ascii=False,
+            ),
+            output=[],
+        )
+        event = make_event(clock.value)
+        event.reply.return_value = SimpleNamespace(id=401)
+        client.send_message.return_value = SimpleNamespace(id=402)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_awaited_once_with("Первая часть")
+        client.send_message.assert_awaited_once_with(100, "Вторая часть")
+
+    async def test_invalid_structured_json_is_not_sent(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        openai_client.responses.create.return_value = SimpleNamespace(
+            output_text="not-json",
+            output=[],
+        )
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        openai_client.responses.create.assert_awaited_once()
+        event.reply.assert_not_awaited()
+        self.assertEqual(
+            [item.role for item in responder.memory.get_chat_history(100)],
+            ["user"],
+        )
+
+    async def test_incomplete_structured_output_is_not_sent_or_stored(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        diary_call = SimpleNamespace(
+            type="function_call",
+            name="write_diary",
+            arguments='{"content":"Не должна сохраниться"}',
+            call_id="incomplete-diary",
+        )
+        openai_client.responses.create.return_value = SimpleNamespace(
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            output_text='{"messages":["Обрезано',
+            output=[diary_call],
+        )
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_not_awaited()
+        openai_client.responses.create.assert_awaited_once()
+        self.assertEqual(responder.memory.get_diary(), [])
+        self.assertEqual(
+            [item.role for item in responder.memory.get_chat_history(100)],
+            ["user"],
+        )
 
     async def test_invalid_diary_call_returns_tool_error_without_writing(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -749,7 +1711,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_model_answer_is_not_sent_or_stored_as_assistant(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, _, openai_client = make_responder(clock)
-        openai_client.responses.create.return_value = SimpleNamespace(output_text="   ", output=[])
+        openai_client.responses.create.return_value = structured_response("   ")
         event = make_event(clock.value)
 
         with patch("builtins.print"):
@@ -761,10 +1723,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
     async def test_multi_part_answer_uses_reply_then_send_message(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)
-        openai_client.responses.create.return_value = SimpleNamespace(
-            output_text="a" * 4001,
-            output=[],
-        )
+        openai_client.responses.create.return_value = structured_response("a" * 4001)
         event = make_event(clock.value)
 
         with patch("builtins.print"):
@@ -772,7 +1731,12 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         event.reply.assert_awaited_once_with("a" * 4000)
         client.send_message.assert_awaited_once_with(100, "a")
-        self.assertEqual(responder.memory.get_chat_history(100)[-1].content, "a" * 4001)
+        assistant_parts = [
+            item.content
+            for item in responder.memory.get_chat_history(100)
+            if item.role == "assistant"
+        ]
+        self.assertEqual(assistant_parts, ["a" * 4000, "a"])
 
     async def test_read_acknowledgement_failure_still_allows_answer(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -800,10 +1764,15 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         # The next (60th) user message should cross the threshold inside process
         event = make_event(clock.value, text="Юбилейное сообщение 60", chat_id=chat, message_id=5000, sender_id=123)
 
-        # Make the summary call return something distinct, answer call returns normal
-        summary_call_result = SimpleNamespace(output_text="Ключевые темы: имя Тест, любит кофе, планирует отпуск.")
-        answer_result = SimpleNamespace(output_text="Поняла, кофе и отпуск.", output=[])
-        openai_client.responses.create.side_effect = [summary_call_result, answer_result]
+        # Structured answer calls and the plain-text summarizer share one client.
+        async def answer_or_summarize(**kwargs):
+            if "text" in kwargs:
+                return structured_response("Поняла, кофе и отпуск.")
+            return SimpleNamespace(
+                output_text="Ключевые темы: имя Тест, любит кофе, планирует отпуск."
+            )
+
+        openai_client.responses.create.side_effect = answer_or_summarize
 
         with patch("builtins.print"):
             await responder.process(event)
@@ -816,11 +1785,32 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(info)
         self.assertIn("кофе", (info.summary if info else ""))
 
-        # The input to the *answer* generation (last call) must contain the summary note + recent
-        last_call_input = openai_client.responses.create.await_args_list[-1].kwargs["input"]
-        joined = str(last_call_input)
-        self.assertIn("Ключевые темы", joined)  # from the injected summary block
-        self.assertIn("Юбилейное сообщение 60", joined)
+        answer_calls = [
+            call
+            for call in openai_client.responses.create.await_args_list
+            if "text" in call.kwargs
+        ]
+        self.assertIn("Юбилейное сообщение 60", str(answer_calls[0].kwargs["input"]))
+
+        # Once the worker is idle, the persisted summary is available to the next answer.
+        follow_up = make_event(
+            clock.value,
+            text="Что ты помнишь?",
+            chat_id=chat,
+            message_id=5001,
+            sender_id=123,
+        )
+        with patch("builtins.print"):
+            await responder.process(follow_up)
+
+        answer_calls = [
+            call
+            for call in openai_client.responses.create.await_args_list
+            if "text" in call.kwargs
+        ]
+        joined = str(answer_calls[-1].kwargs["input"])
+        self.assertIn("Ключевые темы", joined)
+        self.assertIn("Что ты помнишь?", joined)
 
         # Covered count advanced so that active user window is reset toward 30
         self.assertLessEqual(info.covered_user_messages if info else 0, 59)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import threading
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -303,7 +304,11 @@ class MilanaMemoryStore:
         return result
 
     def response_input_with_summary(
-        self, chat_id: int | str, *, recent_limit: int = RECENT_MESSAGES_LIMIT
+        self,
+        chat_id: int | str,
+        *,
+        recent_limit: int = RECENT_MESSAGES_LIMIT,
+        exclude_user_message_ids: Collection[int] | None = None,
     ) -> list[dict[str, str]]:
         """Return summary context (if any) + recent raw messages for the main model."""
         result: list[dict[str, str]] = []
@@ -315,7 +320,23 @@ class MilanaMemoryStore:
                 + info.summary
             )
             result.append({"role": "assistant", "content": note})
-        for message in self.get_chat_history(chat_id, limit=recent_limit):
+        excluded_ids = set(exclude_user_message_ids or ())
+        if recent_limit <= 0:
+            messages: list[ChatMessage] = []
+        else:
+            messages = self.get_chat_history(
+                chat_id,
+                limit=recent_limit + len(excluded_ids),
+            )
+            messages = [
+                message
+                for message in messages
+                if not (
+                    message.role == "user"
+                    and message.telegram_message_id in excluded_ids
+                )
+            ][-recent_limit:]
+        for message in messages:
             content = message.content
             if message.role == "user" and message.sender_name:
                 content = f"{message.sender_name}: {content}"

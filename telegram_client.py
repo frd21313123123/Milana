@@ -10,7 +10,7 @@ import math
 import os
 import random
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -21,6 +21,7 @@ from telethon.errors import FloodWaitError, RPCError
 
 from milana_memory import (
     DEFAULT_HISTORY_LIMIT,
+    MAX_DIARY_ENTRY_LENGTH,
     RECENT_MESSAGES_LIMIT,
     MilanaMemoryStore,
     WRITE_DIARY_TOOL,
@@ -65,12 +66,22 @@ class Config:
 
 
 @dataclass(frozen=True)
+class MessageFlowConfig:
+    input_quiet_seconds: float = 2.0
+    input_max_wait_seconds: float = 8.0
+    max_reply_messages: int = 5
+    inter_message_min_delay_seconds: float = 1.0
+    inter_message_max_delay_seconds: float = 3.0
+
+
+@dataclass(frozen=True)
 class AIConfig:
     api_key: str
     model: str
     instructions: str
     temperature: float
     max_output_tokens: int
+    message_flow: MessageFlowConfig = MessageFlowConfig()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -175,6 +186,80 @@ def ai_positive_int(settings: Mapping[str, Any], key: str, default: int) -> int:
     return value
 
 
+def ai_nonnegative_number(
+    settings: Mapping[str, Any], key: str, default: float
+) -> float:
+    value = settings.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} в {AI_CONFIG_PATH.name} должен быть числом")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(
+            f"{key} в {AI_CONFIG_PATH.name} должен быть неотрицательным числом"
+        )
+    return result
+
+
+def load_message_flow_config(settings: Mapping[str, Any]) -> MessageFlowConfig:
+    raw = settings.get("message_flow", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"message_flow в {AI_CONFIG_PATH.name} должен быть JSON-объектом")
+
+    allowed = {
+        "input_quiet_seconds",
+        "input_max_wait_seconds",
+        "max_reply_messages",
+        "inter_message_min_delay_seconds",
+        "inter_message_max_delay_seconds",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Неизвестные параметры message_flow в {AI_CONFIG_PATH.name}: "
+            + ", ".join(unknown)
+        )
+
+    input_quiet_seconds = ai_nonnegative_number(raw, "input_quiet_seconds", 2.0)
+    input_max_wait_seconds = ai_nonnegative_number(
+        raw, "input_max_wait_seconds", 8.0
+    )
+    if input_max_wait_seconds < input_quiet_seconds:
+        raise ValueError(
+            "input_max_wait_seconds в ai_config.json не может быть меньше "
+            "input_quiet_seconds"
+        )
+
+    max_reply_messages = raw.get("max_reply_messages", 5)
+    if (
+        isinstance(max_reply_messages, bool)
+        or not isinstance(max_reply_messages, int)
+        or not 1 <= max_reply_messages <= 6
+    ):
+        raise ValueError(
+            "max_reply_messages в ai_config.json должен быть целым числом от 1 до 6"
+        )
+
+    min_delay = ai_nonnegative_number(
+        raw, "inter_message_min_delay_seconds", 1.0
+    )
+    max_delay = ai_nonnegative_number(
+        raw, "inter_message_max_delay_seconds", 3.0
+    )
+    if min_delay > max_delay:
+        raise ValueError(
+            "inter_message_min_delay_seconds в ai_config.json не может быть больше "
+            "inter_message_max_delay_seconds"
+        )
+
+    return MessageFlowConfig(
+        input_quiet_seconds=input_quiet_seconds,
+        input_max_wait_seconds=input_max_wait_seconds,
+        max_reply_messages=max_reply_messages,
+        inter_message_min_delay_seconds=min_delay,
+        inter_message_max_delay_seconds=max_delay,
+    )
+
+
 def load_ai_config() -> AIConfig:
     env_values = load_env_file(ENV_PATH)
     settings = load_ai_settings()
@@ -200,6 +285,7 @@ def load_ai_config() -> AIConfig:
     max_output_tokens = ai_positive_int(
         settings, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS
     )
+    message_flow = load_message_flow_config(settings)
 
     if not api_key:
         raise ValueError("Добавьте OPENAI_API_KEY в переменные среды или файл .env")
@@ -211,6 +297,7 @@ def load_ai_config() -> AIConfig:
         instructions=instructions,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
+        message_flow=message_flow,
     )
 
 
@@ -595,8 +682,48 @@ def split_telegram_text(text: str, limit: int = 4000) -> list[str]:
     return parts
 
 
+@dataclass(frozen=True)
+class IncomingEnvelope:
+    event: Any
+    received_at: datetime
+    queued_at: datetime
+    received_while_online: bool
+    continues_conversation: bool
+
+
+@dataclass(frozen=True)
+class PreparedIncoming:
+    event: Any
+    received_at: datetime
+    sender_name: str
+    text: str
+    image_data_url: str | None
+
+
+@dataclass(frozen=True)
+class GeneratedReply:
+    messages: tuple[str, ...]
+    staged_diary_entries: tuple[str, ...] = ()
+
+
+@dataclass
+class ChatWorkerState:
+    chat_key: int | str
+    pending: list[IncomingEnvelope] = field(default_factory=list)
+    seen_message_ids: set[int] = field(default_factory=set)
+    revision: int = 0
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    worker: asyncio.Task[None] | None = None
+
+
+@dataclass(frozen=True)
+class SendOutcome:
+    sent_count: int
+    interrupted: bool
+
+
 class MilanaMessageResponder:
-    """Читает и обрабатывает одно сообщение в ритме текущего занятия Миланы."""
+    """Объединяет входящие по чатам и отвечает в ритме текущего занятия Миланы."""
 
     def __init__(
         self,
@@ -628,8 +755,11 @@ class MilanaMessageResponder:
             sleep=sleep,
             randint=randint,
         )
-        self._chat_locks: dict[int | str, asyncio.Lock] = {}
+        self._chat_states: dict[int | str, ChatWorkerState] = {}
+        self._chat_states_lock = asyncio.Lock()
+        self._closing = False
         self._supports_temperature: bool | None = None
+        self._supports_structured_reply: bool | None = None
 
     async def _import_existing_history(
         self, event: events.NewMessage.Event, chat_key: int | str
@@ -690,6 +820,7 @@ class MilanaMessageResponder:
         *,
         instructions: str,
         input_items: list[Any],
+        structured_reply: bool = True,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self.config.model,
@@ -701,6 +832,27 @@ class MilanaMessageResponder:
         }
         if self._supports_temperature is not False:
             request["temperature"] = self.config.temperature
+        if structured_reply and self._supports_structured_reply is not False:
+            request["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "milana_telegram_reply",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "messages": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                                "maxItems": self.config.message_flow.max_reply_messages,
+                            }
+                        },
+                        "required": ["messages"],
+                        "additionalProperties": False,
+                    },
+                }
+            }
         return request
 
     @staticmethod
@@ -712,28 +864,75 @@ class MilanaMessageResponder:
             "temperature" in message and "unsupported parameter" in message
         )
 
+    @staticmethod
+    def _structured_reply_is_unsupported(exc: BadRequestError) -> bool:
+        body = getattr(exc, "body", None)
+        parameter = (
+            str(body.get("param", "")).lower() if isinstance(body, dict) else ""
+        )
+        message = str(exc).lower()
+        mentions_format = parameter in {"text", "text.format", "response_format"} or (
+            "json_schema" in message
+            or "structured output" in message
+            or "text.format" in message
+        )
+        return mentions_format and any(
+            marker in message
+            for marker in (
+                "unsupported",
+                "not support",
+                "unknown parameter",
+                "unrecognized parameter",
+            )
+        )
+
+    @staticmethod
+    def _plain_reply_instructions(instructions: str) -> str:
+        return (
+            f"{instructions}\n\n"
+            "Structured Outputs для этой модели недоступны. Верни только один готовый "
+            "текст Telegram-сообщения без JSON, массива messages, Markdown-блока кода "
+            "и служебных пояснений."
+        )
+
     async def _create_model_response(
         self, *, instructions: str, input_items: list[Any]
-    ) -> Any:
+    ) -> tuple[Any, bool]:
         request = self._response_request(
             instructions=instructions,
             input_items=input_items,
         )
-        try:
-            response = await self.openai_client.responses.create(**request)
-            if "temperature" in request:
-                self._supports_temperature = True
-            return response
-        except BadRequestError as exc:
-            if "temperature" not in request or not self._temperature_is_unsupported(exc):
+        if "text" not in request:
+            request["instructions"] = self._plain_reply_instructions(instructions)
+        while True:
+            try:
+                response = await self.openai_client.responses.create(**request)
+                if "temperature" in request:
+                    self._supports_temperature = True
+                if "text" in request:
+                    self._supports_structured_reply = True
+                return response, "text" in request
+            except BadRequestError as exc:
+                if "temperature" in request and self._temperature_is_unsupported(exc):
+                    self._supports_temperature = False
+                    request.pop("temperature")
+                    print(
+                        f"Модель {self.config.model} не поддерживает temperature; "
+                        "повторяю запрос без этого параметра"
+                    )
+                    continue
+                if "text" in request and self._structured_reply_is_unsupported(exc):
+                    self._supports_structured_reply = False
+                    request.pop("text")
+                    request["instructions"] = self._plain_reply_instructions(
+                        instructions
+                    )
+                    print(
+                        f"Модель {self.config.model} не поддерживает Structured Outputs; "
+                        "повторяю запрос с одним обычным текстовым ответом"
+                    )
+                    continue
                 raise
-            self._supports_temperature = False
-            request.pop("temperature")
-            print(
-                f"Модель {self.config.model} не поддерживает temperature; "
-                "повторяю запрос без этого параметра"
-            )
-            return await self.openai_client.responses.create(**request)
 
     def _execute_diary_call(
         self,
@@ -761,6 +960,49 @@ class MilanaMessageResponder:
             {"status": "stored" if stored else "already_exists"},
             ensure_ascii=False,
         )
+
+    @staticmethod
+    def _staged_diary_call(call: Any, staged: list[str]) -> str:
+        """Validate a diary call without mutating memory until the reply is committed."""
+        try:
+            arguments = json.loads(call.arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("arguments должен быть объектом")
+            content = arguments.get("content")
+            if not isinstance(content, str):
+                raise TypeError("Запись дневника должна быть строкой")
+            content = content.strip()
+            if not content:
+                raise ValueError("Запись дневника не может быть пустой")
+            if len(content) > MAX_DIARY_ENTRY_LENGTH:
+                raise ValueError(
+                    f"Запись дневника не может быть длиннее {MAX_DIARY_ENTRY_LENGTH} символов"
+                )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            return json.dumps(
+                {"status": "error", "message": str(exc)}, ensure_ascii=False
+            )
+
+        if content not in staged:
+            staged.append(content)
+            status = "accepted"
+        else:
+            status = "already_accepted"
+        return json.dumps({"status": status}, ensure_ascii=False)
+
+    def _commit_staged_diary(
+        self,
+        entries: tuple[str, ...],
+        *,
+        chat_key: int | str,
+        source_message_id: int | None,
+    ) -> None:
+        for content in entries:
+            self.memory.add_diary_entry(
+                content,
+                source_chat_id=chat_key,
+                source_message_id=source_message_id,
+            )
 
     # --- Summarization for long-term per-chat context + dynamic user window ---
 
@@ -893,41 +1135,103 @@ class MilanaMessageResponder:
             # Never break the main flow because of summarization
             print(f"Не удалось обновить обзор чата {chat_key}: {exc}", file=sys.stderr)
 
+    @staticmethod
+    def _response_refusal(response: Any) -> str | None:
+        for output in list(getattr(response, "output", None) or []):
+            if getattr(output, "type", None) != "message":
+                continue
+            for item in list(getattr(output, "content", None) or []):
+                if getattr(item, "type", None) == "refusal":
+                    refusal = str(getattr(item, "refusal", "") or "").strip()
+                    if refusal:
+                        return refusal
+        return None
+
+    @staticmethod
+    def _raise_if_incomplete(response: Any) -> None:
+        if getattr(response, "status", None) != "incomplete":
+            return
+        details = getattr(response, "incomplete_details", None)
+        reason = getattr(details, "reason", None) or "unknown"
+        raise ValueError(f"Модель вернула незавершённый ответ: {reason}")
+
+    def _parse_generated_reply(
+        self,
+        response: Any,
+        *,
+        structured: bool,
+        staged_diary_entries: list[str],
+    ) -> GeneratedReply:
+        self._raise_if_incomplete(response)
+
+        refusal = self._response_refusal(response)
+        if refusal:
+            return GeneratedReply((refusal,), tuple(staged_diary_entries))
+
+        output_text = str(getattr(response, "output_text", "") or "").strip()
+        if not structured:
+            if not output_text:
+                raise ValueError("Модель вернула пустой ответ")
+            return GeneratedReply((output_text,), tuple(staged_diary_entries))
+
+        try:
+            payload = json.loads(output_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Модель вернула некорректный структурированный ответ") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+            raise ValueError("Структурированный ответ не содержит массив messages")
+
+        raw_messages = payload["messages"]
+        if any(not isinstance(message, str) for message in raw_messages):
+            raise ValueError("Каждая часть структурированного ответа должна быть строкой")
+        messages = tuple(message.strip() for message in raw_messages if message.strip())
+        if len(messages) > self.config.message_flow.max_reply_messages:
+            raise ValueError("Модель превысила максимальное число сообщений в ответе")
+        if not messages:
+            raise ValueError("Модель вернула пустой ответ")
+        return GeneratedReply(messages, tuple(staged_diary_entries))
+
     async def _generate_answer(
         self,
         *,
         chat_key: int | str,
-        message_id: int | None,
-        sender_name: str,
-        text: str,
         history_input: list[dict[str, str]],
-        image_data_url: str | None = None,
-    ) -> str:
+        messages: list[PreparedIncoming],
+    ) -> GeneratedReply:
+        max_parts = self.config.message_flow.max_reply_messages
         instructions = (
             f"{self.config.instructions}\n\n"
             f"{build_schedule_prompt(self.routine, self.current_time())}\n\n"
-            f"{self.memory.diary_instructions()}"
+            f"{self.memory.diary_instructions()}\n\n"
+            "Сформируй готовый ответ для Telegram как от Миланы. Самостоятельно реши, "
+            f"нужна одна реплика или естественная серия до {max_parts} реплик. "
+            "Не дроби цельную мысль искусственно, но можешь отделить короткое приветствие, "
+            "реакцию или продолжение так, как люди пишут в живом чате. Каждая строка массива "
+            "messages будет отправлена отдельным сообщением; не добавляй служебные пояснения."
         )
         input_items: list[Any] = [*history_input]
-        current_text = f"{sender_name}: {text}"
-        if image_data_url is None:
-            input_items.append({"role": "user", "content": current_text})
-        else:
-            input_items.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": current_text},
-                        {"type": "input_image", "image_url": image_data_url},
-                    ],
-                }
-            )
+        for message in messages:
+            current_text = f"{message.sender_name}: {message.text}"
+            if message.image_data_url is None:
+                input_items.append({"role": "user", "content": current_text})
+            else:
+                input_items.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": current_text},
+                            {"type": "input_image", "image_url": message.image_data_url},
+                        ],
+                    }
+                )
 
+        staged_diary_entries: list[str] = []
         for _ in range(4):
-            response = await self._create_model_response(
+            response, structured = await self._create_model_response(
                 instructions=instructions,
                 input_items=input_items,
             )
+            self._raise_if_incomplete(response)
             output = list(getattr(response, "output", None) or [])
             calls = [
                 item
@@ -936,17 +1240,17 @@ class MilanaMessageResponder:
                 and getattr(item, "name", None) == "write_diary"
             ]
             if not calls:
-                return str(getattr(response, "output_text", "") or "")
+                return self._parse_generated_reply(
+                    response,
+                    structured=structured,
+                    staged_diary_entries=staged_diary_entries,
+                )
 
             # The Responses API expects the model output followed by one result
             # for every function call on the next request.
             input_items.extend(output)
             for call in calls:
-                result = self._execute_diary_call(
-                    call,
-                    chat_key=chat_key,
-                    source_message_id=message_id,
-                )
+                result = self._staged_diary_call(call, staged_diary_entries)
                 input_items.append(
                     {
                         "type": "function_call_output",
@@ -1064,169 +1368,585 @@ class MilanaMessageResponder:
             )
             await self._sleep_until(plan.respond_at)
 
-    async def process(self, event: events.NewMessage.Event) -> None:
-        """Последовательно обрабатывает сообщения одного чата, не блокируя другие."""
-        received_at = self.received_time(event)
-        received_while_online = self.presence.is_online(received_at)
-        continues_conversation = self.presence.is_sleep_deferred(received_at)
-        chat_key: int | str = event.chat_id
+    @staticmethod
+    def _chat_key(event: Any) -> int | str:
+        chat_key: int | str | None = getattr(event, "chat_id", None)
         if chat_key is None:
-            chat_key = str(event.sender_id or "unknown")
-        chat_lock = self._chat_locks.setdefault(chat_key, asyncio.Lock())
+            chat_key = str(getattr(event, "sender_id", None) or "unknown")
+        return chat_key
 
-        async with chat_lock:
-            await self._process_locked(
-                event,
-                received_at=received_at,
-                received_while_online=received_while_online,
-                continues_conversation=continues_conversation,
-            )
+    @staticmethod
+    def _envelope_sort_key(envelope: IncomingEnvelope) -> tuple[datetime, int]:
+        message_id = getattr(envelope.event, "id", 0)
+        return envelope.received_at, message_id if isinstance(message_id, int) else 0
 
-    async def _process_locked(
-        self,
-        event: events.NewMessage.Event,
-        *,
-        received_at: datetime,
-        received_while_online: bool,
-        continues_conversation: bool,
-    ) -> None:
-        print(
-            f"Получено входящее сообщение: chat_id={event.chat_id}, "
-            f"message_id={event.id}; ожидаю подходящего момента для чтения"
+    @staticmethod
+    def _report_worker_error(done: asyncio.Task[None]) -> None:
+        if done.cancelled():
+            return
+        error = done.exception()
+        if error is not None:
+            print(f"Необработанная ошибка worker чата: {error}", file=sys.stderr)
+
+    async def submit(self, event: events.NewMessage.Event) -> asyncio.Task[None]:
+        """Quickly enqueue an event and ensure exactly one worker owns its chat."""
+        received_at = self.received_time(event)
+        envelope = IncomingEnvelope(
+            event=event,
+            received_at=received_at,
+            queued_at=self.current_time(),
+            received_while_online=self.presence.is_online(received_at),
+            continues_conversation=self.presence.is_sleep_deferred(received_at),
         )
+        chat_key = self._chat_key(event)
+        message_id = getattr(event, "id", None)
 
-        presence_started = False
-        answered = False
+        async with self._chat_states_lock:
+            if self._closing:
+                raise RuntimeError("ИИ-ответчик уже останавливается")
+            state = self._chat_states.get(chat_key)
+            if state is None:
+                state = ChatWorkerState(chat_key=chat_key)
+                self._chat_states[chat_key] = state
+
+            if isinstance(message_id, int) and message_id in state.seen_message_ids:
+                if state.worker is None:
+                    state.worker = asyncio.create_task(
+                        self._chat_worker(state),
+                        name=f"milana-chat-{chat_key}",
+                    )
+                    state.worker.add_done_callback(self._report_worker_error)
+                return state.worker
+
+            if isinstance(message_id, int):
+                state.seen_message_ids.add(message_id)
+            state.pending.append(envelope)
+            state.revision += 1
+            state.changed.set()
+            if state.worker is None or state.worker.done():
+                state.worker = asyncio.create_task(
+                    self._chat_worker(state),
+                    name=f"milana-chat-{chat_key}",
+                )
+                state.worker.add_done_callback(self._report_worker_error)
+            worker = state.worker
+
+        print(
+            f"Получено входящее сообщение: chat_id={getattr(event, 'chat_id', None)}, "
+            f"message_id={message_id}; добавлено в очередь чата"
+        )
+        return worker
+
+    async def process(self, event: events.NewMessage.Event) -> None:
+        """Compatibility helper: enqueue one event and wait until its chat is idle."""
+        worker = await self.submit(event)
+        await asyncio.shield(worker)
+
+    async def shutdown(self) -> None:
+        """Stop all chat workers and wait until their cancellation is complete."""
+        async with self._chat_states_lock:
+            self._closing = True
+            workers = [
+                state.worker
+                for state in self._chat_states.values()
+                if state.worker is not None and not state.worker.done()
+            ]
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        async with self._chat_states_lock:
+            self._chat_states.clear()
+
+    async def _first_pending(self, state: ChatWorkerState) -> IncomingEnvelope | None:
+        async with self._chat_states_lock:
+            if not state.pending:
+                return None
+            return min(state.pending, key=self._envelope_sort_key)
+
+    async def _revision(self, state: ChatWorkerState) -> int:
+        async with self._chat_states_lock:
+            return state.revision
+
+    async def _generation_revision(self, state: ChatWorkerState) -> int | None:
+        """Capture a revision only when every queued event is already in the batch."""
+        async with self._chat_states_lock:
+            if state.pending:
+                return None
+            state.changed.clear()
+            return state.revision
+
+    async def _sleep_or_changed(
+        self, state: ChatWorkerState, seconds: float
+    ) -> bool:
+        if seconds <= 0:
+            return state.changed.is_set()
+        sleep_task = asyncio.create_task(self._sleep(seconds))
+        changed_task = asyncio.create_task(state.changed.wait())
         try:
-            await self._wait_before_reading(
-                received_at,
-                received_while_online=received_while_online,
-                continues_conversation=continues_conversation,
+            done, _ = await asyncio.wait(
+                {sleep_task, changed_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            changed_won = changed_task in done
+        finally:
+            for task in (sleep_task, changed_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleep_task, changed_task, return_exceptions=True)
+        # An event can arrive while the losing task is being cancelled above.
+        # Check the signal after cleanup so that arrival starts a fresh quiet wait.
+        return changed_won or state.changed.is_set()
+
+    async def _wait_for_input_quiet(
+        self, state: ChatWorkerState
+    ) -> list[IncomingEnvelope]:
+        """Wait for quiet (within the cap) and atomically claim the pending batch."""
+        flow = self.config.message_flow
+        started_at = self.current_time()
+        deadline = started_at + timedelta(seconds=flow.input_max_wait_seconds)
+        earliest_quiet_end = started_at + timedelta(seconds=flow.input_quiet_seconds)
+        while True:
+            async with self._chat_states_lock:
+                if not state.pending:
+                    return []
+                latest = max(item.queued_at for item in state.pending)
+                state.changed.clear()
+            target = min(
+                max(
+                    latest + timedelta(seconds=flow.input_quiet_seconds),
+                    earliest_quiet_end,
+                ),
+                deadline,
+            )
+            delay = (target - self.current_time()).total_seconds()
+            if delay > 0 and await self._sleep_or_changed(state, delay):
+                continue
+
+            # Recheck and drain under one lock. A submit racing with the end of
+            # sleep either extends quiet here or remains pending for the next pass.
+            async with self._chat_states_lock:
+                if not state.pending:
+                    return []
+                now = self.current_time()
+                latest = max(item.queued_at for item in state.pending)
+                current_target = min(
+                    max(
+                        latest + timedelta(seconds=flow.input_quiet_seconds),
+                        earliest_quiet_end,
+                    ),
+                    deadline,
+                )
+                if current_target > now:
+                    continue
+                pending = sorted(state.pending, key=self._envelope_sort_key)
+                state.pending.clear()
+                state.changed.clear()
+                return pending
+
+    async def _prepare_envelopes(
+        self,
+        state: ChatWorkerState,
+        envelopes: list[IncomingEnvelope],
+    ) -> list[PreparedIncoming]:
+        if not envelopes:
+            return []
+
+        envelopes_with_ids = [
+            envelope
+            for envelope in envelopes
+            if isinstance(getattr(envelope.event, "id", None), int)
+        ]
+        history_anchor = (
+            min(envelopes_with_ids, key=lambda item: item.event.id)
+            if envelopes_with_ids
+            else envelopes[0]
+        )
+        acknowledge_through = (
+            max(envelopes_with_ids, key=lambda item: item.event.id)
+            if envelopes_with_ids
+            else envelopes[-1]
+        )
+        await self._import_existing_history(history_anchor.event, state.chat_key)
+
+        try:
+            input_chat = await acknowledge_through.event.get_input_chat()
+            if input_chat is None:
+                raise TypeError("Telethon не смог определить входной peer чата")
+            await self.client.send_read_acknowledge(
+                input_chat,
+                message=acknowledge_through.event.message,
+                max_id=acknowledge_through.event.id,
+            )
+        except (RPCError, OSError, TypeError, ValueError) as exc:
+            print(
+                "Не удалось отметить пакет до "
+                f"message_id={getattr(acknowledge_through.event, 'id', None)} "
+                f"прочитанным: {exc}",
+                file=sys.stderr,
             )
 
-            action_target: Any = event.chat_id
-            read_acknowledged = False
-            try:
-                input_chat = await event.get_input_chat()
-                if input_chat is None:
-                    raise TypeError("Telethon не смог определить входной peer чата")
-                action_target = input_chat
-                await self.client.send_read_acknowledge(
-                    input_chat,
-                    message=event.message,
-                    max_id=event.id,
-                )
-                read_acknowledged = True
-            except (RPCError, OSError, TypeError, ValueError) as exc:
-                print(
-                    f"Не удалось отметить message_id={event.id} прочитанным: {exc}",
-                    file=sys.stderr,
-                )
-
-            text = (event.raw_text or "").strip()
+        prepared: list[PreparedIncoming] = []
+        for envelope in envelopes:
+            event = envelope.event
+            text = (getattr(event, "raw_text", "") or "").strip()
             image_mime_type = telegram_image_mime_type(event)
             if not text and image_mime_type is None:
                 print(
                     f"Прочитано и пропущено сообщение без текста, message_id={event.id}"
                 )
-                return
+                continue
 
             image_data_url: str | None = None
             if image_mime_type is not None:
-                image_data_url = await telegram_image_data_url(event, image_mime_type)
+                try:
+                    image_data_url = await telegram_image_data_url(
+                        event, image_mime_type
+                    )
+                except (RPCError, OSError, TypeError, ValueError) as exc:
+                    print(
+                        f"Не удалось загрузить изображение message_id={event.id}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if not text:
+                        continue
             stored_text = text or "[фото без подписи]"
-
             try:
                 sender = await event.get_sender()
                 sender_name = display_name(sender)
-            except (RPCError, OSError, TypeError, ValueError):
-                sender_name = str(event.sender_id or "неизвестно")
-            read_status = (
-                "прочитано" if read_acknowledged else "без подтверждения прочтения"
-            )
-            print(f"Сообщение от {sender_name}: {read_status}; генерирую ответ")
+            except (RPCError, OSError, TypeError, ValueError, AttributeError):
+                sender_name = str(getattr(event, "sender_id", None) or "неизвестно")
 
-            chat_key: int | str = event.chat_id
-            if chat_key is None:
-                chat_key = str(event.sender_id or "unknown")
-            await self._import_existing_history(event, chat_key)
-            is_new = self.memory.add_message(
-                chat_key,
-                "user",
-                stored_text,
-                telegram_message_id=event.id,
-                sender_name=sender_name,
-                created_at=received_at.isoformat(),
-            )
+            try:
+                is_new = self.memory.add_message(
+                    state.chat_key,
+                    "user",
+                    stored_text,
+                    telegram_message_id=event.id,
+                    sender_name=sender_name,
+                    created_at=envelope.received_at.isoformat(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"Не удалось сохранить входящее message_id={event.id}: {exc}",
+                    file=sys.stderr,
+                )
+                is_new = True
             if not is_new:
                 print(
-                    f"Повторное событие пропущено: chat_id={event.chat_id}, "
+                    f"Повторное событие пропущено: chat_id={getattr(event, 'chat_id', None)}, "
                     f"message_id={event.id}"
                 )
-                return
-
-            # Dynamic summarization (per-user): if user window hit 60, fold older part into summary
-            # (summarizer covers everything except last ~30 messages).
-            await self._maybe_update_chat_summary(chat_key)
-
-            # Always feed summary (long-term) + fixed recent 30 raw messages to Milana
-            history_input = self.memory.response_input_with_summary(
-                chat_key, recent_limit=RECENT_MESSAGES_LIMIT
-            )
-
-            await self._wait_for_full_online_window(
-                continues_conversation=continues_conversation
-            )
-            answer = await self._generate_answer(
-                chat_key=chat_key,
-                message_id=event.id,
-                sender_name=sender_name,
-                text=stored_text,
-                history_input=history_input,
-                image_data_url=image_data_url,
-            )
-
-            answer_parts = split_telegram_text(answer)
-            if not answer_parts:
-                raise ValueError("Модель вернула пустой ответ")
-
-            await self.presence.begin_response()
-            presence_started = True
-            sent_message_id: int | None = None
-            async with self.client.action(action_target, "typing"):
-                for index, part in enumerate(answer_parts):
-                    if index == 0:
-                        sent = await event.reply(part)
-                    else:
-                        sent = await self.client.send_message(event.chat_id, part)
-                    candidate_id = getattr(sent, "id", None)
-                    if sent_message_id is None and isinstance(candidate_id, int):
-                        sent_message_id = candidate_id
-            answered = True
-            self.memory.add_message(
-                chat_key,
-                "assistant",
-                answer,
-                telegram_message_id=sent_message_id,
-                sender_name="Милана",
-            )
-            print(f"Отправлен ИИ-ответ на message_id={event.id}")
-        except (OpenAIError, RPCError, OSError, TypeError, ValueError) as exc:
-            print(
-                f"Ошибка ИИ-ответа для message_id={event.id}: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-        finally:
-            if presence_started:
-                online_seconds = await self.presence.finish_response(
-                    answered=answered
+                continue
+            prepared.append(
+                PreparedIncoming(
+                    event=event,
+                    received_at=envelope.received_at,
+                    sender_name=sender_name,
+                    text=stored_text,
+                    image_data_url=image_data_url,
                 )
-                if online_seconds is not None:
-                    print(
-                        "После ответа Милана останется в сети ещё "
-                        f"{online_seconds} сек."
+            )
+        return prepared
+
+    async def _action_target(self, event: Any) -> Any:
+        try:
+            input_chat = await event.get_input_chat()
+            if input_chat is None:
+                raise TypeError("Telethon не смог определить входной peer чата")
+            return input_chat
+        except (RPCError, OSError, TypeError, ValueError, AttributeError):
+            return getattr(event, "chat_id", None)
+
+    def _full_online_window_is_open(self, *, continues_conversation: bool) -> bool:
+        if continues_conversation:
+            return True
+        now = self.current_time()
+        if not self.presence.can_respond(now):
+            return False
+        routine_state = self.routine.state_at(now)
+        if (
+            routine_state.next_at is None
+            or routine_state.next_activity is None
+            or routine_state.next_activity.kind != "sleep"
+        ):
+            return True
+        seconds_to_sleep = (routine_state.next_at - now).total_seconds()
+        return seconds_to_sleep >= self.routine.online_behavior.sleep_buffer_seconds
+
+    async def _generate_or_change(
+        self,
+        state: ChatWorkerState,
+        *,
+        revision: int,
+        chat_key: int | str,
+        history_input: list[dict[str, str]],
+        active: list[PreparedIncoming],
+    ) -> GeneratedReply | None:
+        generation_task = asyncio.create_task(
+            self._generate_answer(
+                chat_key=chat_key,
+                history_input=history_input,
+                messages=active,
+            )
+        )
+        changed_task = asyncio.create_task(state.changed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {generation_task, changed_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if generation_task in done:
+                result = await generation_task
+                if await self._revision(state) != revision:
+                    return None
+                return result
+            generation_task.cancel()
+            await asyncio.gather(generation_task, return_exceptions=True)
+            return None
+        finally:
+            for task in (generation_task, changed_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(generation_task, changed_task, return_exceptions=True)
+
+    def _physical_reply_parts(self, reply: GeneratedReply) -> list[str]:
+        parts: list[str] = []
+        for message in reply.messages:
+            parts.extend(split_telegram_text(message))
+        if not parts:
+            raise ValueError("Модель вернула пустой ответ")
+        return parts
+
+    async def _send_generated_reply(
+        self,
+        state: ChatWorkerState,
+        *,
+        revision: int,
+        active: list[PreparedIncoming],
+        reply: GeneratedReply,
+        continues_conversation: bool,
+    ) -> SendOutcome:
+        parts = self._physical_reply_parts(reply)
+        reply_event = active[-1].event
+        sent_count = 0
+        diary_committed = False
+
+        for index, part in enumerate(parts):
+            if index > 0:
+                flow = self.config.message_flow
+                minimum_ms = round(flow.inter_message_min_delay_seconds * 1000)
+                maximum_ms = round(flow.inter_message_max_delay_seconds * 1000)
+                delay = self._randint(minimum_ms, maximum_ms) / 1000
+                if await self._sleep_or_changed(state, delay):
+                    return SendOutcome(sent_count=sent_count, interrupted=True)
+
+            if await self._revision(state) != revision:
+                return SendOutcome(sent_count=sent_count, interrupted=True)
+            if index == 0 and not self._full_online_window_is_open(
+                continues_conversation=continues_conversation
+            ):
+                return SendOutcome(sent_count=sent_count, interrupted=True)
+
+            try:
+                if index == 0:
+                    sent = await reply_event.reply(part)
+                else:
+                    sent = await self.client.send_message(reply_event.chat_id, part)
+            except (RPCError, OSError, TypeError, ValueError) as exc:
+                print(
+                    f"Ошибка отправки части ответа на message_id={reply_event.id}: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                return SendOutcome(sent_count=sent_count, interrupted=False)
+
+            sent_count += 1
+            candidate_id = getattr(sent, "id", None)
+            try:
+                self.memory.add_message(
+                    state.chat_key,
+                    "assistant",
+                    part,
+                    telegram_message_id=(
+                        candidate_id if isinstance(candidate_id, int) else None
+                    ),
+                    sender_name="Милана",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"Ответ отправлен, но не сохранён в памяти: {exc}",
+                    file=sys.stderr,
+                )
+            if not diary_committed:
+                try:
+                    self._commit_staged_diary(
+                        reply.staged_diary_entries,
+                        chat_key=state.chat_key,
+                        source_message_id=getattr(reply_event, "id", None),
                     )
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"Ответ отправлен, но записи дневника не сохранены: {exc}",
+                        file=sys.stderr,
+                    )
+                diary_committed = True
+
+        return SendOutcome(sent_count=sent_count, interrupted=False)
+
+    async def _update_summary_while_idle(self, state: ChatWorkerState) -> None:
+        async with self._chat_states_lock:
+            if state.pending:
+                return
+            state.changed.clear()
+        summary_task = asyncio.create_task(self._maybe_update_chat_summary(state.chat_key))
+        changed_task = asyncio.create_task(state.changed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {summary_task, changed_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if changed_task in done and not summary_task.done():
+                summary_task.cancel()
+            await asyncio.gather(summary_task, return_exceptions=True)
+        finally:
+            for task in (summary_task, changed_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(summary_task, changed_task, return_exceptions=True)
+
+    async def _retire_if_idle(self, state: ChatWorkerState) -> bool:
+        async with self._chat_states_lock:
+            if state.pending:
+                return False
+            if self._chat_states.get(state.chat_key) is state:
+                self._chat_states.pop(state.chat_key, None)
+            return True
+
+    async def _chat_worker(self, state: ChatWorkerState) -> None:
+        active: list[PreparedIncoming] = []
+        context: IncomingEnvelope | None = None
+        skip_schedule_once = False
+        try:
+            while True:
+                if not active:
+                    context = await self._first_pending(state)
+                    if context is None:
+                        if await self._retire_if_idle(state):
+                            return
+                        continue
+                    if not skip_schedule_once:
+                        await self._wait_before_reading(
+                            context.received_at,
+                            received_while_online=context.received_while_online,
+                            continues_conversation=context.continues_conversation,
+                        )
+                    skip_schedule_once = False
+
+                envelopes = await self._wait_for_input_quiet(state)
+                if envelopes:
+                    try:
+                        active.extend(await self._prepare_envelopes(state, envelopes))
+                    except (RPCError, OSError, TypeError, ValueError) as exc:
+                        latest_id = getattr(envelopes[-1].event, "id", None)
+                        print(
+                            f"Ошибка подготовки пакета до message_id={latest_id}: "
+                            f"{type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
+                active.sort(key=lambda item: (item.received_at, getattr(item.event, "id", 0)))
+                if not active:
+                    context = None
+                    continue
+                assert context is not None
+
+                await self._wait_for_full_online_window(
+                    continues_conversation=context.continues_conversation
+                )
+                active_ids = {
+                    item.event.id
+                    for item in active
+                    if isinstance(getattr(item.event, "id", None), int)
+                }
+                history_input = self.memory.response_input_with_summary(
+                    state.chat_key,
+                    recent_limit=RECENT_MESSAGES_LIMIT,
+                    exclude_user_message_ids=active_ids,
+                )
+                revision = await self._generation_revision(state)
+                if revision is None:
+                    continue
+                reply_event = active[-1].event
+                action_target = await self._action_target(reply_event)
+                presence_started = False
+                outcome: SendOutcome | None = None
+
+                try:
+                    # Telethon renews the action while this context is active, so
+                    # «печатает…» covers generation, pauses and every sent part.
+                    async with self.client.action(action_target, "typing"):
+                        reply = await self._generate_or_change(
+                            state,
+                            revision=revision,
+                            chat_key=state.chat_key,
+                            history_input=history_input,
+                            active=active,
+                        )
+                        if reply is None:
+                            continue
+                        if not self._full_online_window_is_open(
+                            continues_conversation=context.continues_conversation
+                        ):
+                            continue
+                        if await self._revision(state) != revision:
+                            continue
+
+                        await self.presence.begin_response()
+                        presence_started = True
+                        outcome = await self._send_generated_reply(
+                            state,
+                            revision=revision,
+                            active=active,
+                            reply=reply,
+                            continues_conversation=context.continues_conversation,
+                        )
+                except (OpenAIError, RPCError, OSError, TypeError, ValueError) as exc:
+                    print(
+                        f"Ошибка ИИ-ответа для message_id={reply_event.id}: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                finally:
+                    if presence_started:
+                        answered = outcome is not None and outcome.sent_count > 0
+                        online_seconds = await self.presence.finish_response(answered=answered)
+                        if online_seconds is not None:
+                            print(
+                                "После ответа Милана останется в сети ещё "
+                                f"{online_seconds} сек."
+                            )
+
+                if outcome is not None and outcome.interrupted and outcome.sent_count == 0:
+                    # No part crossed the commit boundary: keep the old inputs and
+                    # merge the newly queued messages into the same response.
+                    continue
+
+                sent_count = outcome.sent_count if outcome is not None else 0
+                interrupted = bool(outcome and outcome.interrupted and sent_count > 0)
+                if sent_count:
+                    print(
+                        f"Отправлено частей ИИ-ответа: {sent_count}; "
+                        f"последний входящий message_id={reply_event.id}"
+                    )
+                active = []
+                context = None
+                skip_schedule_once = interrupted
+                if sent_count:
+                    await self._update_summary_while_idle(state)
+        finally:
+            async with self._chat_states_lock:
+                if self._chat_states.get(state.chat_key) is state:
+                    self._chat_states.pop(state.chat_key, None)
 
 
 async def run_ai_bot(client: TelegramClient) -> None:
@@ -1244,27 +1964,11 @@ async def run_ai_bot(client: TelegramClient) -> None:
         memory=memory,
         presence=presence,
     )
-    pending_tasks: set[asyncio.Task[None]] = set()
-
     async def handler(event: events.NewMessage.Event) -> None:
-        task = asyncio.create_task(
-            responder.process(event),
-            name=f"milana-message-{event.chat_id}-{event.id}",
-        )
-        pending_tasks.add(task)
-
-        def finish_message(done: asyncio.Task[None]) -> None:
-            pending_tasks.discard(done)
-            if done.cancelled():
-                return
-            error = done.exception()
-            if error is not None:
-                print(
-                    f"Необработанная ошибка фонового ответа: {error}",
-                    file=sys.stderr,
-                )
-
-        task.add_done_callback(finish_message)
+        try:
+            await responder.submit(event)
+        except RuntimeError as exc:
+            print(f"Входящее сообщение пропущено при остановке: {exc}", file=sys.stderr)
 
     client.add_event_handler(
         handler,
@@ -1284,10 +1988,7 @@ async def run_ai_bot(client: TelegramClient) -> None:
     try:
         await client.run_until_disconnected()
     finally:
-        for task in tuple(pending_tasks):
-            task.cancel()
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        await responder.shutdown()
         presence_task.cancel()
         await asyncio.gather(presence_task, return_exceptions=True)
         if client.is_connected():

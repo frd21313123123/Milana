@@ -192,6 +192,46 @@ class MilanaMemoryStoreTests(unittest.TestCase):
         self.assertNotIn("Краткий обзор", str(inp))
         store.close()
 
+    def test_response_input_excludes_active_users_before_applying_recent_limit(self) -> None:
+        store = MilanaMemoryStore()
+        for message_id in range(1, 33):
+            store.add_message(
+                9,
+                "user",
+                f"q{message_id}",
+                telegram_message_id=message_id,
+                sender_name="Лена",
+            )
+
+        inp = store.response_input_with_summary(
+            9,
+            recent_limit=30,
+            exclude_user_message_ids={31, 32},
+        )
+
+        self.assertEqual(len(inp), 30)
+        self.assertIn("q1", inp[0]["content"])
+        self.assertIn("q30", inp[-1]["content"])
+        self.assertNotIn("q31", str(inp))
+        self.assertNotIn("q32", str(inp))
+        store.close()
+
+    def test_active_user_exclusion_keeps_summary_and_assistant_with_same_id(self) -> None:
+        store = MilanaMemoryStore()
+        store.set_chat_summary(7, "Старый контекст")
+        store.add_message(7, "user", "Новый вопрос", telegram_message_id=10)
+        store.add_message(7, "assistant", "Уже отправлено", telegram_message_id=10)
+
+        inp = store.response_input_with_summary(
+            7,
+            exclude_user_message_ids={10},
+        )
+
+        self.assertIn("Старый контекст", inp[0]["content"])
+        self.assertNotIn("Новый вопрос", str(inp))
+        self.assertIn({"role": "assistant", "content": "Уже отправлено"}, inp)
+        store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
