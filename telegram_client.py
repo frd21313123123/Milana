@@ -21,8 +21,10 @@ from telethon.errors import FloodWaitError, RPCError
 
 from milana_memory import (
     DEFAULT_HISTORY_LIMIT,
+    RECENT_MESSAGES_LIMIT,
     MilanaMemoryStore,
     WRITE_DIARY_TOOL,
+    ChatMessage,
 )
 from milana_schedule import (
     DAY_KEYS,
@@ -706,6 +708,137 @@ class MilanaMessageResponder:
             ensure_ascii=False,
         )
 
+    # --- Summarization for long-term per-chat context + dynamic user window ---
+
+    async def _generate_summary(
+        self, *, current_summary: str, new_messages: list[ChatMessage]
+    ) -> str:
+        """Call the model to produce or update a concise chat summary (incremental)."""
+        if not new_messages:
+            return current_summary.strip()
+
+        lines: list[str] = []
+        for m in new_messages:
+            who = m.sender_name or ("Милана" if m.role == "assistant" else "Собеседник")
+            lines.append(f"{who}: {m.content}")
+        transcript = "\n".join(lines)
+
+        instructions = (
+            "Ты — модель сжатия истории диалога. Создай или обнови КРАТКИЙ пересказ "
+            "основных моментов разговора между собеседником и Миланой. "
+            "Выдели только существенное:\n"
+            "- имя и ключевые факты о собеседнике (предпочтения, важные детали жизни)\n"
+            "- темы обсуждений и устойчивые факты\n"
+            "- важные события, договорённости, обещания, решения\n"
+            "- текущее положение дел в чате (если релевантно)\n\n"
+            "Будь очень краток (5–15 пунктов или короткий связный текст). "
+            "Отвечай на языке пользователя (в основном русский). "
+            "Не выдумывай. Не используй дословные длинные цитаты. "
+            "Если есть предыдущий обзор — интегрируй в него новую информацию, сохраняя лаконичность.\n"
+            "ВЫВОДИ ТОЛЬКО сам пересказ, без вступлений и пояснений."
+        )
+
+        prev = f"Предыдущий обзор:\n{current_summary}\n\n" if current_summary.strip() else ""
+        input_items: list[Any] = [
+            {
+                "role": "user",
+                "content": (
+                    prev
+                    + "Новый фрагмент диалога, который нужно учесть в обзоре:\n\n"
+                    + transcript
+                    + "\n\nОбновлённый краткий обзор основных моментов:"
+                ),
+            }
+        ]
+
+        # Use a direct call (no diary tools). Reuse temperature-fallback logic.
+        max_tokens = min(700, self.config.max_output_tokens)
+        request: dict[str, Any] = {
+            "model": self.config.model,
+            "instructions": instructions,
+            "input": input_items,
+            "max_output_tokens": max_tokens,
+        }
+        if self._supports_temperature is not False:
+            request["temperature"] = 0.25
+
+        try:
+            response = await self.openai_client.responses.create(**request)
+            if "temperature" in request:
+                self._supports_temperature = True
+            text = str(getattr(response, "output_text", "") or "").strip()
+            return text or current_summary.strip()
+        except BadRequestError as exc:
+            if "temperature" not in request or not self._temperature_is_unsupported(exc):
+                print(f"Ошибка summarizer: {exc}", file=sys.stderr)
+                return current_summary.strip()
+            self._supports_temperature = False
+            request.pop("temperature", None)
+            try:
+                response = await self.openai_client.responses.create(**request)
+                text = str(getattr(response, "output_text", "") or "").strip()
+                return text or current_summary.strip()
+            except Exception as inner:  # noqa: BLE001
+                print(f"Ошибка summarizer (повтор без temperature): {inner}", file=sys.stderr)
+                return current_summary.strip()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Ошибка summarizer: {exc}", file=sys.stderr)
+            return current_summary.strip()
+
+    async def _maybe_update_chat_summary(self, chat_key: int | str) -> None:
+        """If the dynamic user-message window reached 60, summarize older part (except last ~30)."""
+        try:
+            total_users = self.memory.count_user_messages(chat_key)
+            info = self.memory.get_chat_summary_info(chat_key)
+            covered = info.covered_user_messages if info else 0
+            last_covered_id = info.last_covered_message_id if info else 0
+            current_summary = info.summary if info else ""
+
+            if total_users - covered < 60:
+                return
+
+            user_cutoff = self.memory.get_nth_last_user_message_id(chat_key, 30)
+            total_cutoff = self.memory.get_nth_last_message_id(chat_key, 30)
+            cutoff = None
+            if user_cutoff is not None and total_cutoff is not None:
+                cutoff = min(user_cutoff, total_cutoff)
+            elif user_cutoff is not None:
+                cutoff = user_cutoff
+            elif total_cutoff is not None:
+                cutoff = total_cutoff
+
+            if cutoff is None or cutoff <= last_covered_id:
+                # Nothing new to cover; just advance the covered count
+                if total_users - 30 > covered:
+                    self.memory.set_chat_summary(
+                        chat_key,
+                        current_summary or "Диалог начат.",
+                        covered_user_messages=total_users - 30,
+                        last_covered_message_id=cutoff or last_covered_id,
+                    )
+                return
+
+            batch = self.memory.get_messages_in_id_range(
+                chat_key, last_covered_id + 1, cutoff
+            )
+            if not batch:
+                return
+
+            new_summary = await self._generate_summary(
+                current_summary=current_summary, new_messages=batch
+            )
+            if new_summary:
+                self.memory.set_chat_summary(
+                    chat_key,
+                    new_summary,
+                    covered_user_messages=total_users - 30,
+                    last_covered_message_id=cutoff,
+                )
+                print(f"Обновлён обзор чата chat_id={chat_key} (покрыто пользователей: {total_users - 30})")
+        except Exception as exc:  # noqa: BLE001
+            # Never break the main flow because of summarization
+            print(f"Не удалось обновить обзор чата {chat_key}: {exc}", file=sys.stderr)
+
     async def _generate_answer(
         self,
         *,
@@ -790,7 +923,7 @@ class MilanaMessageResponder:
         received_at: datetime,
         *,
         received_while_online: bool,
-    ) -> datetime | None:
+    ) -> None:
         if received_while_online:
             behavior = self.routine.online_behavior
             fast_delay = self._randint(
@@ -799,12 +932,18 @@ class MilanaMessageResponder:
             )
             fast_target = received_at + timedelta(seconds=fast_delay)
             print(
-                "Сообщение получено, пока Милана в сети; "
-                f"ответ будет отправлен не позднее чем через {fast_delay} сек."
+                f"Сообщение получено, пока Милана в сети; "
+                f"чтение запланировано на {fast_target:%d.%m %H:%M:%S} "
+                f"(через {fast_delay} сек.)"
             )
             now = self.current_time()
             if self.routine.response_policy_at(now).available:
-                return fast_target
+                await self._sleep_until(fast_target)
+                now = self.current_time()
+                if self.routine.response_policy_at(now).available:
+                    return None
+                # Если после короткой задержки окно закрылось (редко) — планируем от текущего момента
+                received_at = now
 
         plan = self.routine.plan_response(received_at, randint=self._randint)
         while True:
@@ -894,7 +1033,7 @@ class MilanaMessageResponder:
         presence_started = False
         answered = False
         try:
-            fast_send_at = await self._wait_before_reading(
+            await self._wait_before_reading(
                 received_at,
                 received_while_online=received_while_online,
             )
@@ -945,9 +1084,6 @@ class MilanaMessageResponder:
             if chat_key is None:
                 chat_key = str(event.sender_id or "unknown")
             await self._import_existing_history(event, chat_key)
-            history_input = self.memory.response_input(
-                chat_key, limit=self.history_limit
-            )
             is_new = self.memory.add_message(
                 chat_key,
                 "user",
@@ -962,6 +1098,15 @@ class MilanaMessageResponder:
                     f"message_id={event.id}"
                 )
                 return
+
+            # Dynamic summarization (per-user): if user window hit 60, fold older part into summary
+            # (summarizer covers everything except last ~30 messages).
+            await self._maybe_update_chat_summary(chat_key)
+
+            # Always feed summary (long-term) + fixed recent 30 raw messages to Milana
+            history_input = self.memory.response_input_with_summary(
+                chat_key, recent_limit=RECENT_MESSAGES_LIMIT
+            )
 
             await self._wait_for_full_online_window()
             async with self._generation_lock:
@@ -978,8 +1123,6 @@ class MilanaMessageResponder:
             if not answer_parts:
                 raise ValueError("Модель вернула пустой ответ")
 
-            if fast_send_at is not None:
-                await self._sleep_until(fast_send_at)
             await self.presence.begin_response()
             presence_started = True
             sent_message_id: int | None = None

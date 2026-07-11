@@ -140,6 +140,58 @@ class MilanaMemoryStoreTests(unittest.TestCase):
         )
         store.close()
 
+    def test_chat_summary_persists_and_is_isolated(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.sqlite3"
+            store = MilanaMemoryStore(path)
+            store.set_chat_summary(100, "Анна любит кофе и планирует поездку.", covered_user_messages=42, last_covered_message_id=99)
+            store.set_chat_summary(200, "Другой пользователь — только работа.")
+
+            info100 = store.get_chat_summary_info(100)
+            info200 = store.get_chat_summary_info(200)
+            self.assertIsNotNone(info100)
+            self.assertIn("кофе", info100.summary if info100 else "")
+            self.assertEqual(info100.covered_user_messages if info100 else 0, 42)
+            self.assertIn("работа", info200.summary if info200 else "")
+
+            # response_input_with_summary injects the block
+            store.add_message(100, "user", "Привет снова", sender_name="Анна")
+            inp = store.response_input_with_summary(100, recent_limit=5)
+            self.assertTrue(any("Краткий обзор предыдущей части" in (m.get("content") or "") for m in inp))
+            self.assertTrue(any("Привет снова" in (m.get("content") or "") for m in inp))
+            store.close()
+
+    def test_user_window_counts_and_nth_last_queries(self) -> None:
+        store = MilanaMemoryStore()
+        for i in range(65):
+            store.add_message(5, "user", f"msg {i}")
+            if i % 3 == 0:
+                store.add_message(5, "assistant", "ok")
+
+        self.assertEqual(store.count_user_messages(5), 65)
+        # 30th last user id exists
+        uid = store.get_nth_last_user_message_id(5, 30)
+        self.assertIsNotNone(uid)
+        self.assertIsInstance(uid, int)
+
+        total_last = store.get_nth_last_message_id(5, 30)
+        self.assertIsNotNone(total_last)
+
+        # range helper
+        batch = store.get_messages_in_id_range(5, 1, 10)
+        self.assertTrue(len(batch) >= 1)
+        store.close()
+
+    def test_response_input_with_summary_uses_30_and_skips_summary_when_absent(self) -> None:
+        store = MilanaMemoryStore()
+        for i in range(40):
+            store.add_message(9, "user", f"q{i}")
+        inp = store.response_input_with_summary(9, recent_limit=30)
+        # No summary yet -> starts directly with messages, length == 30
+        self.assertEqual(len(inp), 30)
+        self.assertNotIn("Краткий обзор", str(inp))
+        store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
