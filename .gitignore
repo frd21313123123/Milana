@@ -9,3 +9,6 @@ sessions/
 bot.pid
 bot-output.log
 bot-error.log
+data/
+*.sqlite3-wal
+*.sqlite3-shm

@@ -23,6 +23,95 @@
     "breaks_minutes": 90
   },
   "sport_hours": 0.5,
+  "response_behavior": {
+    "default": {
+      "available": true,
+      "min_delay_seconds": 10,
+      "max_delay_seconds": 240
+    },
+    "by_kind": {
+      "sleep": {
+        "available": false
+      },
+      "study": {
+        "available": true,
+        "min_delay_seconds": 240,
+        "max_delay_seconds": 1440
+      },
+      "work": {
+        "available": true,
+        "min_delay_seconds": 240,
+        "max_delay_seconds": 1440
+      },
+      "walk": {
+        "available": true,
+        "min_delay_seconds": 45,
+        "max_delay_seconds": 360
+      },
+      "personal": {
+        "available": true,
+        "min_delay_seconds": 10,
+        "max_delay_seconds": 240
+      },
+      "food": {
+        "available": true,
+        "min_delay_seconds": 5,
+        "max_delay_seconds": 120
+      },
+      "sport": {
+        "available": true,
+        "min_delay_seconds": 60,
+        "max_delay_seconds": 480
+      },
+      "chores": {
+        "available": true,
+        "min_delay_seconds": 60,
+        "max_delay_seconds": 600
+      },
+      "commute": {
+        "available": true,
+        "min_delay_seconds": 15,
+        "max_delay_seconds": 180
+      },
+      "rest": {
+        "available": true,
+        "min_delay_seconds": 5,
+        "max_delay_seconds": 120
+      }
+    },
+    "by_title": {
+      "Утренние сборы": {
+        "available": true,
+        "min_delay_seconds": 15,
+        "max_delay_seconds": 120
+      },
+      "Завтрак": {
+        "available": true,
+        "min_delay_seconds": 15,
+        "max_delay_seconds": 120
+      },
+      "Дорога домой": {
+        "available": true,
+        "min_delay_seconds": 30,
+        "max_delay_seconds": 300
+      },
+      "Личные дела": {
+        "available": true,
+        "min_delay_seconds": 60,
+        "max_delay_seconds": 600
+      },
+      "Личные дела и отдых": {
+        "available": true,
+        "min_delay_seconds": 10,
+        "max_delay_seconds": 240
+      },
+      "Свободное время": {
+        "available": true,
+        "min_delay_seconds": 2,
+        "max_delay_seconds": 60
+      }
+    }
+  },
   "custom_events": {
     "mon": [],
     "tue": [],

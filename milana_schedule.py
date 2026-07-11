@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,19 @@ ACTIVITY_EFFECTS = {
     "rest": "восстановление внимания",
 }
 VALID_MODES = {"student", "worker", "balanced", "loaded"}
+MAX_RESPONSE_DELAY_SECONDS = 24 * 60 * 60
+
+DEFAULT_RESPONSE_BEHAVIOR: Mapping[str, Any] = {
+    "default": {
+        "available": True,
+        "min_delay_seconds": 10,
+        "max_delay_seconds": 240,
+    },
+    "by_kind": {
+        "sleep": {"available": False},
+    },
+    "by_title": {},
+}
 
 
 @dataclass(frozen=True)
@@ -119,6 +133,25 @@ class ScheduleState:
     metrics: DayMetrics
 
 
+@dataclass(frozen=True)
+class ResponsePolicy:
+    available: bool
+    min_delay_seconds: int
+    max_delay_seconds: int
+
+    @property
+    def label(self) -> str:
+        """Краткое русское описание политики для журналов и интерфейса."""
+        return format_response_policy(self)
+
+
+@dataclass(frozen=True)
+class ResponsePlan:
+    received_at: datetime
+    respond_at: datetime
+    policy: ResponsePolicy
+
+
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} должен быть объектом")
@@ -139,6 +172,121 @@ def _number(
     if not math.isfinite(number) or not minimum <= number <= maximum:
         raise ValueError(f"{label} должен быть от {minimum:g} до {maximum:g}")
     return number
+
+
+def _response_delay(
+    data: Mapping[str, Any], key: str, label: str
+) -> int:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label}.{key} должен быть целым числом")
+    if not 0 <= value <= MAX_RESPONSE_DELAY_SECONDS:
+        raise ValueError(
+            f"{label}.{key} должен быть от 0 до {MAX_RESPONSE_DELAY_SECONDS}"
+        )
+    return value
+
+
+def _load_response_policy(value: Any, label: str) -> ResponsePolicy:
+    data = _mapping(value, label)
+    unknown_keys = set(data) - {
+        "available",
+        "min_delay_seconds",
+        "max_delay_seconds",
+    }
+    if unknown_keys:
+        raise ValueError(
+            f"Неизвестные поля в {label}: "
+            + ", ".join(sorted(str(key) for key in unknown_keys))
+        )
+
+    available = data.get("available")
+    if not isinstance(available, bool):
+        raise ValueError(f"{label}.available должен быть true или false")
+
+    has_minimum = "min_delay_seconds" in data
+    has_maximum = "max_delay_seconds" in data
+    if has_minimum != has_maximum:
+        raise ValueError(
+            f"{label} должен одновременно задавать min_delay_seconds и "
+            "max_delay_seconds"
+        )
+
+    if not available and not has_minimum:
+        return ResponsePolicy(
+            available=False,
+            min_delay_seconds=0,
+            max_delay_seconds=0,
+        )
+    if available and not has_minimum:
+        raise ValueError(
+            f"{label} должен задавать min_delay_seconds и max_delay_seconds"
+        )
+
+    minimum = _response_delay(data, "min_delay_seconds", label)
+    maximum = _response_delay(data, "max_delay_seconds", label)
+    if minimum > maximum:
+        raise ValueError(
+            f"{label}.min_delay_seconds не может быть больше max_delay_seconds"
+        )
+    if not available and (minimum or maximum):
+        raise ValueError(
+            f"{label} недоступен для ответов, поэтому задержки должны быть нулевыми"
+        )
+    return ResponsePolicy(
+        available=available,
+        min_delay_seconds=minimum,
+        max_delay_seconds=maximum,
+    )
+
+
+def _load_response_behavior(
+    value: Any,
+) -> tuple[
+    ResponsePolicy,
+    Mapping[str, ResponsePolicy],
+    Mapping[str, ResponsePolicy],
+]:
+    data = _mapping(value, "response_behavior")
+    unknown_sections = set(data) - {"default", "by_kind", "by_title"}
+    if unknown_sections:
+        raise ValueError(
+            "Неизвестные разделы в response_behavior: "
+            + ", ".join(sorted(str(key) for key in unknown_sections))
+        )
+
+    default = _load_response_policy(
+        data.get("default"), "response_behavior.default"
+    )
+    raw_by_kind = _mapping(data.get("by_kind", {}), "response_behavior.by_kind")
+    by_kind: dict[str, ResponsePolicy] = {}
+    for kind, raw_policy in raw_by_kind.items():
+        if not isinstance(kind, str) or kind not in ACTIVITY_NAMES:
+            raise ValueError(
+                f"Неизвестный вид занятия в response_behavior.by_kind: {kind!r}"
+            )
+        by_kind[kind] = _load_response_policy(
+            raw_policy, f"response_behavior.by_kind.{kind}"
+        )
+
+    raw_by_title = _mapping(
+        data.get("by_title", {}), "response_behavior.by_title"
+    )
+    by_title: dict[str, ResponsePolicy] = {}
+    for raw_title, raw_policy in raw_by_title.items():
+        if not isinstance(raw_title, str) or not raw_title.strip():
+            raise ValueError(
+                "Названия в response_behavior.by_title должны быть непустыми строками"
+            )
+        title = raw_title.strip()
+        if title in by_title:
+            raise ValueError(
+                f"Повторяющееся название в response_behavior.by_title: {title!r}"
+            )
+        by_title[title] = _load_response_policy(
+            raw_policy, f"response_behavior.by_title.{title}"
+        )
+    return default, by_kind, by_title
 
 
 def time_to_minutes(value: Any, label: str = "время") -> int:
@@ -317,6 +465,13 @@ class WeeklyRoutine:
         )
         self.sport_hours = _number(
             config, "sport_hours", "sport_hours", 0, 3
+        )
+        (
+            self.default_response_policy,
+            self.response_policies_by_kind,
+            self.response_policies_by_title,
+        ) = _load_response_behavior(
+            config.get("response_behavior", DEFAULT_RESPONSE_BEHAVIOR)
         )
         self.custom_events = self._load_custom_events(
             config.get("custom_events", {})
@@ -528,6 +683,71 @@ class WeeklyRoutine:
             metrics=calculate_day_metrics(self.days[day_key]),
         )
 
+    def _response_policy_for_activity(
+        self, activity: Activity | None
+    ) -> ResponsePolicy:
+        if activity is not None:
+            title_policy = self.response_policies_by_title.get(activity.title)
+            if title_policy is not None:
+                return title_policy
+            kind_policy = self.response_policies_by_kind.get(activity.kind)
+            if kind_policy is not None:
+                return kind_policy
+        return self.default_response_policy
+
+    def response_policy_at(
+        self, value: datetime | None = None
+    ) -> ResponsePolicy:
+        """Возвращает правила чтения и ответа для занятия в указанный момент."""
+        state = self.state_at(value)
+        return self._response_policy_for_activity(state.current)
+
+    def plan_response(
+        self,
+        value: datetime | None = None,
+        randint: Callable[[int, int], int] = random.randint,
+    ) -> ResponsePlan:
+        """Планирует ответ, пересчитывая задержку на границах занятий."""
+        received_at = self.normalize_datetime(value)
+        cursor = received_at
+        search_until = received_at + timedelta(days=8)
+
+        while cursor <= search_until:
+            state = self.state_at(cursor)
+            policy = self._response_policy_for_activity(state.current)
+            if policy.available:
+                delay_seconds = randint(
+                    policy.min_delay_seconds,
+                    policy.max_delay_seconds,
+                )
+                if (
+                    isinstance(delay_seconds, bool)
+                    or not isinstance(delay_seconds, int)
+                    or not (
+                        policy.min_delay_seconds
+                        <= delay_seconds
+                        <= policy.max_delay_seconds
+                    )
+                ):
+                    raise ValueError(
+                        "randint должен вернуть целое число внутри диапазона политики"
+                    )
+                respond_at = cursor + timedelta(seconds=delay_seconds)
+                if state.next_at is None or respond_at < state.next_at:
+                    return ResponsePlan(
+                        received_at=received_at,
+                        respond_at=respond_at,
+                        policy=policy,
+                    )
+
+            if state.next_at is None or state.next_at <= cursor:
+                break
+            cursor = state.next_at
+
+        raise ValueError(
+            "Не удалось найти доступное окно для ответа в пределах недели"
+        )
+
     def week_metrics(self) -> WeekMetrics:
         days = [calculate_day_metrics(self.days[day_key]) for day_key in DAY_KEYS]
 
@@ -583,6 +803,36 @@ def format_duration(minutes: int) -> str:
     return f"{hours} ч {remainder} мин"
 
 
+def format_response_delay(seconds: int) -> str:
+    """Форматирует секундную задержку компактно и без потери точности."""
+    seconds = max(0, seconds)
+    if seconds == 0:
+        return "сразу"
+    hours, remainder = divmod(seconds, 60 * 60)
+    minutes, remainder = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours} ч")
+    if minutes:
+        parts.append(f"{minutes} мин")
+    if remainder:
+        parts.append(f"{remainder} сек")
+    return " ".join(parts)
+
+
+def format_response_policy(policy: ResponsePolicy) -> str:
+    """Возвращает понятное пользователю описание поведения с сообщениями."""
+    if not policy.available:
+        return "не читает и не отвечает"
+    minimum = format_response_delay(policy.min_delay_seconds)
+    maximum = format_response_delay(policy.max_delay_seconds)
+    if policy.min_delay_seconds == policy.max_delay_seconds:
+        if policy.min_delay_seconds == 0:
+            return "читает и отвечает сразу"
+        return f"читает и отвечает примерно через {minimum}"
+    return f"читает и отвечает через {minimum}–{maximum}"
+
+
 def format_activity_range(activity: Activity) -> str:
     return f"{minutes_to_time(activity.start)}–{minutes_to_time(activity.end)}"
 
@@ -598,6 +848,9 @@ def format_current_status(
     brief: bool = False,
 ) -> str:
     state = routine.state_at(value)
+    response_behavior = format_response_policy(
+        routine._response_policy_for_activity(state.current)
+    )
     current_label = _activity_label(state.current)
     current_range = (
         f" ({format_activity_range(state.current)})" if state.current else ""
@@ -619,6 +872,7 @@ def format_current_status(
         return (
             f"Расписание Миланы: сейчас «{current_label}»{current_range}"
             f"{remaining_text}; {next_text}. "
+            f"Сообщения: {response_behavior}. "
             f"Состояние дня: энергия {state.metrics.energy}%, "
             f"стресс {state.metrics.stress}%, "
             f"продуктивность {state.metrics.productivity}%, "
@@ -636,6 +890,7 @@ def format_current_status(
             f"({routine.timezone_name}, {offset_label})"
         ),
         f"Сейчас: {current_label}{current_range}{remaining_text}.",
+        f"Сообщения: {response_behavior}.",
         f"Далее: {_activity_label(state.next_activity)}"
         + (f" в {state.next_at:%H:%M}." if state.next_at else "."),
         (
@@ -648,9 +903,12 @@ def format_current_status(
     ]
     for activity in routine.days[state.day_key]:
         marker = "→" if activity is state.current else " "
+        activity_response = format_response_policy(
+            routine._response_policy_for_activity(activity)
+        )
         lines.append(
             f"{marker} {format_activity_range(activity)}  {activity.title} "
-            f"({ACTIVITY_NAMES[activity.kind]})"
+            f"({ACTIVITY_NAMES[activity.kind]}; {activity_response})"
         )
     return "\n".join(lines)
 
@@ -665,9 +923,13 @@ def format_day_schedule(routine: WeeklyRoutine, day_key: str) -> str:
         ),
     ]
     for activity in routine.days[day_key]:
+        activity_response = format_response_policy(
+            routine._response_policy_for_activity(activity)
+        )
         lines.append(
             f"{format_activity_range(activity)}  {activity.title} "
-            f"({ACTIVITY_NAMES[activity.kind]}: {ACTIVITY_EFFECTS[activity.kind]})"
+            f"({ACTIVITY_NAMES[activity.kind]}: {ACTIVITY_EFFECTS[activity.kind]}; "
+            f"{activity_response})"
         )
     return "\n".join(lines)
 
