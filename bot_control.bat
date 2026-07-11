@@ -64,7 +64,7 @@ if defined BOT_PIDS (
 )
 if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath '%PYTHON%' -ArgumentList '-u', '%SCRIPT%', 'ai-bot' -WorkingDirectory '%ROOT%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $pathValue = [Environment]::GetEnvironmentVariable('Path'); [Environment]::SetEnvironmentVariable('PATH', $null); [Environment]::SetEnvironmentVariable('Path', $pathValue); $p = Start-Process -FilePath '%PYTHON%' -ArgumentList '-u', '%SCRIPT%', 'ai-bot' -WorkingDirectory '%ROOT%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id"
 if errorlevel 1 (
     echo Failed to start the bot. Check PowerShell availability.
     goto action_done

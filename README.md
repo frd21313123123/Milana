@@ -189,9 +189,17 @@ OPENAI_API_KEY=
   "online_response_max_seconds": 10,
   "post_reply_online_min_seconds": 30,
   "post_reply_online_max_seconds": 60,
+  "spontaneous_online_interval_min_seconds": 900,
+  "spontaneous_online_interval_max_seconds": 2700,
+  "spontaneous_online_duration_min_seconds": 120,
+  "spontaneous_online_duration_max_seconds": 300,
   "sleep_buffer_seconds": 60
 }
 ```
+
+По умолчанию в доступное по расписанию время Милана заходит в сеть через
+случайные 15–45 минут, остаётся там на 2–5 минут и снова выходит. Во время сна
+такие фоновые появления не запускаются.
 
 Минимальное значение не должно превышать максимальное, а
 `sleep_buffer_seconds` должно быть не меньше

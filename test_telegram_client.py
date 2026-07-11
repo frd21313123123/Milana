@@ -335,7 +335,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
     async def test_answer_keeps_presence_online_for_thirty_to_sixty_seconds(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         client = MagicMock()
-        client.side_effect = AsyncMock(return_value=None)
+        update_status = AsyncMock(return_value=None)
+        client.side_effect = update_status
         presence = MilanaPresenceController(
             client,
             load_routine(),
@@ -352,6 +353,50 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(presence.is_online())
         self.assertEqual(presence.online_until, clock.value + timedelta(seconds=60))
         clock.value += timedelta(seconds=60)
+        self.assertFalse(presence.is_online())
+
+    async def test_presence_spontaneously_goes_online_for_a_few_minutes(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        client = MagicMock()
+        update_status = AsyncMock(return_value=None)
+        client.side_effect = update_status
+        presence = MilanaPresenceController(
+            client,
+            load_routine(),
+            now=clock.now,
+            sleep=clock.sleep,
+            randint=lambda minimum, maximum: minimum,
+        )
+
+        self.assertIsNone(await presence.refresh())
+        self.assertFalse(presence.is_online())
+        clock.value += timedelta(minutes=15)
+        self.assertEqual(await presence.refresh(), 120)
+        self.assertTrue(presence.is_online())
+        clock.value += timedelta(minutes=2)
+        self.assertIsNone(await presence.refresh())
+        self.assertFalse(presence.is_online())
+
+        offline_flags = [
+            call.args[0].offline for call in update_status.await_args_list
+        ]
+        self.assertEqual(offline_flags, [True, False, True])
+
+    async def test_presence_does_not_spontaneously_go_online_during_sleep(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 1, 0, tzinfo=YEKT))
+        client = MagicMock()
+        client.side_effect = AsyncMock(return_value=None)
+        presence = MilanaPresenceController(
+            client,
+            load_routine(),
+            now=clock.now,
+            sleep=clock.sleep,
+            randint=lambda minimum, maximum: minimum,
+        )
+
+        await presence.refresh()
+        clock.value += timedelta(minutes=15)
+        self.assertIsNone(await presence.refresh())
         self.assertFalse(presence.is_online())
 
     async def test_second_message_receives_history_from_the_same_chat(self) -> None:

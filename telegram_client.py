@@ -402,6 +402,7 @@ class MilanaPresenceController:
         self._sleep = sleep
         self._randint = randint
         self._online_until: datetime | None = None
+        self._next_spontaneous_online_at: datetime | None = None
         self._active_responses = 0
         self._last_offline: bool | None = None
         self._lock = asyncio.Lock()
@@ -460,17 +461,56 @@ class MilanaPresenceController:
             await self._publish_locked()
             return online_seconds
 
+    def _schedule_spontaneous_online_locked(self, from_time: datetime) -> None:
+        behavior = self.routine.online_behavior
+        delay = self._randint(
+            behavior.spontaneous_online_interval_min_seconds,
+            behavior.spontaneous_online_interval_max_seconds,
+        )
+        self._next_spontaneous_online_at = from_time + timedelta(seconds=delay)
+
+    async def refresh(self) -> int | None:
+        """Обновляет статус и при необходимости начинает фоновое online-окно."""
+        async with self._lock:
+            now = self.current_time()
+            if self._next_spontaneous_online_at is None:
+                self._schedule_spontaneous_online_locked(now)
+
+            online_seconds: int | None = None
+            if (
+                self._next_spontaneous_online_at is not None
+                and now >= self._next_spontaneous_online_at
+                and self.routine.response_policy_at(now).available
+            ):
+                behavior = self.routine.online_behavior
+                online_seconds = self._randint(
+                    behavior.spontaneous_online_duration_min_seconds,
+                    behavior.spontaneous_online_duration_max_seconds,
+                )
+                candidate = now + timedelta(seconds=online_seconds)
+                if self._online_until is None or candidate > self._online_until:
+                    self._online_until = candidate
+                self._schedule_spontaneous_online_locked(candidate)
+
+            await self._publish_locked()
+            return online_seconds
+
     async def run(self, interval: float = 1.0) -> None:
-        """Обновляет offline после завершения гарантированного online-окна."""
+        """Управляет ответами и случайными короткими появлениями в сети."""
         while True:
-            async with self._lock:
-                await self._publish_locked()
+            online_seconds = await self.refresh()
+            if online_seconds is not None:
+                print(
+                    "Милана ненадолго зашла в сеть; выйдет примерно через "
+                    f"{online_seconds // 60} мин."
+                )
             await self._sleep(interval)
 
     async def force_offline(self) -> None:
         async with self._lock:
             self._active_responses = 0
             self._online_until = None
+            self._next_spontaneous_online_at = None
             try:
                 await self.client(functions.account.UpdateStatusRequest(offline=True))
                 self._last_offline = True

@@ -69,6 +69,10 @@ DEFAULT_ONLINE_BEHAVIOR: Mapping[str, int] = {
     "online_response_max_seconds": 10,
     "post_reply_online_min_seconds": 30,
     "post_reply_online_max_seconds": 60,
+    "spontaneous_online_interval_min_seconds": 15 * 60,
+    "spontaneous_online_interval_max_seconds": 45 * 60,
+    "spontaneous_online_duration_min_seconds": 2 * 60,
+    "spontaneous_online_duration_max_seconds": 5 * 60,
     "sleep_buffer_seconds": 60,
 }
 
@@ -165,6 +169,10 @@ class OnlineBehavior:
     online_response_max_seconds: int
     post_reply_online_min_seconds: int
     post_reply_online_max_seconds: int
+    spontaneous_online_interval_min_seconds: int
+    spontaneous_online_interval_max_seconds: int
+    spontaneous_online_duration_min_seconds: int
+    spontaneous_online_duration_max_seconds: int
     sleep_buffer_seconds: int
 
 
@@ -340,6 +348,22 @@ def _load_online_behavior(value: Any) -> OnlineBehavior:
         raise ValueError(
             "online_behavior.post_reply_online_min_seconds не может быть больше "
             "post_reply_online_max_seconds"
+        )
+    if (
+        values["spontaneous_online_interval_min_seconds"]
+        > values["spontaneous_online_interval_max_seconds"]
+    ):
+        raise ValueError(
+            "online_behavior.spontaneous_online_interval_min_seconds не может "
+            "быть больше spontaneous_online_interval_max_seconds"
+        )
+    if (
+        values["spontaneous_online_duration_min_seconds"]
+        > values["spontaneous_online_duration_max_seconds"]
+    ):
+        raise ValueError(
+            "online_behavior.spontaneous_online_duration_min_seconds не может "
+            "быть больше spontaneous_online_duration_max_seconds"
         )
     if (
         values["sleep_buffer_seconds"]

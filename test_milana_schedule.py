@@ -259,6 +259,10 @@ class MilanaScheduleTests(unittest.TestCase):
                 online_response_max_seconds=10,
                 post_reply_online_min_seconds=30,
                 post_reply_online_max_seconds=60,
+                spontaneous_online_interval_min_seconds=900,
+                spontaneous_online_interval_max_seconds=2700,
+                spontaneous_online_duration_min_seconds=120,
+                spontaneous_online_duration_max_seconds=300,
                 sleep_buffer_seconds=60,
             ),
         )
@@ -277,6 +281,18 @@ class MilanaScheduleTests(unittest.TestCase):
                     post_reply_online_max_seconds=60,
                 ),
                 "post_reply_online_min_seconds не может быть больше",
+            ),
+            (
+                lambda behavior: behavior.update(
+                    spontaneous_online_interval_min_seconds=2701,
+                ),
+                "spontaneous_online_interval_min_seconds не может",
+            ),
+            (
+                lambda behavior: behavior.update(
+                    spontaneous_online_duration_min_seconds=301,
+                ),
+                "spontaneous_online_duration_min_seconds не может",
             ),
             (
                 lambda behavior: behavior.update(sleep_buffer_seconds=59),
