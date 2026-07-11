@@ -637,6 +637,46 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         event.reply.assert_awaited_once_with("Готовый ответ")
 
+    async def test_dynamic_summary_triggers_on_60_user_messages_and_prepends_context(self) -> None:
+        """When ~60 user messages accumulate the summarizer runs and Milana receives summary + recent 30."""
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+
+        chat = 777
+        # Pre-populate just under the window (59 users). Interleave a few assistant turns.
+        for i in range(59):
+            responder.memory.add_message(chat, "user", f"u{i}", sender_name="Тест")
+            if i % 2 == 0:
+                responder.memory.add_message(chat, "assistant", f"a{i}")
+
+        # The next (60th) user message should cross the threshold inside process
+        event = make_event(clock.value, text="Юбилейное сообщение 60", chat_id=chat, message_id=5000, sender_id=123)
+
+        # Make the summary call return something distinct, answer call returns normal
+        summary_call_result = SimpleNamespace(output_text="Ключевые темы: имя Тест, любит кофе, планирует отпуск.")
+        answer_result = SimpleNamespace(output_text="Поняла, кофе и отпуск.", output=[])
+        openai_client.responses.create.side_effect = [summary_call_result, answer_result]
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        # Two model calls: first summarizer, second the actual answer
+        self.assertGreaterEqual(openai_client.responses.create.call_count, 2)
+
+        # Summary was persisted
+        info = responder.memory.get_chat_summary_info(chat)
+        self.assertIsNotNone(info)
+        self.assertIn("кофе", (info.summary if info else ""))
+
+        # The input to the *answer* generation (last call) must contain the summary note + recent
+        last_call_input = openai_client.responses.create.await_args_list[-1].kwargs["input"]
+        joined = str(last_call_input)
+        self.assertIn("Ключевые темы", joined)  # from the injected summary block
+        self.assertIn("Юбилейное сообщение 60", joined)
+
+        # Covered count advanced so that active user window is reset toward 30
+        self.assertLessEqual(info.covered_user_messages if info else 0, 59)
+
 
 if __name__ == "__main__":
     unittest.main()

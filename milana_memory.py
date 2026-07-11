@@ -15,6 +15,10 @@ DEFAULT_HISTORY_LIMIT = 40
 DEFAULT_DIARY_LIMIT = 80
 MAX_MESSAGE_LENGTH = 20_000
 MAX_DIARY_ENTRY_LENGTH = 2_000
+MAX_SUMMARY_LENGTH = 8_000
+RECENT_MESSAGES_LIMIT = 30
+USER_WINDOW_TRIGGER = 60
+USER_WINDOW_RESET_TARGET = 30
 
 
 WRITE_DIARY_TOOL: dict[str, Any] = {
@@ -56,6 +60,14 @@ class DiaryEntry:
     created_at: str
     source_chat_id: str | None
     source_message_id: int | None
+
+
+@dataclass(frozen=True)
+class ChatSummary:
+    """Compressed long-term context for one chat (per-user)."""
+    summary: str
+    covered_user_messages: int
+    last_covered_message_id: int
 
 
 def _utc_now() -> str:
@@ -113,6 +125,14 @@ class MilanaMemoryStore:
                 created_at TEXT NOT NULL,
                 source_chat_id TEXT,
                 source_message_id INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_summaries (
+                chat_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                covered_user_messages INTEGER NOT NULL DEFAULT 0,
+                last_covered_message_id INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -281,6 +301,137 @@ class MilanaMemoryStore:
                 content = f"{message.sender_name}: {content}"
             result.append({"role": message.role, "content": content})
         return result
+
+    def response_input_with_summary(
+        self, chat_id: int | str, *, recent_limit: int = RECENT_MESSAGES_LIMIT
+    ) -> list[dict[str, str]]:
+        """Return summary context (if any) + recent raw messages for the main model."""
+        result: list[dict[str, str]] = []
+        info = self.get_chat_summary_info(chat_id)
+        if info and info.summary:
+            note = (
+                "[Краткий обзор предыдущей части разговора (основные моменты). "
+                "Используй как долговременный контекст этого чата.]\n"
+                + info.summary
+            )
+            result.append({"role": "assistant", "content": note})
+        for message in self.get_chat_history(chat_id, limit=recent_limit):
+            content = message.content
+            if message.role == "user" and message.sender_name:
+                content = f"{message.sender_name}: {content}"
+            result.append({"role": message.role, "content": content})
+        return result
+
+    # --- Per-chat summary + dynamic window helpers ---
+
+    def get_chat_summary_info(self, chat_id: int | str) -> ChatSummary | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT summary, covered_user_messages, last_covered_message_id
+                FROM chat_summaries WHERE chat_id = ?
+                """,
+                (str(chat_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return ChatSummary(
+            summary=row["summary"],
+            covered_user_messages=row["covered_user_messages"],
+            last_covered_message_id=row["last_covered_message_id"],
+        )
+
+    def set_chat_summary(
+        self,
+        chat_id: int | str,
+        summary: str,
+        *,
+        covered_user_messages: int = 0,
+        last_covered_message_id: int = 0,
+    ) -> None:
+        value = _normalize_content(
+            summary, maximum=MAX_SUMMARY_LENGTH, label="Краткий обзор"
+        )
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO chat_summaries
+                (chat_id, summary, covered_user_messages, last_covered_message_id, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(chat_id),
+                    value,
+                    max(0, int(covered_user_messages)),
+                    max(0, int(last_covered_message_id)),
+                    _utc_now(),
+                ),
+            )
+            self._connection.commit()
+
+    def count_user_messages(self, chat_id: int | str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS c FROM chat_messages WHERE chat_id = ? AND role = 'user'",
+                (str(chat_id),),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def get_nth_last_user_message_id(self, chat_id: int | str, n: int = 30) -> int | None:
+        if n < 1:
+            return None
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT id FROM chat_messages
+                WHERE chat_id = ? AND role = 'user'
+                ORDER BY id DESC
+                LIMIT 1 OFFSET ?
+                """,
+                (str(chat_id), n - 1),
+            ).fetchone()
+        return int(row["id"]) if row and row["id"] is not None else None
+
+    def get_nth_last_message_id(self, chat_id: int | str, n: int = 30) -> int | None:
+        if n < 1:
+            return None
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT id FROM chat_messages
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT 1 OFFSET ?
+                """,
+                (str(chat_id), n - 1),
+            ).fetchone()
+        return int(row["id"]) if row and row["id"] is not None else None
+
+    def get_messages_in_id_range(
+        self, chat_id: int | str, min_id: int, max_id: int
+    ) -> list[ChatMessage]:
+        if min_id > max_id:
+            return []
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT role, content, telegram_message_id, sender_name, created_at
+                FROM chat_messages
+                WHERE chat_id = ? AND id >= ? AND id <= ?
+                ORDER BY id ASC
+                """,
+                (str(chat_id), min_id, max_id),
+            ).fetchall()
+        return [
+            ChatMessage(
+                role=row["role"],
+                content=row["content"],
+                telegram_message_id=row["telegram_message_id"],
+                sender_name=row["sender_name"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def diary_instructions(self, *, limit: int = DEFAULT_DIARY_LIMIT) -> str:
         """Build a clearly delimited, non-command memory block for the model."""
