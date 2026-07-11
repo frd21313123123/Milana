@@ -490,8 +490,25 @@ class MilanaPresenceController:
                     behavior.spontaneous_online_duration_max_seconds,
                 )
                 candidate = now + timedelta(seconds=online_seconds)
+                state = self.routine.state_at(now)
+                if (
+                    state.next_at is not None
+                    and state.next_activity is not None
+                    and state.next_activity.kind == "sleep"
+                ):
+                    # Фоновый online должен закончиться заранее, чтобы статус
+                    # «в сети» никогда не появлялся там, где уже нельзя успеть
+                    # ответить и затем сохранить post-reply окно.
+                    safe_until = state.next_at - timedelta(
+                        seconds=behavior.sleep_buffer_seconds
+                    )
+                    candidate = min(candidate, safe_until)
+                online_seconds = max(0, int((candidate - now).total_seconds()))
                 if self._online_until is None or candidate > self._online_until:
-                    self._online_until = candidate
+                    if candidate > now:
+                        self._online_until = candidate
+                if online_seconds == 0:
+                    online_seconds = None
                 self._schedule_spontaneous_online_locked(candidate)
 
             await self._publish_locked()
@@ -941,8 +958,9 @@ class MilanaMessageResponder:
                 await self._sleep_until(fast_target)
                 now = self.current_time()
                 if self.routine.response_policy_at(now).available:
-                    return None
-                # Если после короткой задержки окно закрылось (редко) — планируем от текущего момента
+                    return
+                # Если после короткой задержки окно закрылось (редко),
+                # планируем чтение заново от текущего момента.
                 received_at = now
 
         plan = self.routine.plan_response(received_at, randint=self._randint)

@@ -332,6 +332,39 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(clock.delays, [60, 10])
 
+    async def test_online_delay_finishes_before_reading_and_generation(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(
+            clock,
+            randint=lambda minimum, maximum: maximum,
+        )
+        await responder.presence.begin_response()
+        await responder.presence.finish_response(answered=True)
+        event = make_event(clock.value, message_id=302)
+
+        read_at: list[datetime] = []
+        generation_started_at: list[datetime] = []
+
+        async def acknowledge_after_timer(*args, **kwargs):
+            read_at.append(clock.value)
+
+        async def generate_immediately(**kwargs):
+            generation_started_at.append(clock.value)
+            return SimpleNamespace(output_text="Готовый ответ")
+
+        client.send_read_acknowledge.side_effect = acknowledge_after_timer
+        openai_client.responses.create.side_effect = generate_immediately
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        expected_start = event.message.date + timedelta(seconds=10)
+        self.assertEqual(read_at, [expected_start])
+        self.assertEqual(generation_started_at, [expected_start])
+        self.assertEqual(clock.delays, [10])
+        client.send_read_acknowledge.assert_awaited_once()
+        event.reply.assert_awaited_once_with("Готовый ответ")
+
     async def test_answer_keeps_presence_online_for_thirty_to_sixty_seconds(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         client = MagicMock()
@@ -381,6 +414,26 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             call.args[0].offline for call in update_status.await_args_list
         ]
         self.assertEqual(offline_flags, [True, False, True])
+
+    async def test_spontaneous_online_ends_before_pre_sleep_buffer(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 23, 13, tzinfo=YEKT))
+        client = MagicMock()
+        client.side_effect = AsyncMock(return_value=None)
+        presence = MilanaPresenceController(
+            client,
+            load_routine(),
+            now=clock.now,
+            sleep=clock.sleep,
+            randint=lambda minimum, maximum: minimum,
+        )
+
+        await presence.refresh()
+        clock.value += timedelta(minutes=15)
+        self.assertEqual(await presence.refresh(), 60)
+        self.assertEqual(
+            presence.online_until,
+            datetime(2026, 7, 13, 23, 29, tzinfo=YEKT),
+        )
 
     async def test_presence_does_not_spontaneously_go_online_during_sleep(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 1, 0, tzinfo=YEKT))
