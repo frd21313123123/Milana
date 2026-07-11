@@ -276,11 +276,23 @@ class MilanaScheduleTests(unittest.TestCase):
                 "online_response_min_seconds не может быть больше",
             ),
             (
+                lambda behavior: behavior.update(online_response_max_seconds=11),
+                "online_response_max_seconds должен быть не больше 10",
+            ),
+            (
                 lambda behavior: behavior.update(
                     post_reply_online_min_seconds=61,
                     post_reply_online_max_seconds=60,
                 ),
                 "post_reply_online_min_seconds не может быть больше",
+            ),
+            (
+                lambda behavior: behavior.update(post_reply_online_min_seconds=29),
+                "post_reply_online_min_seconds должен быть не меньше 30",
+            ),
+            (
+                lambda behavior: behavior.update(post_reply_online_max_seconds=61),
+                "post_reply_online_max_seconds должен быть не больше 60",
             ),
             (
                 lambda behavior: behavior.update(

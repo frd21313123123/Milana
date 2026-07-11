@@ -341,6 +341,10 @@ def _load_online_behavior(value: Any) -> OnlineBehavior:
             "online_behavior.online_response_min_seconds не может быть больше "
             "online_response_max_seconds"
         )
+    if values["online_response_max_seconds"] > 10:
+        raise ValueError(
+            "online_behavior.online_response_max_seconds должен быть не больше 10"
+        )
     if (
         values["post_reply_online_min_seconds"]
         > values["post_reply_online_max_seconds"]
@@ -348,6 +352,14 @@ def _load_online_behavior(value: Any) -> OnlineBehavior:
         raise ValueError(
             "online_behavior.post_reply_online_min_seconds не может быть больше "
             "post_reply_online_max_seconds"
+        )
+    if values["post_reply_online_min_seconds"] < 30:
+        raise ValueError(
+            "online_behavior.post_reply_online_min_seconds должен быть не меньше 30"
+        )
+    if values["post_reply_online_max_seconds"] > 60:
+        raise ValueError(
+            "online_behavior.post_reply_online_max_seconds должен быть не больше 60"
         )
     if (
         values["spontaneous_online_interval_min_seconds"]

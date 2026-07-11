@@ -490,8 +490,25 @@ class MilanaPresenceController:
                     behavior.spontaneous_online_duration_max_seconds,
                 )
                 candidate = now + timedelta(seconds=online_seconds)
+                state = self.routine.state_at(now)
+                if (
+                    state.next_at is not None
+                    and state.next_activity is not None
+                    and state.next_activity.kind == "sleep"
+                ):
+                    # Фоновый online должен закончиться заранее, чтобы статус
+                    # «в сети» никогда не появлялся там, где уже нельзя успеть
+                    # ответить и затем сохранить post-reply окно.
+                    safe_until = state.next_at - timedelta(
+                        seconds=behavior.sleep_buffer_seconds
+                    )
+                    candidate = min(candidate, safe_until)
+                online_seconds = max(0, int((candidate - now).total_seconds()))
                 if self._online_until is None or candidate > self._online_until:
-                    self._online_until = candidate
+                    if candidate > now:
+                        self._online_until = candidate
+                if online_seconds == 0:
+                    online_seconds = None
                 self._schedule_spontaneous_online_locked(candidate)
 
             await self._publish_locked()
@@ -574,7 +591,6 @@ class MilanaMessageResponder:
             randint=randint,
         )
         self._chat_locks: dict[int | str, asyncio.Lock] = {}
-        self._generation_lock = asyncio.Lock()
         self._supports_temperature: bool | None = None
 
     async def _import_existing_history(
@@ -941,8 +957,9 @@ class MilanaMessageResponder:
                 await self._sleep_until(fast_target)
                 now = self.current_time()
                 if self.routine.response_policy_at(now).available:
-                    return None
-                # Если после короткой задержки окно закрылось (редко) — планируем от текущего момента
+                    return
+                # Если после короткой задержки окно закрылось (редко),
+                # планируем чтение заново от текущего момента.
                 received_at = now
 
         plan = self.routine.plan_response(received_at, randint=self._randint)
@@ -1109,15 +1126,14 @@ class MilanaMessageResponder:
             )
 
             await self._wait_for_full_online_window()
-            async with self._generation_lock:
-                answer = await self._generate_answer(
-                    chat_key=chat_key,
-                    message_id=event.id,
-                    sender_name=sender_name,
-                    text=stored_text,
-                    history_input=history_input,
-                    image_data_url=image_data_url,
-                )
+            answer = await self._generate_answer(
+                chat_key=chat_key,
+                message_id=event.id,
+                sender_name=sender_name,
+                text=stored_text,
+                history_input=history_input,
+                image_data_url=image_data_url,
+            )
 
             answer_parts = split_telegram_text(answer)
             if not answer_parts:
