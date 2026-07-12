@@ -1,6 +1,9 @@
 import argparse
 import asyncio
+import gzip
+import io
 import json
+import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,16 +27,19 @@ from telegram_client import (
     ai_string,
     build_parser,
     display_name,
+    image_mime_type_from_bytes,
     load_env_file,
     load_ai_settings,
     load_message_flow_config,
     message_text,
     normalize_target,
     positive_int,
+    render_sticker_png,
     run,
     run_ai_bot,
     split_telegram_text,
     telegram_image_mime_type,
+    telegram_sticker_info,
 )
 
 
@@ -134,16 +140,38 @@ def make_event(
     photo: bool = False,
     mime_type: str | None = None,
     image_bytes: bytes = b"test-image",
+    sticker: bool = False,
+    sticker_emoji: str | None = None,
+    sticker_thumbs: list[object] | None = None,
+    thumbnail_bytes: bytes | None = b"\xff\xd8\xffpreview",
 ):
-    message = SimpleNamespace(date=value, photo=object() if photo else None)
-    message.download_media = AsyncMock(return_value=image_bytes)
+    file_info = (
+        SimpleNamespace(mime_type=mime_type, emoji=sticker_emoji)
+        if mime_type is not None or sticker
+        else None
+    )
+    sticker_document = (
+        SimpleNamespace(thumbs=tuple(sticker_thumbs or ())) if sticker else None
+    )
+    message = SimpleNamespace(
+        date=value,
+        photo=object() if photo else None,
+        file=file_info,
+        sticker=sticker_document,
+    )
+
+    async def download_media(*, file, thumb=None):
+        return thumbnail_bytes if thumb is not None else image_bytes
+
+    message.download_media = AsyncMock(side_effect=download_media)
     event = SimpleNamespace(
         chat_id=chat_id,
         sender_id=sender_id,
         id=message_id,
         raw_text=text,
         photo=message.photo,
-        file=SimpleNamespace(mime_type=mime_type) if mime_type else None,
+        file=file_info,
+        sticker=sticker_document,
         message=message,
         get_input_chat=AsyncMock(return_value="peer"),
         get_sender=AsyncMock(return_value=None),
@@ -302,6 +330,119 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertEqual(telegram_image_mime_type(photo), "image/jpeg")
         self.assertEqual(telegram_image_mime_type(document), "image/png")
         self.assertIsNone(telegram_image_mime_type(unsupported))
+
+    def test_detects_sticker_kind_emoji_and_raster_thumbnail(self) -> None:
+        raster_thumb = types.PhotoSize(type="m", w=320, h=320, size=4096)
+        nested = SimpleNamespace(
+            message=SimpleNamespace(
+                sticker=SimpleNamespace(
+                    thumbs=[
+                        raster_thumb,
+                        types.PhotoStrippedSize(type="i", bytes=b"x" * 8192),
+                        types.PhotoPathSize(type="j", bytes=b"path"),
+                    ]
+                ),
+                file=SimpleNamespace(
+                    mime_type="application/x-tgsticker",
+                    emoji=" 😄 ",
+                ),
+            )
+        )
+
+        info = telegram_sticker_info(nested)
+
+        self.assertIsNotNone(info)
+        self.assertEqual(
+            info.description if info else None,
+            "[анимированный стикер; эмодзи: 😄]",
+        )
+        self.assertEqual(info.thumbnail if info else None, "m")
+
+    def test_image_mime_type_is_detected_from_magic_bytes(self) -> None:
+        samples = {
+            b"\xff\xd8\xffjpeg": "image/jpeg",
+            b"\x89PNG\r\n\x1a\npng": "image/png",
+            b"GIF89agif": "image/gif",
+            b"RIFF\x04\x00\x00\x00WEBPwebp": "image/webp",
+            b"not-an-image": None,
+        }
+
+        for payload, expected in samples.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(image_mime_type_from_bytes(payload), expected)
+
+    def test_tgs_renderer_uses_middle_animation_frame(self) -> None:
+        rendered_frames: list[int] = []
+
+        class FakeImage:
+            def save(self, output, *, format: str) -> None:
+                self.assert_format(format)
+                output.write(b"\x89PNG\r\n\x1a\nrendered")
+
+            @staticmethod
+            def assert_format(format: str) -> None:
+                if format != "PNG":
+                    raise AssertionError(format)
+
+        class FakeAnimation:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                return None
+
+            @staticmethod
+            def lottie_animation_get_totalframe() -> int:
+                return 9
+
+            @staticmethod
+            def render_pillow_frame(*, frame_num: int):
+                rendered_frames.append(frame_num)
+                return FakeImage()
+
+        class FakeLottieAnimation:
+            @staticmethod
+            def from_data(*, data: str):
+                if data != '{"v":"5"}':
+                    raise AssertionError(data)
+                return FakeAnimation()
+
+        fake_module = SimpleNamespace(LottieAnimation=FakeLottieAnimation)
+        with patch.dict(sys.modules, {"rlottie_python": fake_module}):
+            png = render_sticker_png(
+                gzip.compress(b'{"v":"5"}'),
+                "application/x-tgsticker",
+            )
+
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(rendered_frames, [4])
+
+    def test_webm_renderer_preserves_vp9_alpha(self) -> None:
+        try:
+            from imageio_ffmpeg import write_frames
+            from PIL import Image
+        except ImportError as exc:
+            self.skipTest(f"optional sticker renderer is not installed: {exc}")
+
+        with TemporaryDirectory() as directory:
+            webm_path = Path(directory) / "transparent.webm"
+            writer = write_frames(
+                str(webm_path),
+                (16, 16),
+                fps=1,
+                codec="libvpx-vp9",
+                pix_fmt_in="rgba",
+                pix_fmt_out="yuva420p",
+                output_params=["-frames:v", "1", "-auto-alt-ref", "0"],
+                ffmpeg_log_level="error",
+            )
+            writer.send(None)
+            writer.send(bytes((255, 0, 0, 0)) * (16 * 16))
+            writer.close()
+            png = render_sticker_png(webm_path.read_bytes(), "video/webm")
+
+        pixel = Image.open(io.BytesIO(png)).convert("RGBA").getpixel((0, 0))
+        self.assertEqual(pixel[3], 0)
 
 
 class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -1167,6 +1308,172 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content[0]["text"], "неизвестно: Как тебе?")
         self.assertEqual(content[1]["image_url"], "data:image/png;base64,cG5n")
 
+    async def test_static_webp_sticker_is_sent_as_original_image(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="image/webp",
+            image_bytes=b"RIFF\x04\x00\x00\x00WEBPdata",
+            sticker=True,
+            sticker_emoji="🥳",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(
+            content[0]["text"],
+            "неизвестно: [стикер; эмодзи: 🥳]",
+        )
+        self.assertTrue(content[1]["image_url"].startswith("data:image/webp;base64,"))
+
+    async def test_broken_static_sticker_still_reaches_model_as_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="image/webp",
+            sticker=True,
+            sticker_emoji="🙃",
+        )
+        event.message.download_media.side_effect = OSError("download failed")
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content, "неизвестно: [стикер; эмодзи: 🙃]")
+
+    async def test_animated_sticker_uses_raster_thumbnail(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="application/x-tgsticker",
+            sticker=True,
+            sticker_emoji="😂",
+            sticker_thumbs=[SimpleNamespace(type="m")],
+            thumbnail_bytes=b"\x89PNG\r\n\x1a\npreview",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes, thumb="m")
+        content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(
+            content[0]["text"],
+            "неизвестно: [анимированный стикер; эмодзи: 😂]",
+        )
+        self.assertTrue(content[1]["image_url"].startswith("data:image/png;base64,"))
+
+    async def test_animated_sticker_without_preview_is_rendered(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="application/x-tgsticker",
+            image_bytes=b"raw-tgs",
+            sticker=True,
+            sticker_emoji="😍",
+            sticker_thumbs=[
+                types.PhotoStrippedSize(type="i", bytes=b"tiny"),
+                types.PhotoPathSize(type="j", bytes=b"outline"),
+            ],
+        )
+        rendered_png = b"\x89PNG\r\n\x1a\nrendered"
+
+        with (
+            patch("telegram_client.render_sticker_png", return_value=rendered_png) as render,
+            patch("builtins.print"),
+        ):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        render.assert_called_once_with(b"raw-tgs", "application/x-tgsticker")
+        content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(
+            content[0]["text"],
+            "неизвестно: [анимированный стикер; эмодзи: 😍]",
+        )
+        self.assertTrue(content[1]["image_url"].startswith("data:image/png;base64,"))
+
+    async def test_outline_only_sticker_falls_back_to_emoji_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="application/x-tgsticker",
+            sticker=True,
+            sticker_emoji="🤔",
+            sticker_thumbs=[types.PhotoPathSize(type="j", bytes=b"outline")],
+        )
+
+        with (
+            patch(
+                "telegram_client.render_sticker_png",
+                side_effect=ValueError("renderer unavailable"),
+            ),
+            patch("builtins.print"),
+        ):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(
+            content,
+            "неизвестно: [анимированный стикер; эмодзи: 🤔]",
+        )
+
+    async def test_broken_video_preview_falls_back_to_source_render(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="video/webm",
+            sticker=True,
+            sticker_emoji="🔥",
+            sticker_thumbs=[SimpleNamespace(type="x")],
+            thumbnail_bytes=b"not-an-image",
+        )
+
+        with (
+            patch(
+                "telegram_client.render_sticker_png",
+                return_value=b"\x89PNG\r\n\x1a\nrendered",
+            ) as render,
+            patch("builtins.print"),
+        ):
+            await responder.process(event)
+
+        event.message.download_media.assert_has_awaits(
+            [call(file=bytes, thumb="x"), call(file=bytes)]
+        )
+        render.assert_called_once_with(b"test-image", "video/webm")
+        content = openai_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[0]["text"], "неизвестно: [видеостикер; эмодзи: 🔥]")
+        self.assertTrue(content[1]["image_url"].startswith("data:image/png;base64,"))
+
+    async def test_non_sticker_webm_without_caption_is_still_ignored(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock)
+        event = make_event(clock.value, text="", mime_type="video/webm")
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_not_awaited()
+        openai_client.responses.create.assert_not_awaited()
+
     async def test_message_received_while_online_uses_at_most_ten_seconds(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, _, _ = make_responder(
@@ -1485,6 +1792,19 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             ),
             SimpleNamespace(
                 id=10,
+                raw_text="",
+                out=False,
+                sender_id=200,
+                sticker=SimpleNamespace(thumbs=[]),
+                file=SimpleNamespace(
+                    mime_type="application/x-tgsticker",
+                    emoji="🙂",
+                ),
+                date=clock.value,
+                get_sender=AsyncMock(return_value=None),
+            ),
+            SimpleNamespace(
+                id=11,
                 raw_text="Старый вопрос",
                 out=False,
                 sender_id=200,
@@ -1492,7 +1812,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
                 get_sender=AsyncMock(return_value=None),
             ),
             SimpleNamespace(
-                id=11,
+                id=12,
                 raw_text="Ранее отвечала Милана",
                 out=True,
                 date=clock.value,
@@ -1504,16 +1824,20 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
                 yield message
 
         client.iter_messages.return_value = iter_history()
-        event = make_event(clock.value, text="Новый вопрос", message_id=12)
+        event = make_event(clock.value, text="Новый вопрос", message_id=13)
 
         with patch("builtins.print"):
             await responder.process(event)
 
         request_input = openai_client.responses.create.await_args.kwargs["input"]
         self.assertEqual(
-            request_input[:3],
+            request_input[:4],
             [
                 {"role": "user", "content": "неизвестно: [фото без подписи]"},
+                {
+                    "role": "user",
+                    "content": "неизвестно: [анимированный стикер; эмодзи: 🙂]",
+                },
                 {"role": "user", "content": "неизвестно: Старый вопрос"},
                 {"role": "assistant", "content": "Ранее отвечала Милана"},
             ],
@@ -1521,7 +1845,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         client.iter_messages.assert_called_once_with(
             100,
             limit=None,
-            max_id=12,
+            max_id=13,
             reverse=True,
         )
 

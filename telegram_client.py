@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import gzip
+import io
 import json
 import math
 import os
@@ -13,6 +15,7 @@ import sys
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Awaitable, Callable, Mapping
 
 from openai import AsyncOpenAI, BadRequestError, OpenAIError
@@ -56,6 +59,8 @@ SUPPORTED_IMAGE_MIME_TYPES = {
     "image/png",
     "image/webp",
 }
+ANIMATED_STICKER_MIME_TYPE = "application/x-tgsticker"
+VIDEO_STICKER_MIME_TYPE = "video/webm"
 SAFE_REACTIONS = ("👍", "❤", "🔥", "🤣", "😢", "🎉", "🤔")
 READ_ONLY_SENTINEL = "[[READ_ONLY]]"
 SUMMARY_CHUNK_MAX_MESSAGES = 120
@@ -67,6 +72,13 @@ class Config:
     api_id: int
     api_hash: str
     session_path: Path
+
+
+@dataclass(frozen=True)
+class TelegramStickerInfo:
+    description: str
+    mime_type: str | None
+    thumbnail: Any | None
 
 
 @dataclass(frozen=True)
@@ -410,7 +422,95 @@ def telegram_image_mime_type(event: Any) -> str | None:
     return None
 
 
-async def telegram_image_data_url(event: Any, mime_type: str) -> str:
+def telegram_sticker_info(event: Any) -> TelegramStickerInfo | None:
+    """Возвращает описание стикера и доступное растровое превью."""
+    message = getattr(event, "message", None)
+    sticker = getattr(event, "sticker", None)
+    if sticker is None and message is not None and message is not event:
+        sticker = getattr(message, "sticker", None)
+
+    file_info = getattr(event, "file", None)
+    if file_info is None and message is not None and message is not event:
+        file_info = getattr(message, "file", None)
+    emoji = getattr(file_info, "emoji", None)
+    if sticker is None and emoji is None:
+        return None
+
+    mime_type = getattr(file_info, "mime_type", None)
+    if mime_type == ANIMATED_STICKER_MIME_TYPE:
+        kind = "анимированный стикер"
+    elif mime_type == VIDEO_STICKER_MIME_TYPE:
+        kind = "видеостикер"
+    else:
+        kind = "стикер"
+
+    normalized_emoji = emoji.strip() if isinstance(emoji, str) else ""
+    description = (
+        f"[{kind}; эмодзи: {normalized_emoji}]"
+        if normalized_emoji
+        else f"[{kind}]"
+    )
+
+    thumbnail: Any | None = None
+    if mime_type not in SUPPORTED_IMAGE_MIME_TYPES and sticker is not None:
+        thumbs = tuple(getattr(sticker, "thumbs", None) or ())
+        unsupported_thumb_types = (
+            types.PhotoPathSize,
+            types.PhotoSizeEmpty,
+            # Это крошечный размытый placeholder. Исходный TGS/WebM даст
+            # модели заметно более информативный кадр.
+            types.PhotoStrippedSize,
+            types.VideoSize,
+        )
+        raster_thumbs = [
+            candidate
+            for candidate in thumbs
+            if not isinstance(candidate, unsupported_thumb_types)
+        ]
+
+        def thumbnail_rank(candidate: Any) -> tuple[int, int]:
+            if isinstance(candidate, types.PhotoCachedSize):
+                return (1, len(getattr(candidate, "bytes", b"") or b""))
+            if isinstance(candidate, types.PhotoSizeProgressive):
+                return (1, max(getattr(candidate, "sizes", ()) or (0,)))
+            size = getattr(candidate, "size", 0)
+            normalized_size = size if isinstance(size, int) and size >= 0 else 0
+            return (1, normalized_size)
+
+        if raster_thumbs:
+            largest = max(raster_thumbs, key=thumbnail_rank)
+            thumbnail = getattr(largest, "type", None) or largest
+
+    return TelegramStickerInfo(
+        description=description,
+        mime_type=mime_type,
+        thumbnail=thumbnail,
+    )
+
+
+def image_mime_type_from_bytes(image_bytes: bytes) -> str | None:
+    """Определяет поддерживаемый MIME изображения по сигнатуре файла."""
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if (
+        len(image_bytes) >= 12
+        and image_bytes.startswith(b"RIFF")
+        and image_bytes[8:12] == b"WEBP"
+    ):
+        return "image/webp"
+    return None
+
+
+async def telegram_image_data_url(
+    event: Any,
+    mime_type: str | None,
+    *,
+    thumbnail: Any | None = None,
+) -> str:
     """Скачивает Telegram-изображение в память и кодирует для Responses API."""
     message = getattr(event, "message", None)
     download_media = getattr(message, "download_media", None)
@@ -419,11 +519,111 @@ async def telegram_image_data_url(event: Any, mime_type: str) -> str:
     if not callable(download_media):
         raise ValueError("Telegram не предоставил способ скачать изображение")
 
-    image_bytes = await download_media(file=bytes)
+    download_kwargs: dict[str, Any] = {"file": bytes}
+    if thumbnail is not None:
+        download_kwargs["thumb"] = thumbnail
+    image_bytes = await download_media(**download_kwargs)
     if not isinstance(image_bytes, bytes) or not image_bytes:
         raise ValueError("Не удалось скачать изображение из Telegram")
+    detected_mime_type = image_mime_type_from_bytes(image_bytes)
+    resolved_mime_type = detected_mime_type or mime_type
+    if resolved_mime_type not in SUPPORTED_IMAGE_MIME_TYPES:
+        raise ValueError("Telegram вернул превью в неподдерживаемом формате")
     encoded = base64.b64encode(image_bytes).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+    return f"data:{resolved_mime_type};base64,{encoded}"
+
+
+def _pillow_image_png_bytes(image: Any) -> bytes:
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    png_bytes = output.getvalue()
+    if not png_bytes:
+        raise ValueError("Рендерер вернул пустое изображение")
+    return png_bytes
+
+
+def _render_tgs_sticker_png(sticker_bytes: bytes) -> bytes:
+    from rlottie_python import LottieAnimation
+
+    animation_json = gzip.decompress(sticker_bytes).decode("utf-8")
+    with LottieAnimation.from_data(data=animation_json) as animation:
+        total_frames = int(animation.lottie_animation_get_totalframe())
+        frame_number = max(0, total_frames // 2)
+        image = animation.render_pillow_frame(frame_num=frame_number)
+        return _pillow_image_png_bytes(image)
+
+
+def _render_webm_sticker_png(sticker_bytes: bytes) -> bytes:
+    from imageio_ffmpeg import read_frames
+    from PIL import Image
+
+    with TemporaryDirectory(prefix="milana-sticker-") as directory:
+        video_path = Path(directory) / "sticker.webm"
+        video_path.write_bytes(sticker_bytes)
+        frames = read_frames(
+            str(video_path),
+            pix_fmt="rgba",
+            bits_per_pixel=32,
+            # Нативный декодер VP9 теряет alpha plane WebM-стикеров.
+            input_params=["-c:v", "libvpx-vp9"],
+            # FFmpeg выбирает наиболее характерный кадр из первых 30, а не
+            # слепо берёт потенциально пустой стартовый кадр анимации.
+            output_params=["-vf", "thumbnail=30", "-frames:v", "1"],
+        )
+        try:
+            metadata = next(frames)
+            frame = next(frames)
+        finally:
+            frames.close()
+
+    size = metadata.get("size") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(size, (tuple, list))
+        or len(size) != 2
+        or not all(isinstance(value, int) and value > 0 for value in size)
+    ):
+        raise ValueError("FFmpeg не вернул размер кадра WebM-стикера")
+    width, height = size
+    if len(frame) != width * height * 4:
+        raise ValueError("FFmpeg вернул повреждённый кадр WebM-стикера")
+    image = Image.frombytes("RGBA", (width, height), frame)
+    return _pillow_image_png_bytes(image)
+
+
+def render_sticker_png(sticker_bytes: bytes, mime_type: str | None) -> bytes:
+    """Рендерит репрезентативный кадр TGS/WebM-стикера в PNG."""
+    renderer: Callable[[bytes], bytes]
+    if mime_type == ANIMATED_STICKER_MIME_TYPE:
+        renderer = _render_tgs_sticker_png
+    elif mime_type == VIDEO_STICKER_MIME_TYPE:
+        renderer = _render_webm_sticker_png
+    else:
+        raise ValueError(f"Неподдерживаемый формат стикера: {mime_type}")
+
+    try:
+        return renderer(sticker_bytes)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Не удалось отрендерить стикер {mime_type}: {exc}") from exc
+
+
+async def telegram_rendered_sticker_data_url(
+    event: Any,
+    mime_type: str | None,
+) -> str:
+    """Скачивает исходный TGS/WebM и рендерит один кадр для vision-модели."""
+    message = getattr(event, "message", None)
+    download_media = getattr(message, "download_media", None)
+    if not callable(download_media):
+        download_media = getattr(event, "download_media", None)
+    if not callable(download_media):
+        raise ValueError("Telegram не предоставил способ скачать стикер")
+
+    sticker_bytes = await download_media(file=bytes)
+    if not isinstance(sticker_bytes, bytes) or not sticker_bytes:
+        raise ValueError("Не удалось скачать стикер из Telegram")
+    png_bytes = await asyncio.to_thread(render_sticker_png, sticker_bytes, mime_type)
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 async def print_message(message: Any) -> None:
@@ -831,9 +1031,13 @@ class MilanaMessageResponder:
             for message in messages:
                 text = (getattr(message, "raw_text", None) or "").strip()
                 if not text:
-                    if telegram_image_mime_type(message) is None:
+                    sticker_info = telegram_sticker_info(message)
+                    if sticker_info is not None:
+                        text = sticker_info.description
+                    elif telegram_image_mime_type(message) is not None:
+                        text = "[фото без подписи]"
+                    else:
                         continue
-                    text = "[фото без подписи]"
                 outgoing = bool(getattr(message, "out", False))
                 sender_name = "Милана" if outgoing else None
                 if not outgoing:
@@ -1754,8 +1958,9 @@ class MilanaMessageResponder:
         for envelope in envelopes:
             event = envelope.event
             text = (getattr(event, "raw_text", "") or "").strip()
+            sticker_info = telegram_sticker_info(event)
             image_mime_type = telegram_image_mime_type(event)
-            if not text and image_mime_type is None:
+            if not text and image_mime_type is None and sticker_info is None:
                 print(
                     f"Прочитано и пропущено сообщение без текста, message_id={event.id}"
                 )
@@ -1767,14 +1972,66 @@ class MilanaMessageResponder:
                     image_data_url = await telegram_image_data_url(
                         event, image_mime_type
                     )
-                except (RPCError, OSError, TypeError, ValueError) as exc:
+                except (RPCError, OSError, TypeError, ValueError, AttributeError, IndexError) as exc:
                     print(
                         f"Не удалось загрузить изображение message_id={event.id}: {exc}",
                         file=sys.stderr,
                     )
-                    if not text:
+                    if not text and sticker_info is None:
                         continue
-            stored_text = text or "[фото без подписи]"
+            elif sticker_info is not None:
+                if sticker_info.thumbnail is not None:
+                    try:
+                        image_data_url = await telegram_image_data_url(
+                            event,
+                            None,
+                            thumbnail=sticker_info.thumbnail,
+                        )
+                    except (
+                        RPCError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                        AttributeError,
+                        IndexError,
+                    ) as exc:
+                        print(
+                            "Не удалось загрузить превью стикера "
+                            f"message_id={event.id}: {exc}",
+                            file=sys.stderr,
+                        )
+                if (
+                    image_data_url is None
+                    and sticker_info.mime_type
+                    in {ANIMATED_STICKER_MIME_TYPE, VIDEO_STICKER_MIME_TYPE}
+                ):
+                    try:
+                        image_data_url = await telegram_rendered_sticker_data_url(
+                            event,
+                            sticker_info.mime_type,
+                        )
+                    except (
+                        RPCError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                        AttributeError,
+                        IndexError,
+                    ) as exc:
+                        print(
+                            "Не удалось отрендерить стикер "
+                            f"message_id={event.id}: {exc}",
+                            file=sys.stderr,
+                        )
+
+            if sticker_info is not None:
+                stored_text = (
+                    f"{text}\n{sticker_info.description}"
+                    if text
+                    else sticker_info.description
+                )
+            else:
+                stored_text = text or "[фото без подписи]"
             try:
                 sender = await event.get_sender()
                 sender_name = display_name(sender)
@@ -2223,7 +2480,7 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     else:
         print(
             f"ИИ-бот запущен для аккаунта {own_label}: обрабатываю входящие "
-            f"текстовые сообщения и фото, модель={config.model}. "
+            f"текстовые сообщения, фото и стикеры, модель={config.model}. "
             "Для остановки нажмите Ctrl+C."
         )
         print(format_current_status(routine, brief=True))
