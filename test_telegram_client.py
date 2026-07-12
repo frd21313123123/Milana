@@ -1753,6 +1753,47 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         event.reply.assert_awaited_once_with("Не могу помочь")
 
+    async def test_message_can_be_read_without_reply_or_reaction(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        openai_client.responses.create.return_value = structured_response()
+        event = make_event(clock.value, message_id=778)
+
+        with patch("builtins.print") as output:
+            await responder.process(event)
+
+        event.reply.assert_not_awaited()
+        client.send_message.assert_not_awaited()
+        client.assert_not_called()
+        instructions = openai_client.responses.create.await_args.kwargs["instructions"]
+        self.assertIn("просто прочитать", instructions)
+        self.assertTrue(
+            any("прочитано без ответа" in str(call) for call in output.call_args_list)
+        )
+        self.assertEqual(
+            [item.role for item in responder.memory.get_chat_history(100)],
+            ["user"],
+        )
+
+    async def test_plain_response_read_only_sentinel_is_not_sent(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        responder._supports_structured_reply = False
+        openai_client.responses.create.return_value = SimpleNamespace(
+            output_text="[[READ_ONLY]]",
+            output=[],
+        )
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.reply.assert_not_awaited()
+        client.send_message.assert_not_awaited()
+        request = openai_client.responses.create.await_args.kwargs
+        self.assertNotIn("text", request)
+        self.assertIn("[[READ_ONLY]]", request["instructions"])
+
     async def test_reaction_only_targets_message_and_counts_as_answer(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)

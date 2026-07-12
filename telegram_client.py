@@ -57,6 +57,7 @@ SUPPORTED_IMAGE_MIME_TYPES = {
     "image/webp",
 }
 SAFE_REACTIONS = ("👍", "❤", "🔥", "🤣", "😢", "🎉", "🤔")
+READ_ONLY_SENTINEL = "[[READ_ONLY]]"
 
 
 @dataclass(frozen=True)
@@ -924,9 +925,10 @@ class MilanaMessageResponder:
     def _plain_reply_instructions(instructions: str) -> str:
         return (
             f"{instructions}\n\n"
-            "Structured Outputs для этой модели недоступны. Верни только один готовый "
-            "текст Telegram-сообщения без JSON, массива messages, Markdown-блока кода "
-            "и служебных пояснений."
+            "Structured Outputs для этой модели недоступны. Верни только один готовый текст "
+            "Telegram-сообщения без JSON, массива messages, Markdown-блока кода и служебных "
+            "пояснений. Исключение: если на входящее сообщение не нужно отвечать, верни "
+            f"в точности {READ_ONLY_SENTINEL}."
         )
 
     async def _create_model_response(
@@ -1207,6 +1209,11 @@ class MilanaMessageResponder:
 
         output_text = str(getattr(response, "output_text", "") or "").strip()
         if not structured:
+            if output_text == READ_ONLY_SENTINEL:
+                return GeneratedReply(
+                    messages=(),
+                    staged_diary_entries=tuple(staged_diary_entries),
+                )
             if not output_text:
                 raise ValueError("Модель вернула пустой ответ")
             return GeneratedReply(
@@ -1232,8 +1239,6 @@ class MilanaMessageResponder:
         messages = tuple(message.strip() for message in raw_messages if message.strip())
         if len(messages) > self.message_flow.max_reply_messages:
             raise ValueError("Модель превысила максимальное число сообщений в ответе")
-        if not messages and reaction is None:
-            raise ValueError("Модель вернула пустой ответ")
         return GeneratedReply(
             messages=messages,
             reaction=reaction,
@@ -1266,7 +1271,11 @@ class MilanaMessageResponder:
             "пользователя из разрешённого набора. Используй реакцию без текста только для "
             "простого подтверждения или эмоционального отклика, когда содержательный ответ не "
             "нужен; если требуется пояснение, вопрос или помощь, добавь текст. Не ставь реакцию "
-            "механически к каждому ответу. Каждая строка массива messages будет отправлена "
+            "механически к каждому ответу. Если сообщение достаточно просто прочитать и ни "
+            "текст, ни реакция не нужны, верни пустой массив messages и reaction=null. Например, "
+            "так поступай с чисто информационными сообщениями, завершением разговора или явным "
+            "указанием не отвечать — но только когда молчание естественно и от Миланы не ждут "
+            "вопроса, подтверждения либо действия. Каждая строка массива messages будет отправлена "
             "отдельным сообщением; не добавляй служебные пояснения."
         )
         input_items: list[Any] = [*history_input]
@@ -1785,8 +1794,6 @@ class MilanaMessageResponder:
         parts: list[str] = []
         for message in reply.messages:
             parts.extend(split_telegram_text(message))
-        if not parts and reply.reaction is None:
-            raise ValueError("Модель вернула пустой ответ")
         return parts
 
     async def _send_generated_reply(
@@ -2068,6 +2075,11 @@ class MilanaMessageResponder:
                         f"Отправлено частей ИИ-ответа: {sent_count}; "
                         f"последний входящий message_id={reply_event.id}"
                     )
+                if outcome is not None and not answered:
+                    print(
+                        "Сообщение прочитано без ответа по решению Миланы: "
+                        f"message_id={reply_event.id}"
+                    )
                 active = []
                 context = None
                 skip_schedule_once = interrupted
@@ -2115,7 +2127,7 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
         presence_task = None
     else:
         print(
-            f"ИИ-бот запущен для аккаунта {own_label}: отвечаю на все входящие "
+            f"ИИ-бот запущен для аккаунта {own_label}: обрабатываю входящие "
             f"текстовые сообщения и фото, модель={config.model}. "
             "Для остановки нажмите Ctrl+C."
         )
