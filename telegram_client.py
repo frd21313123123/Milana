@@ -87,7 +87,7 @@ class MessageFlowConfig:
     input_max_wait_seconds: float = 8.0
     max_reply_messages: int = 5
     inter_message_min_delay_seconds: float = 1.0
-    inter_message_max_delay_seconds: float = 3.0
+    inter_message_max_delay_seconds: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -259,7 +259,7 @@ def load_message_flow_config(settings: Mapping[str, Any]) -> MessageFlowConfig:
         raw, "inter_message_min_delay_seconds", 1.0
     )
     max_delay = ai_nonnegative_number(
-        raw, "inter_message_max_delay_seconds", 3.0
+        raw, "inter_message_max_delay_seconds", 15.0
     )
     if min_delay > max_delay:
         raise ValueError(
@@ -892,6 +892,17 @@ def split_telegram_text(text: str, limit: int = 4000) -> list[str]:
     if text:
         parts.append(text)
     return parts
+
+
+def inter_message_typing_delay(
+    text: str,
+    *,
+    minimum_seconds: float = 1.0,
+    maximum_seconds: float = 15.0,
+) -> float:
+    """Возвращает паузу, похожую на набор следующего сообщения с телефона."""
+    estimated_seconds = 0.8 + len(text) / 11
+    return min(maximum_seconds, max(minimum_seconds, estimated_seconds))
 
 
 @dataclass(frozen=True)
@@ -2200,9 +2211,11 @@ class MilanaMessageResponder:
         for index, part in enumerate(parts):
             if index > 0:
                 flow = self.message_flow
-                minimum_ms = round(flow.inter_message_min_delay_seconds * 1000)
-                maximum_ms = round(flow.inter_message_max_delay_seconds * 1000)
-                delay = self._randint(minimum_ms, maximum_ms) / 1000
+                delay = inter_message_typing_delay(
+                    part,
+                    minimum_seconds=flow.inter_message_min_delay_seconds,
+                    maximum_seconds=flow.inter_message_max_delay_seconds,
+                )
                 if await self._sleep_or_changed(state, delay):
                     return SendOutcome(
                         sent_count=sent_count,

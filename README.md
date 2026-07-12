@@ -183,7 +183,7 @@ OPENAI_API_KEY=
     "input_max_wait_seconds": 8.0,
     "max_reply_messages": 5,
     "inter_message_min_delay_seconds": 1.0,
-    "inter_message_max_delay_seconds": 3.0
+    "inter_message_max_delay_seconds": 15.0
   }
 }
 ```
@@ -200,7 +200,10 @@ OPENAI_API_KEY=
 - `message_flow.max_reply_messages` — защитный предел смысловых сообщений в одном
   ответе (`1` отключает смысловое разбиение);
 - `message_flow.inter_message_min_delay_seconds` и
-  `inter_message_max_delay_seconds` — диапазон пауз между частями ответа.
+  `inter_message_max_delay_seconds` — нижняя и верхняя границы паузы перед каждой
+  следующей частью ответа. Внутри этих границ пауза считается по длине следующего
+  сообщения: `0,8 секунды + количество символов / 11`. Всё это время собеседник
+  видит индикатор «печатает…».
 
 Каждую смысловую часть клиент дополнительно делит по техническому лимиту Telegram
 в 4000 символов. Такое деление не влияет на решение Миланы о структуре ответа.

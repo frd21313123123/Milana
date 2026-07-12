@@ -28,6 +28,7 @@ from telegram_client import (
     build_parser,
     display_name,
     image_mime_type_from_bytes,
+    inter_message_typing_delay,
     load_env_file,
     load_ai_settings,
     load_message_flow_config,
@@ -200,6 +201,11 @@ class SplitTelegramTextTests(unittest.TestCase):
     def test_prefers_newlines_and_spaces_when_splitting(self) -> None:
         self.assertEqual(split_telegram_text("первая строка\nвторая", 14), ["первая строка", "вторая"])
         self.assertEqual(split_telegram_text("один два три", 9), ["один два", "три"])
+
+    def test_inter_message_typing_delay_scales_with_next_message_length(self) -> None:
+        self.assertAlmostEqual(inter_message_typing_delay("привет"), 0.8 + 6 / 11)
+        self.assertEqual(inter_message_typing_delay("а"), 1.0)
+        self.assertEqual(inter_message_typing_delay("а" * 200), 15.0)
 
     def test_load_ai_settings_reads_json_object(self) -> None:
         with TemporaryDirectory() as directory:
@@ -602,6 +608,48 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             await responder.process(event)
 
         client.action.assert_called_once_with("peer", "typing")
+        self.assertFalse(action_active)
+
+    async def test_next_message_length_controls_delay_while_typing_is_visible(self) -> None:
+        clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        flow = MessageFlowConfig(
+            input_quiet_seconds=0,
+            input_max_wait_seconds=0,
+            inter_message_min_delay_seconds=1,
+            inter_message_max_delay_seconds=15,
+        )
+        responder, client, openai_client = make_responder(clock, message_flow=flow)
+        responder._wait_before_reading = AsyncMock()
+        responder._wait_for_full_online_window = AsyncMock()
+        second_message = "это второе сообщение"
+        openai_client.responses.create.return_value = structured_response(
+            "первое", second_message
+        )
+        action_active = False
+
+        class TrackedTypingAction:
+            async def __aenter__(self) -> None:
+                nonlocal action_active
+                action_active = True
+
+            async def __aexit__(self, exc_type, exc, traceback) -> None:
+                nonlocal action_active
+                action_active = False
+
+        client.action.return_value = TrackedTypingAction()
+
+        with patch("builtins.print"):
+            worker = asyncio.create_task(responder.process(make_event(clock.value)))
+            delay, release = await asyncio.wait_for(clock.sleep_calls.get(), timeout=1)
+            self.assertAlmostEqual(delay, 0.8 + len(second_message) / 11)
+            self.assertTrue(action_active)
+            client.send_message.assert_awaited_once_with(100, "первое")
+            release.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        client.send_message.assert_has_awaits(
+            [call(100, "первое"), call(100, second_message)]
+        )
         self.assertFalse(action_active)
 
     async def test_different_chats_generate_answers_concurrently(self) -> None:

@@ -8,6 +8,6 @@
     "input_max_wait_seconds": 8.0,
     "max_reply_messages": 5,
     "inter_message_min_delay_seconds": 1.0,
-    "inter_message_max_delay_seconds": 3.0
+    "inter_message_max_delay_seconds": 15.0
   }
 }
