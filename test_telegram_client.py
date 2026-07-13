@@ -15,10 +15,12 @@ import httpx
 from openai import BadRequestError
 from telethon import functions, types
 
+from agy_provider import AgyError, AgyQuotaError
 from milana_schedule import load_routine
 from telegram_client import (
     AIConfig,
     Config,
+    GeminiQuotaFallbackClient,
     MessageFlowConfig,
     MilanaMessageResponder,
     MilanaPresenceController,
@@ -290,6 +292,7 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertEqual(config.provider, "gemini")
         self.assertEqual(config.model, "gemini-3.5-flash")
         self.assertEqual(config.api_key, "")
+        self.assertEqual(config.openai_fallback_model, "openai-model-from-config")
 
     def test_max_output_tokens_must_be_an_integer(self) -> None:
         with self.assertRaisesRegex(ValueError, "целым числом"):
@@ -544,6 +547,67 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertEqual(pixel[3], 0)
 
 
+class GeminiQuotaFallbackClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_each_call_retries_gemini_and_falls_back_to_openai_on_quota(self) -> None:
+        gemini = MagicMock()
+        gemini.responses.create = AsyncMock(
+            side_effect=AgyQuotaError("quota exceeded")
+        )
+        openai = MagicMock()
+        expected = structured_response("Резервный ответ")
+        openai.responses.create = AsyncMock(return_value=expected)
+        client = GeminiQuotaFallbackClient(
+            gemini,
+            openai,
+            openai_model="gpt-fallback",
+        )
+        request = {
+            "model": "gemini-3.5-flash",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_audio", "audio_url": "data:audio/ogg;base64,AA=="},
+                        {"type": "input_text", "text": "Голосовое сообщение"},
+                    ],
+                }
+            ],
+        }
+
+        with patch("builtins.print") as log:
+            first = await client.responses.create(**request)
+            second = await client.responses.create(
+                model="gemini-3.5-flash",
+                input=[{"role": "user", "content": "Ещё сообщение"}],
+            )
+
+        self.assertIs(first, expected)
+        self.assertIs(second, expected)
+        self.assertEqual(gemini.responses.create.await_count, 2)
+        self.assertEqual(openai.responses.create.await_count, 2)
+        fallback_request = openai.responses.create.await_args_list[0].kwargs
+        self.assertEqual(fallback_request["model"], "gpt-fallback")
+        self.assertIn("Аудиовложение", str(fallback_request["input"]))
+        self.assertNotIn("audio_url", str(fallback_request["input"]))
+        self.assertEqual(log.call_count, 2)
+
+    async def test_non_quota_agy_error_does_not_use_fallback(self) -> None:
+        gemini = MagicMock()
+        gemini.responses.create = AsyncMock(side_effect=AgyError("auth or network"))
+        openai = MagicMock()
+        openai.responses.create = AsyncMock()
+        client = GeminiQuotaFallbackClient(
+            gemini,
+            openai,
+            openai_model="gpt-fallback",
+        )
+
+        with self.assertRaises(AgyError):
+            await client.responses.create(model="gemini-3.5-flash", input=[])
+
+        openai.responses.create.assert_not_awaited()
+
+
 class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_forwards_dev_chat_flag_to_ai_bot(self) -> None:
         args = build_parser().parse_args(["ai-bot", "--dev-chat"])
@@ -610,21 +674,23 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
 
-    async def test_gemini_runtime_uses_agy_client_instead_of_openai(self) -> None:
+    async def test_gemini_runtime_wraps_agy_with_openai_quota_fallback(self) -> None:
         client = MagicMock()
         client.get_me = AsyncMock(return_value=SimpleNamespace(username="milana", id=1))
         client.run_until_disconnected = AsyncMock()
         client.is_connected.return_value = False
         config = AIConfig(
-            api_key="",
+            api_key="test-openai-key",
             model="gemini-3.5-flash",
             instructions="Тестовая инструкция",
             temperature=0.2,
             max_output_tokens=100,
             provider="gemini",
+            openai_fallback_model="gpt-fallback",
         )
         routine = load_routine()
         agy_client = MagicMock()
+        openai_client = MagicMock()
         memory = MagicMock()
         presence = MagicMock()
         presence.run = AsyncMock()
@@ -636,7 +702,9 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             patch("telegram_client.load_ai_config", return_value=config),
             patch("telegram_client.load_routine", return_value=routine),
             patch("telegram_client.AgyModelClient", return_value=agy_client) as agy_type,
-            patch("telegram_client.AsyncOpenAI") as openai_type,
+            patch(
+                "telegram_client.AsyncOpenAI", return_value=openai_client
+            ) as openai_type,
             patch("telegram_client.MilanaMemoryStore", return_value=memory),
             patch(
                 "telegram_client.MilanaPresenceController", return_value=presence
@@ -649,8 +717,12 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await run_ai_bot(client, dev_chat=True)
 
         agy_type.assert_called_once_with(model="gemini-3.5-flash")
-        openai_type.assert_not_called()
-        self.assertIs(responder_type.call_args.args[1], agy_client)
+        openai_type.assert_called_once_with(api_key="test-openai-key")
+        model_client = responder_type.call_args.args[1]
+        self.assertIsInstance(model_client, GeminiQuotaFallbackClient)
+        self.assertIs(model_client.gemini_client, agy_client)
+        self.assertIs(model_client.openai_client, openai_client)
+        self.assertEqual(model_client.openai_model, "gpt-fallback")
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
 
@@ -707,6 +779,8 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         instructions = openai_client.responses.create.await_args.kwargs["instructions"]
         self.assertIn("режим прямого общения", instructions.lower())
         self.assertNotIn("актуальный бытовой контекст", instructions.lower())
+        self.assertIn("мягко", instructions.lower())
+        self.assertIn("не упоминай модель", instructions.lower())
         event.reply.assert_not_awaited()
         client.send_message.assert_has_awaits(
             [call(100, "Первая часть"), call(100, "Вторая часть")]

@@ -40,6 +40,10 @@ class AgyAuthError(AgyError):
     """Raised when the CLI cannot reuse its saved Windows OAuth session."""
 
 
+class AgyQuotaError(AgyError):
+    """Raised when Gemini cannot answer because its usage quota is exhausted."""
+
+
 def strip_ansi(text: str) -> str:
     """Remove terminal control sequences and normalize PTY line endings."""
     if not text:
@@ -261,7 +265,10 @@ class AgyModelClient:
                 ) from exc
             except subprocess.TimeoutExpired as exc:
                 details = self._agy_log_error(workspace / "agy.log")
-                raise AgyError(
+                error_type = (
+                    AgyQuotaError if self._is_quota_failure(details or "") else AgyError
+                )
+                raise error_type(
                     f"Gemini не ответила за {self.timeout_seconds} секунд"
                     + (f": {details}" if details else "")
                 ) from exc
@@ -274,9 +281,17 @@ class AgyModelClient:
             )
         if "failed_precondition" in lowered or "user location is not supported" in lowered:
             raise AgyError("Google отклонил запрос Gemini из-за сетевого региона")
+        if self._is_quota_failure(answer):
+            raise AgyQuotaError(
+                "Лимит сообщений Gemini 3.5 Flash исчерпан: "
+                f"{self._safe_error_details(answer)}"
+            )
         if not answer:
             if log_error:
-                raise AgyError(f"agy не вернул ответ: {log_error}")
+                error_type = (
+                    AgyQuotaError if self._is_quota_failure(log_error) else AgyError
+                )
+                raise error_type(f"agy не вернул ответ: {log_error}")
             raise AgyError(
                 "agy вернул пустой ответ. На Windows установите зависимости из requirements.txt."
             )
@@ -516,7 +531,7 @@ class AgyModelClient:
         )
         if completed.returncode != 0:
             details = self._safe_error_details(completed.stderr or completed.stdout)
-            error_type = AgyAuthError if self._is_auth_failure(details) else AgyError
+            error_type = self._error_type(details)
             raise error_type(
                 f"agy завершился с кодом {completed.returncode}: "
                 f"{details or 'без текста ошибки'}"
@@ -542,6 +557,11 @@ class AgyModelClient:
             "model output error",
             "authentication timed out",
             "error executing cascade step",
+            "resource_exhausted",
+            "resource exhausted",
+            "quota exceeded",
+            "rate limit",
+            "usage limit",
         )
         errors = [
             line.rsplit("] ", 1)[-1].strip()
@@ -585,6 +605,36 @@ class AgyModelClient:
                 "срок авторизации истёк",
             )
         )
+
+    @staticmethod
+    def _is_quota_failure(text: str) -> bool:
+        lowered = strip_ansi(text).lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "resource_exhausted",
+                "resource exhausted",
+                "quota exceeded",
+                "quota has been exhausted",
+                "rate limit exceeded",
+                "usage limit reached",
+                "usage limit exceeded",
+                "message limit reached",
+                "message limit exceeded",
+                "too many requests",
+                "лимит сообщений исчерпан",
+            )
+        ) or bool(
+            re.search(r"(?:remaining|left)\s*[:=]?\s*0\s+(?:messages?|requests?)", lowered)
+        )
+
+    @classmethod
+    def _error_type(cls, text: str) -> type[AgyError]:
+        if cls._is_auth_failure(text):
+            return AgyAuthError
+        if cls._is_quota_failure(text):
+            return AgyQuotaError
+        return AgyError
 
     def _run_windows(
         self,
@@ -660,7 +710,7 @@ class AgyModelClient:
             details = self._agy_log_error(
                 workspace / "agy.log"
             ) or self._safe_error_details(output)
-            error_type = AgyAuthError if self._is_auth_failure(details) else AgyError
+            error_type = self._error_type(details)
             raise error_type(
                 f"agy завершился с кодом {exit_status}: "
                 f"{details or 'без текста ошибки'}"

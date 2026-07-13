@@ -23,7 +23,7 @@ from openai import AsyncOpenAI, BadRequestError, OpenAIError
 from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
 
-from agy_provider import AgyError, AgyModelClient
+from agy_provider import AgyError, AgyModelClient, AgyQuotaError
 from milana_memory import (
     MAX_DIARY_ENTRY_LENGTH,
     USER_WINDOW_RESET_TARGET,
@@ -138,6 +138,7 @@ class AIConfig:
     max_output_tokens: int
     message_flow: MessageFlowConfig = MessageFlowConfig()
     provider: str = OPENAI_LLM_CHOICE
+    openai_fallback_model: str = DEFAULT_AI_MODEL
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -338,15 +339,16 @@ def load_ai_config() -> AIConfig:
     api_key = (
         env_values.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     ).strip()
+    openai_model = ai_string(
+        settings,
+        "model",
+        os.getenv("OPENAI_MODEL", DEFAULT_AI_MODEL),
+        "model",
+    )
     if provider == GEMINI_LLM_CHOICE:
         model = GEMINI_AI_MODEL
     else:
-        model = ai_string(
-            settings,
-            "model",
-            os.getenv("OPENAI_MODEL", DEFAULT_AI_MODEL),
-            "model",
-        )
+        model = openai_model
     instructions = ai_string(
         settings,
         "system_prompt",
@@ -371,6 +373,7 @@ def load_ai_config() -> AIConfig:
         max_output_tokens=max_output_tokens,
         message_flow=message_flow,
         provider=provider,
+        openai_fallback_model=openai_model,
     )
 
 
@@ -1112,6 +1115,68 @@ class ChatWorkerState:
     worker: asyncio.Task[None] | None = None
 
 
+class _GeminiQuotaFallbackResponses:
+    def __init__(self, client: "GeminiQuotaFallbackClient") -> None:
+        self._client = client
+
+    async def create(self, **request: Any) -> Any:
+        try:
+            return await self._client.gemini_client.responses.create(**request)
+        except AgyQuotaError as exc:
+            print(
+                "Лимит сообщений Gemini 3.5 Flash исчерпан; для этого вызова "
+                f"использую OpenAI ({self._client.openai_model}), а следующий снова "
+                f"отправлю в Gemini: {exc}",
+                file=sys.stderr,
+            )
+            return await self._client._create_openai_response(request)
+
+
+class GeminiQuotaFallbackClient:
+    """Always try Gemini first and use OpenAI only for quota-failed calls."""
+
+    def __init__(
+        self,
+        gemini_client: Any,
+        openai_client: Any,
+        *,
+        openai_model: str,
+    ) -> None:
+        if not openai_model.strip():
+            raise ValueError("Резервная модель OpenAI не может быть пустой")
+        self.gemini_client = gemini_client
+        self.openai_client = openai_client
+        self.openai_model = openai_model.strip()
+        self.responses = _GeminiQuotaFallbackResponses(self)
+
+    @classmethod
+    def _openai_compatible_input(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return [cls._openai_compatible_input(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        media_type = value.get("type")
+        if media_type in {"input_audio", "input_video"}:
+            label = "Аудиовложение" if media_type == "input_audio" else "Видеовложение"
+            return {
+                "type": "input_text",
+                "text": f"[{label} недоступно резервной модели OpenAI]",
+            }
+        return {
+            key: cls._openai_compatible_input(item)
+            for key, item in value.items()
+        }
+
+    async def _create_openai_response(self, request: Mapping[str, Any]) -> Any:
+        fallback_request = dict(request)
+        fallback_request["model"] = self.openai_model
+        if "input" in fallback_request:
+            fallback_request["input"] = self._openai_compatible_input(
+                fallback_request["input"]
+            )
+        return await self.openai_client.responses.create(**fallback_request)
+
+
 @dataclass(frozen=True)
 class SendOutcome:
     sent_count: int
@@ -1758,7 +1823,11 @@ class MilanaMessageResponder:
             "текст, ни реакция не нужны, верни пустой массив messages и reaction=null. Например, "
             "так поступай с чисто информационными сообщениями, завершением разговора или явным "
             "указанием не отвечать — но только когда молчание естественно и от Миланы не ждут "
-            "вопроса, подтверждения либо действия. Каждая строка массива messages будет отправлена "
+            "вопроса, подтверждения либо действия. Если ты не можешь содержательно ответить — "
+            "например, не поняла вложение, не знаешь ответа или не хочешь обсуждать тему — мягко "
+            "и естественно уйди от ответа в стиле живой переписки: коротко смени тему, отшутись "
+            "или задай уместный встречный вопрос. Не упоминай модель, провайдера, API, системные "
+            "ограничения, недоступный формат или внутреннюю ошибку. Каждая строка массива messages будет отправлена "
             "отдельным сообщением; не добавляй служебные пояснения."
         )
         input_items: list[Any] = [*history_input]
@@ -2767,7 +2836,21 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     config = load_ai_config()
     routine = load_routine()
     if config.provider == GEMINI_LLM_CHOICE:
-        model_client: Any = AgyModelClient(model=config.model)
+        gemini_client = AgyModelClient(model=config.model)
+        if config.api_key:
+            openai_client = AsyncOpenAI(api_key=config.api_key)
+            model_client: Any = GeminiQuotaFallbackClient(
+                gemini_client,
+                openai_client,
+                openai_model=config.openai_fallback_model,
+            )
+        else:
+            model_client = gemini_client
+            print(
+                "Предупреждение: OPENAI_API_KEY не задан; резервный ответ OpenAI "
+                "при исчерпании лимита Gemini будет недоступен.",
+                file=sys.stderr,
+            )
     else:
         model_client = AsyncOpenAI(api_key=config.api_key)
     memory = MilanaMemoryStore(MEMORY_PATH)

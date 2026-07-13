@@ -13,7 +13,13 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
-from agy_provider import AgyAuthError, AgyError, AgyModelClient, strip_ansi
+from agy_provider import (
+    AgyAuthError,
+    AgyError,
+    AgyModelClient,
+    AgyQuotaError,
+    strip_ansi,
+)
 
 
 class StripAnsiTests(unittest.TestCase):
@@ -56,6 +62,32 @@ class AgyModelClientTests(unittest.TestCase):
             "Antigravity CLI не авторизован или срок авторизации истёк",
         )
         self.assertNotIn("https://", details)
+
+    def test_quota_errors_are_classified_separately(self) -> None:
+        for details in (
+            "RESOURCE_EXHAUSTED: quota exceeded",
+            "Rate limit exceeded for gemini-3.5-flash",
+            "You have remaining: 0 messages",
+        ):
+            with self.subTest(details=details):
+                self.assertTrue(AgyModelClient._is_quota_failure(details))
+                self.assertIs(AgyModelClient._error_type(details), AgyQuotaError)
+
+        self.assertFalse(AgyModelClient._is_quota_failure("temporary network error"))
+        self.assertIs(AgyModelClient._error_type("temporary network error"), AgyError)
+
+    def test_successful_process_output_containing_quota_error_is_rejected(self) -> None:
+        client = AgyModelClient()
+        with (
+            patch("agy_provider.platform.system", return_value="Linux"),
+            patch.object(
+                client,
+                "_run_direct",
+                return_value="RESOURCE_EXHAUSTED: quota exceeded",
+            ),
+        ):
+            with self.assertRaises(AgyQuotaError):
+                client._query({"input": []})
 
     def test_missing_executable_is_reported_as_agy_error(self) -> None:
         client = AgyModelClient(executable="missing-agy")
