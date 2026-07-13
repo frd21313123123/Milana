@@ -1577,6 +1577,8 @@ class MilanaMessageResponder:
         presence: MilanaPresenceController | None = None,
         pulse: MilanaPulse | None = None,
         history_limit: int | None = None,
+        user_window_trigger: int = USER_WINDOW_TRIGGER,
+        user_window_reset_target: int = USER_WINDOW_RESET_TARGET,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         randint: Callable[[int, int], int] = SYSTEM_RANDOM.randint,
@@ -1599,6 +1601,14 @@ class MilanaMessageResponder:
         )
         self.memory = memory or MilanaMemoryStore()
         self.history_limit = history_limit
+        if user_window_reset_target < 1:
+            raise ValueError("user_window_reset_target должен быть положительным")
+        if user_window_trigger <= user_window_reset_target:
+            raise ValueError(
+                "user_window_trigger должен быть больше user_window_reset_target"
+            )
+        self.user_window_trigger = user_window_trigger
+        self.user_window_reset_target = user_window_reset_target
         self._now = now
         self._sleep = sleep
         self._randint = randint
@@ -1701,10 +1711,10 @@ class MilanaMessageResponder:
                 if imported:
                     self.memory.replace_chat_history(chat_key, imported)
                     uncovered = self.memory.count_uncovered_user_messages(chat_key)
-                    if uncovered > USER_WINDOW_RESET_TARGET:
+                    if uncovered > self.user_window_reset_target:
                         compacted = await self._maybe_update_chat_summary(
                             chat_key,
-                            trigger=USER_WINDOW_RESET_TARGET + 1,
+                            trigger=self.user_window_reset_target + 1,
                         )
                         if not compacted:
                             # The full raw snapshot is still available. Avoid
@@ -2112,14 +2122,17 @@ class MilanaMessageResponder:
         self,
         chat_key: int | str,
         *,
-        trigger: int = USER_WINDOW_TRIGGER,
+        trigger: int | None = None,
     ) -> bool:
-        """Compact a user suffix at ``trigger`` and retain the newest 30."""
+        """Compact a user suffix at ``trigger`` and retain the configured tail."""
         try:
+            effective_trigger = (
+                self.user_window_trigger if trigger is None else trigger
+            )
             plan = self.memory.prepare_summary_compaction(
                 chat_key,
-                trigger=trigger,
-                retain_user_messages=USER_WINDOW_RESET_TARGET,
+                trigger=effective_trigger,
+                retain_user_messages=self.user_window_reset_target,
             )
             if plan is None:
                 return False
@@ -2139,7 +2152,7 @@ class MilanaMessageResponder:
                 print(
                     f"Обновлён обзор чата chat_id={chat_key} "
                     f"(обобщено сообщений пользователя: {plan.covered_user_messages}; "
-                    f"в активном окне оставлено: {USER_WINDOW_RESET_TARGET})"
+                    f"в активном окне оставлено: {self.user_window_reset_target})"
                 )
             return committed
         except Exception as exc:  # noqa: BLE001
@@ -3240,7 +3253,7 @@ class MilanaMessageResponder:
                     continues_conversation=context.continues_conversation
                 )
                 # Compact before building the main-model input so the reply that
-                # crosses the 60-message boundary immediately sees the new summary.
+                # crosses the 500-message boundary immediately sees the new summary.
                 await self._update_summary_while_idle(state)
                 active_ids = {
                     item.event.id

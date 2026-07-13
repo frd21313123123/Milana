@@ -13,6 +13,20 @@ from milana_memory import (
 )
 
 
+TEST_USER_WINDOW_TRIGGER = 60
+TEST_USER_WINDOW_RESET_TARGET = 30
+
+
+def prepare_test_compaction(
+    store: MilanaMemoryStore, chat_id: int | str
+) -> ChatCompactionPlan | None:
+    return store.prepare_summary_compaction(
+        chat_id,
+        trigger=TEST_USER_WINDOW_TRIGGER,
+        retain_user_messages=TEST_USER_WINDOW_RESET_TARGET,
+    )
+
+
 class MilanaMemoryStoreTests(unittest.TestCase):
     def test_history_is_persistent_ordered_limited_and_isolated(self) -> None:
         with TemporaryDirectory() as directory:
@@ -365,7 +379,7 @@ class MilanaMemoryStoreTests(unittest.TestCase):
                 telegram_message_id=message_id,
             )
 
-        plan = store.prepare_summary_compaction(10)
+        plan = prepare_test_compaction(store, 10)
         self.assertIsInstance(plan, ChatCompactionPlan)
         assert plan is not None
         self.assertEqual(plan.expected_cursor, 0)
@@ -420,7 +434,7 @@ class MilanaMemoryStoreTests(unittest.TestCase):
         store = MilanaMemoryStore()
         for message_id in range(1, 61):
             store.add_message(11, "user", f"u{message_id}")
-        first = store.prepare_summary_compaction(11)
+        first = prepare_test_compaction(store, 11)
         assert first is not None
         self.assertTrue(store.commit_summary_compaction(first, "Первая часть"))
 
@@ -428,10 +442,10 @@ class MilanaMemoryStoreTests(unittest.TestCase):
             store.add_message(11, "user", f"u{message_id}")
         self.assertEqual(store.count_user_messages(11), 89)
         self.assertEqual(store.count_uncovered_user_messages(11), 59)
-        self.assertIsNone(store.prepare_summary_compaction(11))
+        self.assertIsNone(prepare_test_compaction(store, 11))
 
         store.add_message(11, "user", "u90")
-        second = store.prepare_summary_compaction(11)
+        second = prepare_test_compaction(store, 11)
         assert second is not None
         self.assertEqual(second.expected_cursor, first.new_cursor)
         self.assertEqual(second.pending_user_messages, 60)
@@ -460,7 +474,7 @@ class MilanaMemoryStoreTests(unittest.TestCase):
                 telegram_message_id=message_id,
             )
 
-        plan = store.prepare_summary_compaction(13)
+        plan = prepare_test_compaction(store, 13)
         assert plan is not None
         self.assertTrue(store.commit_summary_compaction(plan, "Первые 30 сообщений"))
 
@@ -483,14 +497,14 @@ class MilanaMemoryStoreTests(unittest.TestCase):
             for message_id in range(60):
                 first_store.add_message(12, "user", f"u{message_id}")
 
-            first_plan = first_store.prepare_summary_compaction(12)
+            first_plan = prepare_test_compaction(first_store, 12)
             assert first_plan is not None
             self.assertFalse(first_store.commit_summary_compaction(first_plan, None))
             self.assertFalse(first_store.commit_summary_compaction(first_plan, "   "))
             self.assertIsNone(first_store.get_chat_summary_info(12))
 
             second_store = MilanaMemoryStore(path)
-            stale_plan = second_store.prepare_summary_compaction(12)
+            stale_plan = prepare_test_compaction(second_store, 12)
             assert stale_plan is not None
             self.assertTrue(
                 first_store.commit_summary_compaction(first_plan, "Свежий пересказ")
@@ -515,9 +529,9 @@ class MilanaMemoryStoreTests(unittest.TestCase):
             if i < 59:
                 store.add_message("bob", "user", f"bob-{i}")
 
-        alice_plan = store.prepare_summary_compaction("alice")
+        alice_plan = prepare_test_compaction(store, "alice")
         self.assertIsNotNone(alice_plan)
-        self.assertIsNone(store.prepare_summary_compaction("bob"))
+        self.assertIsNone(prepare_test_compaction(store, "bob"))
         assert alice_plan is not None
         self.assertTrue(store.commit_summary_compaction(alice_plan, "Только чат Alice"))
 

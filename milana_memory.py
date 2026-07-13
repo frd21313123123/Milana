@@ -19,8 +19,8 @@ DEFAULT_DIARY_LIMIT = 80
 MAX_MESSAGE_LENGTH = 20_000
 MAX_DIARY_ENTRY_LENGTH = 2_000
 MAX_SUMMARY_LENGTH = 8_000
-USER_WINDOW_TRIGGER = 60
-USER_WINDOW_RESET_TARGET = 30
+USER_WINDOW_TRIGGER = 500
+USER_WINDOW_RESET_TARGET = 300
 
 
 WRITE_DIARY_TOOL: dict[str, Any] = {
@@ -589,7 +589,7 @@ class MilanaMemoryStore:
     ) -> list[dict[str, str]]:
         """Return the summary followed by its complete, non-overlapping suffix.
 
-        The default is the dynamic 30-to-60-user window: every stored row after
+        The default is the dynamic 300-to-500-user window: every stored row after
         the summary cursor is returned, including assistant replies.  Passing a
         numeric ``recent_limit`` opts into the old fixed-size behaviour for
         compatibility with callers that explicitly need it.

@@ -116,6 +116,8 @@ def make_responder(
     randint=None,
     message_flow: MessageFlowConfig | None = None,
     provider: str = "openai",
+    user_window_trigger: int | None = 60,
+    user_window_reset_target: int | None = 30,
 ):
     client = MagicMock()
     client.side_effect = AsyncMock(return_value=None)
@@ -136,6 +138,11 @@ def make_responder(
         message_flow=message_flow or MessageFlowConfig(),
         provider=provider,
     )
+    window_options = {}
+    if user_window_trigger is not None:
+        window_options["user_window_trigger"] = user_window_trigger
+    if user_window_reset_target is not None:
+        window_options["user_window_reset_target"] = user_window_reset_target
     responder = MilanaMessageResponder(
         client,
         openai_client,
@@ -146,6 +153,7 @@ def make_responder(
         now=clock.now,
         sleep=clock.sleep,
         randint=randint or (lambda minimum, maximum: minimum),
+        **window_options,
     )
     return responder, client, openai_client
 
@@ -933,6 +941,17 @@ class MilanaInitiativeReflectorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_dynamic_context_window_is_300_to_500_messages(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 2, 0, tzinfo=YEKT))
+        responder, _, _ = make_responder(
+            clock,
+            user_window_trigger=None,
+            user_window_reset_target=None,
+        )
+
+        self.assertEqual(responder.user_window_reset_target, 300)
+        self.assertEqual(responder.user_window_trigger, 500)
+
     async def test_dev_chat_answers_during_sleep_without_schedule_or_delays(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 2, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock, dev_chat=True)
