@@ -32,6 +32,8 @@ from milana_memory import (
     WRITE_DIARY_TOOL,
     ChatMessage,
     PulseTask,
+    format_message_for_model,
+    format_message_timestamp,
 )
 from milana_pulse import (
     SCHEDULE_MESSAGE_TOOL,
@@ -1382,6 +1384,10 @@ class MilanaInitiativeReflector:
                 {
                     "role": message.role,
                     "speaker": speaker,
+                    "sent_at": format_message_timestamp(
+                        message.created_at,
+                        display_timezone=self.routine.timezone,
+                    ),
                     "content": message.content[:1000],
                 }
             )
@@ -1392,12 +1398,17 @@ class MilanaInitiativeReflector:
             latest = getattr(dialog, "message", None)
             text = str(getattr(latest, "raw_text", "") or "").strip()
             if text:
-                context.append(
-                    {
-                        "role": "assistant" if getattr(latest, "out", False) else "user",
-                        "content": text[:1000],
-                    }
-                )
+                item = {
+                    "role": "assistant" if getattr(latest, "out", False) else "user",
+                    "content": text[:1000],
+                }
+                latest_at = getattr(latest, "date", None)
+                if isinstance(latest_at, datetime):
+                    item["sent_at"] = format_message_timestamp(
+                        latest_at.isoformat(),
+                        display_timezone=self.routine.timezone,
+                    )
+                context.append(item)
         return tuple(context)
 
     async def _contacts(self) -> list[ReflectionContact]:
@@ -1591,6 +1602,12 @@ class MilanaInitiativeReflector:
                 sent = await self.client.send_message(contact.entity, decision.message)
             answered = True
             candidate_id = getattr(sent, "id", None)
+            sent_at = getattr(sent, "date", None)
+            sent_moment = (
+                self.routine.normalize_datetime(sent_at)
+                if isinstance(sent_at, datetime)
+                else self.routine.normalize_datetime(event_at)
+            )
             try:
                 self.memory.add_message(
                     contact.chat_id,
@@ -1600,7 +1617,7 @@ class MilanaInitiativeReflector:
                         candidate_id if isinstance(candidate_id, int) else None
                     ),
                     sender_name="Милана",
-                    created_at=event_at.isoformat(),
+                    created_at=sent_moment.isoformat(),
                 )
             except Exception as exc:  # noqa: BLE001
                 print(
@@ -2124,6 +2141,10 @@ class MilanaMessageResponder:
                     "role": message.role,
                     "speaker": message.sender_name
                     or ("Милана" if message.role == "assistant" else "Собеседник"),
+                    "sent_at": format_message_timestamp(
+                        message.created_at,
+                        display_timezone=self.routine.timezone,
+                    ),
                     "content": message.content,
                 }
                 for message in new_messages
@@ -2397,11 +2418,20 @@ class MilanaMessageResponder:
             "отдельным сообщением; не добавляй служебные пояснения. Если собеседник просит "
             "написать ему через некоторое время, обязательно вызови schedule_message с готовым "
             "текстом будущего сообщения и задержкой в секундах, а сейчас коротко подтверди "
-            f"задачу.{wake_reply_requirement}"
+            f"задачу.{wake_reply_requirement}\n\n"
+            "У каждой реплики во входной истории есть служебный префикс "
+            "[отправлено: дата время UTC±смещение]. Учитывай его как фактическое время "
+            "отправки сообщения, но не копируй префикс в свой ответ без необходимости."
         )
         input_items: list[Any] = [*history_input]
         for message in messages:
-            current_text = f"{message.sender_name}: {message.text}"
+            current_text = format_message_for_model(
+                role="user",
+                content=message.text,
+                sender_name=message.sender_name,
+                created_at=message.received_at.isoformat(),
+                display_timezone=self.routine.timezone,
+            )
             if message.audio_data_url is not None:
                 input_items.append(
                     {
@@ -3334,9 +3364,12 @@ class MilanaMessageResponder:
                 )
 
             sent_at = getattr(sent, "date", None)
-            await self.presence.record_outgoing(
-                sent_at if isinstance(sent_at, datetime) else self.current_time()
+            sent_moment = (
+                self.routine.normalize_datetime(sent_at)
+                if isinstance(sent_at, datetime)
+                else self.current_time()
             )
+            await self.presence.record_outgoing(sent_moment)
             sent_count += 1
             candidate_id = getattr(sent, "id", None)
             try:
@@ -3348,6 +3381,7 @@ class MilanaMessageResponder:
                         candidate_id if isinstance(candidate_id, int) else None
                     ),
                     sender_name="Милана",
+                    created_at=sent_moment.isoformat(),
                 )
             except Exception as exc:  # noqa: BLE001
                 print(
@@ -3491,6 +3525,7 @@ class MilanaMessageResponder:
                 history_input = self.memory.response_input_with_summary(
                     state.chat_key,
                     exclude_user_message_ids=active_ids,
+                    display_timezone=self.routine.timezone,
                 )
                 revision = await self._generation_revision(state)
                 if revision is None:

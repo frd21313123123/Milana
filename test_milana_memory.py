@@ -168,15 +168,32 @@ class MilanaMemoryStoreTests(unittest.TestCase):
 
     def test_response_input_uses_only_requested_chat(self) -> None:
         store = MilanaMemoryStore()
-        store.add_message(1, "user", "Первый", sender_name="Ира")
-        store.add_message(1, "assistant", "Ответ")
+        store.add_message(
+            1,
+            "user",
+            "Первый",
+            sender_name="Ира",
+            created_at="2026-07-13T16:00:00+00:00",
+        )
+        store.add_message(
+            1,
+            "assistant",
+            "Ответ",
+            created_at="2026-07-13T16:00:05+00:00",
+        )
         store.add_message(2, "user", "Секрет другого чата")
 
         self.assertEqual(
-            store.response_input(1),
+            store.response_input(1, display_timezone=timezone(timedelta(hours=5))),
             [
-                {"role": "user", "content": "Ира: Первый"},
-                {"role": "assistant", "content": "Ответ"},
+                {
+                    "role": "user",
+                    "content": "[отправлено: 13.07.2026 21:00:00 UTC+05:00] Ира: Первый",
+                },
+                {
+                    "role": "assistant",
+                    "content": "[отправлено: 13.07.2026 21:00:05 UTC+05:00] Милана: Ответ",
+                },
             ],
         )
         store.close()
@@ -383,7 +400,13 @@ class MilanaMemoryStoreTests(unittest.TestCase):
 
         self.assertIn("Старый контекст", inp[0]["content"])
         self.assertNotIn("Новый вопрос", str(inp))
-        self.assertIn({"role": "assistant", "content": "Уже отправлено"}, inp)
+        self.assertTrue(
+            any(
+                item["role"] == "assistant"
+                and item["content"].endswith("Милана: Уже отправлено")
+                for item in inp
+            )
+        )
         store.close()
 
     def test_compaction_keeps_last_30_users_and_every_following_assistant(self) -> None:
@@ -443,11 +466,19 @@ class MilanaMemoryStoreTests(unittest.TestCase):
         summary_payload = json.loads(context[0]["content"].split("\n", 1)[1])
         self.assertEqual(summary_payload, {"chat_summary": summary_text})
         self.assertEqual(
-            [item["content"] for item in context[1:] if item["role"] == "user"],
+            [
+                item["content"].rsplit(": ", 1)[-1]
+                for item in context[1:]
+                if item["role"] == "user"
+            ],
             [f"u{i}" for i in range(31, 61)],
         )
         self.assertEqual(
-            [item["content"] for item in context[1:] if item["role"] == "assistant"],
+            [
+                item["content"].rsplit(": ", 1)[-1]
+                for item in context[1:]
+                if item["role"] == "assistant"
+            ],
             [f"a{i}" for i in range(31, 61)],
         )
         self.assertEqual(store.count_uncovered_user_messages(10), 30)

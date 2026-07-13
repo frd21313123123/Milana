@@ -8,7 +8,7 @@ import sqlite3
 import threading
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -127,6 +127,46 @@ def _parse_utc_timestamp(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def format_message_timestamp(
+    created_at: str,
+    *,
+    display_timezone: tzinfo | None = None,
+) -> str:
+    """Format a persisted send time as unambiguous model-facing metadata."""
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if display_timezone is not None:
+            parsed = parsed.astimezone(display_timezone)
+    except (OverflowError, ValueError):
+        return created_at
+
+    offset = parsed.strftime("%z")
+    if offset in {"", "+0000", "-0000"}:
+        zone = "UTC"
+    else:
+        zone = f"UTC{offset[:3]}:{offset[3:]}"
+    return f"{parsed:%d.%m.%Y %H:%M:%S} {zone}"
+
+
+def format_message_for_model(
+    *,
+    role: str,
+    content: str,
+    sender_name: str | None,
+    created_at: str,
+    display_timezone: tzinfo | None = None,
+) -> str:
+    """Add sender and Telegram send time to one model-visible chat turn."""
+    speaker = sender_name or ("Милана" if role == "assistant" else "Собеседник")
+    sent_at = format_message_timestamp(
+        created_at,
+        display_timezone=display_timezone,
+    )
+    return f"[отправлено: {sent_at}] {speaker}: {content}"
 
 
 def _normalize_content(content: str, *, maximum: int, label: str) -> str:
@@ -625,14 +665,22 @@ class MilanaMemoryStore:
         ]
 
     def response_input(
-        self, chat_id: int | str, *, limit: int = DEFAULT_HISTORY_LIMIT
+        self,
+        chat_id: int | str,
+        *,
+        limit: int = DEFAULT_HISTORY_LIMIT,
+        display_timezone: tzinfo | None = None,
     ) -> list[dict[str, str]]:
         """Return only this chat's history in Responses API message format."""
         result: list[dict[str, str]] = []
         for message in self.get_chat_history(chat_id, limit=limit):
-            content = message.content
-            if message.role == "user" and message.sender_name:
-                content = f"{message.sender_name}: {content}"
+            content = format_message_for_model(
+                role=message.role,
+                content=message.content,
+                sender_name=message.sender_name,
+                created_at=message.created_at,
+                display_timezone=display_timezone,
+            )
             result.append({"role": message.role, "content": content})
         return result
 
@@ -642,6 +690,7 @@ class MilanaMemoryStore:
         *,
         recent_limit: int | None = None,
         exclude_user_message_ids: Collection[int] | None = None,
+        display_timezone: tzinfo | None = None,
     ) -> list[dict[str, str]]:
         """Return the summary followed by its complete, non-overlapping suffix.
 
@@ -655,11 +704,13 @@ class MilanaMemoryStore:
                 chat_id,
                 recent_limit=recent_limit,
                 exclude_user_message_ids=exclude_user_message_ids,
+                display_timezone=display_timezone,
             )
 
         return self.summary_context(
             chat_id,
             exclude_user_message_ids=exclude_user_message_ids,
+            display_timezone=display_timezone,
         )
 
     def summary_context(
@@ -667,6 +718,7 @@ class MilanaMemoryStore:
         chat_id: int | str,
         *,
         exclude_user_message_ids: Collection[int] | None = None,
+        display_timezone: tzinfo | None = None,
     ) -> list[dict[str, str]]:
         """Build summary + all raw rows after the per-chat summary cursor."""
         result: list[dict[str, str]] = []
@@ -711,9 +763,13 @@ class MilanaMemoryStore:
         for row in rows:
             if row["role"] == "user" and row["telegram_message_id"] in excluded_ids:
                 continue
-            content = row["content"]
-            if row["role"] == "user" and row["sender_name"]:
-                content = f"{row['sender_name']}: {content}"
+            content = format_message_for_model(
+                role=row["role"],
+                content=row["content"],
+                sender_name=row["sender_name"],
+                created_at=row["created_at"],
+                display_timezone=display_timezone,
+            )
             result.append({"role": row["role"], "content": content})
         return result
 
@@ -726,6 +782,7 @@ class MilanaMemoryStore:
         *,
         recent_limit: int,
         exclude_user_message_ids: Collection[int] | None,
+        display_timezone: tzinfo | None,
     ) -> list[dict[str, str]]:
         """Preserve the pre-compaction fixed-total-message API when requested."""
         result: list[dict[str, str]] = []
@@ -759,9 +816,13 @@ class MilanaMemoryStore:
                 )
             ][-recent_limit:]
         for message in messages:
-            content = message.content
-            if message.role == "user" and message.sender_name:
-                content = f"{message.sender_name}: {content}"
+            content = format_message_for_model(
+                role=message.role,
+                content=message.content,
+                sender_name=message.sender_name,
+                created_at=message.created_at,
+                display_timezone=display_timezone,
+            )
             result.append({"role": message.role, "content": content})
         return result
 
