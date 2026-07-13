@@ -67,6 +67,7 @@ DEFAULT_RESPONSE_BEHAVIOR: Mapping[str, Any] = {
 DEFAULT_ONLINE_BEHAVIOR: Mapping[str, int] = {
     "online_response_min_seconds": 1,
     "online_response_max_seconds": 10,
+    "attention_ramp_seconds": 15 * 60,
     "post_reply_online_min_seconds": 30,
     "post_reply_online_max_seconds": 60,
     "spontaneous_online_interval_min_seconds": 15 * 60,
@@ -168,6 +169,7 @@ class ResponsePlan:
 class OnlineBehavior:
     online_response_min_seconds: int
     online_response_max_seconds: int
+    attention_ramp_seconds: int
     post_reply_online_min_seconds: int
     post_reply_online_max_seconds: int
     spontaneous_online_interval_min_seconds: int
@@ -346,6 +348,10 @@ def _load_online_behavior(value: Any) -> OnlineBehavior:
     if values["online_response_max_seconds"] > 10:
         raise ValueError(
             "online_behavior.online_response_max_seconds должен быть не больше 10"
+        )
+    if values["attention_ramp_seconds"] <= 0:
+        raise ValueError(
+            "online_behavior.attention_ramp_seconds должен быть больше нуля"
         )
     if (
         values["post_reply_online_min_seconds"]
@@ -806,10 +812,52 @@ class WeeklyRoutine:
         state = self.state_at(value)
         return self._response_policy_for_activity(state.current)
 
+    def attentive_response_policy(
+        self,
+        policy: ResponsePolicy,
+        value: datetime,
+        last_attentive_at: datetime | None,
+    ) -> ResponsePolicy:
+        """Плавно сжимает диапазон расписания после недавней активности."""
+        if not policy.available or last_attentive_at is None:
+            return policy
+
+        moment = self.normalize_datetime(value)
+        attentive_at = self.normalize_datetime(last_attentive_at)
+        age_seconds = max(0.0, (moment - attentive_at).total_seconds())
+        ramp_seconds = self.online_behavior.attention_ramp_seconds
+        if age_seconds >= ramp_seconds:
+            return policy
+
+        x = min(1.0, age_seconds / ramp_seconds)
+        weight = x * x * (3.0 - 2.0 * x)
+        behavior = self.online_behavior
+
+        def interpolate(recent: int, scheduled: int) -> int:
+            return round(recent + (scheduled - recent) * weight)
+
+        minimum = interpolate(
+            behavior.online_response_min_seconds,
+            policy.min_delay_seconds,
+        )
+        maximum = interpolate(
+            behavior.online_response_max_seconds,
+            policy.max_delay_seconds,
+        )
+        if minimum > maximum:
+            minimum = maximum
+        return ResponsePolicy(
+            available=True,
+            min_delay_seconds=minimum,
+            max_delay_seconds=maximum,
+        )
+
     def plan_response(
         self,
         value: datetime | None = None,
         randint: Callable[[int, int], int] = random.randint,
+        *,
+        last_attentive_at: datetime | None = None,
     ) -> ResponsePlan:
         """Планирует ответ, пересчитывая задержку на границах занятий."""
         received_at = self.normalize_datetime(value)
@@ -820,6 +868,11 @@ class WeeklyRoutine:
             state = self.state_at(cursor)
             policy = self._response_policy_for_activity(state.current)
             if policy.available:
+                policy = self.attentive_response_policy(
+                    policy,
+                    cursor,
+                    last_attentive_at,
+                )
                 delay_seconds = randint(
                     policy.min_delay_seconds,
                     policy.max_delay_seconds,
@@ -937,6 +990,22 @@ def format_response_policy(policy: ResponsePolicy) -> str:
     return f"читает и отвечает через {minimum}–{maximum}"
 
 
+def format_attention_behavior(routine: WeeklyRoutine) -> str:
+    behavior = routine.online_behavior
+    recent = format_response_policy(
+        ResponsePolicy(
+            True,
+            behavior.online_response_min_seconds,
+            behavior.online_response_max_seconds,
+        )
+    )
+    ramp = format_response_delay(behavior.attention_ramp_seconds)
+    return (
+        f"после online {recent}, затем плавно возвращается к диапазону занятия "
+        f"за {ramp}"
+    )
+
+
 def format_activity_range(activity: Activity) -> str:
     return f"{minutes_to_time(activity.start)}–{minutes_to_time(activity.end)}"
 
@@ -977,6 +1046,7 @@ def format_current_status(
             f"Расписание Миланы: сейчас «{current_label}»{current_range}"
             f"{remaining_text}; {next_text}. "
             f"Сообщения: {response_behavior}. "
+            f"Внимательность: {format_attention_behavior(routine)}. "
             f"Состояние дня: энергия {state.metrics.energy}%, "
             f"стресс {state.metrics.stress}%, "
             f"продуктивность {state.metrics.productivity}%, "
@@ -995,6 +1065,7 @@ def format_current_status(
         ),
         f"Сейчас: {current_label}{current_range}{remaining_text}.",
         f"Сообщения: {response_behavior}.",
+        f"Внимательность: {format_attention_behavior(routine)}.",
         f"Далее: {_activity_label(state.next_activity)}"
         + (f" в {state.next_at:%H:%M}." if state.next_at else "."),
         (
@@ -1025,6 +1096,7 @@ def format_day_schedule(routine: WeeklyRoutine, day_key: str) -> str:
             f"Энергия {metrics.energy}%, стресс {metrics.stress}%, "
             f"продуктивность {metrics.productivity}%, баланс {metrics.balance}%."
         ),
+        f"Внимательность: {format_attention_behavior(routine)}.",
     ]
     for activity in routine.days[day_key]:
         activity_response = format_response_policy(

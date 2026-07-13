@@ -229,6 +229,12 @@ class MilanaMemoryStore:
 
             CREATE INDEX IF NOT EXISTS idx_pulse_tasks_status_due
                 ON pulse_tasks(status, due_at);
+
+            CREATE TABLE IF NOT EXISTS attention_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_attentive_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self._connection.commit()
@@ -419,6 +425,56 @@ class MilanaMemoryStore:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    def get_last_attentive_at(self) -> datetime | None:
+        """Return the persisted global attention timestamp, if one exists."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT last_attentive_at FROM attention_state WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return _parse_utc_timestamp(str(row["last_attentive_at"]))
+
+    def set_last_attentive_at(
+        self,
+        value: datetime,
+        *,
+        only_if_later: bool = True,
+    ) -> datetime:
+        """Atomically persist global attention and return the stored timestamp."""
+        timestamp = _utc_timestamp(value)
+        updated_at = _utc_now()
+        with self._lock:
+            if only_if_later:
+                self._connection.execute(
+                    """
+                    INSERT INTO attention_state (id, last_attentive_at, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        last_attentive_at = excluded.last_attentive_at,
+                        updated_at = excluded.updated_at
+                    WHERE attention_state.last_attentive_at < excluded.last_attentive_at
+                    """,
+                    (timestamp, updated_at),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    INSERT INTO attention_state (id, last_attentive_at, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        last_attentive_at = excluded.last_attentive_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (timestamp, updated_at),
+                )
+            row = self._connection.execute(
+                "SELECT last_attentive_at FROM attention_state WHERE id = 1"
+            ).fetchone()
+            self._connection.commit()
+        assert row is not None
+        return _parse_utc_timestamp(str(row["last_attentive_at"]))
 
     def add_message(
         self,

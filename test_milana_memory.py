@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -28,6 +29,28 @@ def prepare_test_compaction(
 
 
 class MilanaMemoryStoreTests(unittest.TestCase):
+    def test_attention_timestamp_is_atomic_persistent_and_replaceable(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.sqlite3"
+            first = datetime(2026, 7, 13, 18, 0, tzinfo=timezone.utc)
+            later = first + timedelta(minutes=5)
+            earlier = first - timedelta(minutes=5)
+
+            store = MilanaMemoryStore(path)
+            self.assertIsNone(store.get_last_attentive_at())
+            self.assertEqual(store.set_last_attentive_at(first), first)
+            self.assertEqual(store.set_last_attentive_at(earlier), first)
+            self.assertEqual(store.set_last_attentive_at(later), later)
+            store.close()
+
+            reopened = MilanaMemoryStore(path)
+            self.assertEqual(reopened.get_last_attentive_at(), later)
+            self.assertEqual(
+                reopened.set_last_attentive_at(earlier, only_if_later=False),
+                earlier,
+            )
+            reopened.close()
+
     def test_history_is_persistent_ordered_limited_and_isolated(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "memory.sqlite3"

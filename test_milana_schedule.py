@@ -257,6 +257,7 @@ class MilanaScheduleTests(unittest.TestCase):
             OnlineBehavior(
                 online_response_min_seconds=1,
                 online_response_max_seconds=10,
+                attention_ramp_seconds=900,
                 post_reply_online_min_seconds=30,
                 post_reply_online_max_seconds=60,
                 spontaneous_online_interval_min_seconds=900,
@@ -279,6 +280,10 @@ class MilanaScheduleTests(unittest.TestCase):
             (
                 lambda behavior: behavior.update(online_response_max_seconds=11),
                 "online_response_max_seconds должен быть не больше 10",
+            ),
+            (
+                lambda behavior: behavior.update(attention_ramp_seconds=0),
+                "attention_ramp_seconds должен быть больше нуля",
             ),
             (
                 lambda behavior: behavior.update(
@@ -318,6 +323,40 @@ class MilanaScheduleTests(unittest.TestCase):
                 update(config["online_behavior"])
                 with self.assertRaisesRegex(ValueError, expected_error):
                     WeeklyRoutine(config)
+
+    def test_attention_smoothstep_interpolates_both_schedule_bounds(self) -> None:
+        policy = ResponsePolicy(True, 60, 600)
+        now = datetime(2026, 7, 13, 19, 10, tzinfo=YEKT)
+        expected = {
+            0: ResponsePolicy(True, 1, 10),
+            2: ResponsePolicy(True, 1, 10),
+            60: ResponsePolicy(True, 2, 18),
+            300: ResponsePolicy(True, 16, 163),
+            900: policy,
+            1200: policy,
+        }
+
+        for age_seconds, expected_policy in expected.items():
+            with self.subTest(age_seconds=age_seconds):
+                actual = self.routine.attentive_response_policy(
+                    policy,
+                    now,
+                    now - timedelta(seconds=age_seconds),
+                )
+                self.assertEqual(actual, expected_policy)
+
+    def test_plan_response_uses_recent_attention_and_normalizes_timezone(self) -> None:
+        received_at = datetime(2026, 7, 13, 19, 10, tzinfo=YEKT)
+        last_attentive_utc = received_at.astimezone(timezone.utc)
+
+        plan = self.routine.plan_response(
+            received_at,
+            randint=lambda low, high: high,
+            last_attentive_at=last_attentive_utc,
+        )
+
+        self.assertEqual(plan.policy, ResponsePolicy(True, 1, 10))
+        self.assertEqual(plan.respond_at, received_at + timedelta(seconds=10))
 
     def test_time_parsing_and_cross_midnight_activity_boundaries(self) -> None:
         self.assertEqual(time_to_minutes("00:00"), 0)

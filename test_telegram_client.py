@@ -16,6 +16,7 @@ from openai import BadRequestError
 from telethon import functions, types
 
 from agy_provider import AgyError, AgyQuotaError
+from milana_memory import MilanaMemoryStore
 from milana_schedule import load_routine
 from telegram_client import (
     AIConfig,
@@ -688,6 +689,60 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         schedule_status.assert_not_called()
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
+
+    async def test_runtime_restores_and_observes_manual_outgoing_activity(self) -> None:
+        latest_at = datetime(2026, 7, 13, 18, 0, tzinfo=timezone.utc)
+        manual_at = latest_at + timedelta(minutes=1)
+        me = SimpleNamespace(username="milana", id=1)
+
+        async def outgoing_history():
+            yield SimpleNamespace(date=latest_at)
+
+        client = MagicMock()
+        client.get_me = AsyncMock(return_value=me)
+        client.iter_messages.return_value = outgoing_history()
+        client.run_until_disconnected = AsyncMock()
+        client.is_connected.return_value = False
+        config = AIConfig(
+            api_key="test-key",
+            model="test-model",
+            instructions="Тестовая инструкция",
+            temperature=0.2,
+            max_output_tokens=100,
+        )
+        memory = MagicMock()
+        presence = MagicMock()
+        presence.record_outgoing = AsyncMock()
+        presence.run = AsyncMock()
+        presence.force_offline = AsyncMock()
+        responder = MagicMock()
+        responder.shutdown = AsyncMock()
+
+        with (
+            patch("telegram_client.load_ai_config", return_value=config),
+            patch("telegram_client.load_routine", return_value=load_routine()),
+            patch("telegram_client.AsyncOpenAI", return_value=MagicMock()),
+            patch("telegram_client.MilanaMemoryStore", return_value=memory),
+            patch(
+                "telegram_client.MilanaPresenceController", return_value=presence
+            ),
+            patch(
+                "telegram_client.MilanaMessageResponder", return_value=responder
+            ),
+            patch("builtins.print"),
+        ):
+            await run_ai_bot(client, dev_chat=True)
+
+        client.iter_messages.assert_called_once_with(None, limit=1, from_user=me)
+        presence.record_outgoing.assert_awaited_once_with(latest_at)
+        outgoing_handler = client.add_event_handler.call_args_list[1].args[0]
+        await outgoing_handler(
+            SimpleNamespace(message=SimpleNamespace(date=manual_at))
+        )
+        self.assertEqual(
+            presence.record_outgoing.await_args_list,
+            [call(latest_at), call(manual_at)],
+        )
 
     async def test_gemini_runtime_wraps_agy_with_openai_quota_fallback(self) -> None:
         client = MagicMock()
@@ -1771,6 +1826,60 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         instructions = openai_client.responses.create.await_args.kwargs["instructions"]
         self.assertIn("состояние «Утренние сборы»", instructions)
 
+    async def test_three_night_messages_wake_milana_and_require_annoyed_reply(self) -> None:
+        clock = GatedClock(datetime(2026, 7, 13, 23, 45, tzinfo=YEKT))
+        wake_draws: list[tuple[int, int]] = []
+
+        def randint(minimum: int, maximum: int) -> int:
+            if (minimum, maximum) == (3, 8):
+                wake_draws.append((minimum, maximum))
+                return 3
+            return minimum
+
+        responder, client, openai_client = make_responder(clock, randint=randint)
+        events = [
+            make_event(
+                clock.value,
+                text=f"Ночное сообщение {index}",
+                message_id=300 + index,
+            )
+            for index in range(3)
+        ]
+
+        with patch("builtins.print"):
+            worker = await responder.submit(events[0])
+            await asyncio.wait_for(clock.sleep_calls.get(), timeout=1)
+
+            self.assertIs(worker, await responder.submit(events[1]))
+            await asyncio.wait_for(clock.sleep_calls.get(), timeout=1)
+            client.send_read_acknowledge.assert_not_awaited()
+            openai_client.responses.create.assert_not_awaited()
+
+            self.assertIs(worker, await responder.submit(events[2]))
+            quiet_delay, finish_quiet = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(quiet_delay, 2)
+            finish_quiet.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        self.assertEqual(wake_draws, [(3, 8)])
+        self.assertEqual(clock.value, datetime(2026, 7, 13, 23, 45, 2, tzinfo=YEKT))
+        client.send_read_acknowledge.assert_awaited_once_with(
+            "peer",
+            message=events[-1].message,
+            max_id=events[-1].id,
+        )
+        client.send_message.assert_awaited_once_with(100, "Готовый ответ")
+        instructions = openai_client.responses.create.await_args.kwargs["instructions"]
+        self.assertIn("разбудил Милану", instructions)
+        self.assertIn("сонно и явно недовольно", instructions)
+        serialized_input = str(
+            openai_client.responses.create.await_args.kwargs["input"]
+        )
+        for index in range(3):
+            self.assertIn(f"Ночное сообщение {index}", serialized_input)
+
     async def test_media_without_caption_uses_read_delay_but_gets_no_reply(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)
@@ -2243,6 +2352,107 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         clock.value += timedelta(seconds=60)
         self.assertFalse(presence.is_online())
 
+    async def test_persisted_future_attention_is_capped_and_outgoing_notifies(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        with TemporaryDirectory() as directory:
+            memory = MilanaMemoryStore(Path(directory) / "memory.sqlite3")
+            memory.set_last_attentive_at(
+                clock.value.astimezone(timezone.utc) + timedelta(minutes=5)
+            )
+            client = MagicMock()
+            client.side_effect = AsyncMock(return_value=None)
+            presence = MilanaPresenceController(
+                client,
+                load_routine(),
+                memory=memory,
+                now=clock.now,
+                sleep=clock.sleep,
+            )
+
+            self.assertEqual(presence.last_attentive_at, clock.value)
+            self.assertEqual(
+                memory.get_last_attentive_at(),
+                clock.value.astimezone(timezone.utc),
+            )
+
+            version = presence.attention_version
+            changed = asyncio.create_task(
+                presence.wait_for_attention_change(version)
+            )
+            await asyncio.sleep(0)
+            sent_at = clock.value + timedelta(minutes=1)
+            await presence.record_outgoing(sent_at)
+
+            self.assertEqual(await changed, version + 1)
+            self.assertEqual(presence.last_attentive_at, sent_at)
+            self.assertEqual(
+                presence.sleep_deferred_until,
+                sent_at + timedelta(minutes=30),
+            )
+            memory.close()
+
+    async def test_force_offline_truncates_persisted_online_window(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        memory = MilanaMemoryStore()
+        client = MagicMock()
+        client.side_effect = AsyncMock(return_value=None)
+        presence = MilanaPresenceController(
+            client,
+            load_routine(),
+            memory=memory,
+            now=clock.now,
+            sleep=clock.sleep,
+            randint=lambda minimum, maximum: maximum,
+        )
+
+        await presence.begin_response()
+        await presence.finish_response(answered=True)
+        self.assertEqual(
+            memory.get_last_attentive_at(),
+            (clock.value + timedelta(seconds=60)).astimezone(timezone.utc),
+        )
+
+        clock.value += timedelta(seconds=10)
+        await presence.force_offline()
+
+        self.assertEqual(
+            memory.get_last_attentive_at(),
+            clock.value.astimezone(timezone.utc),
+        )
+        self.assertIsNone(presence.online_until)
+        memory.close()
+
+    async def test_new_attention_accelerates_already_waiting_response(self) -> None:
+        clock = GatedClock(datetime(2026, 7, 13, 19, 10, tzinfo=YEKT))
+        responder, client, _ = make_responder(
+            clock,
+            randint=lambda minimum, maximum: maximum,
+        )
+        event = make_event(clock.value)
+
+        with patch("builtins.print"):
+            worker = await responder.submit(event)
+            original_delay, _ = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(original_delay, 600)
+
+            await responder.presence.record_outgoing(clock.value)
+            accelerated_delay, release_accelerated = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(accelerated_delay, 10)
+            release_accelerated.set()
+
+            quiet_delay, release_quiet = await asyncio.wait_for(
+                clock.sleep_calls.get(), timeout=1
+            )
+            self.assertEqual(quiet_delay, 2)
+            release_quiet.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+        client.send_message.assert_awaited_once_with(100, "Готовый ответ")
+
     async def test_answer_defers_sleep_for_thirty_minutes(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 23, 25, tzinfo=YEKT))
         client = MagicMock()
@@ -2263,7 +2473,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(presence.is_sleep_deferred(expected - timedelta(seconds=1)))
         self.assertFalse(presence.is_sleep_deferred(expected))
 
-    async def test_message_during_deferred_sleep_extends_timer_from_new_reply(self) -> None:
+    async def test_message_during_deferred_sleep_uses_attention_gradient(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 23, 25, tzinfo=YEKT))
         responder, _, _ = make_responder(clock)
 
@@ -2275,7 +2485,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             clock.value = datetime(2026, 7, 13, 23, 35, tzinfo=YEKT)
             await responder.process(make_event(clock.value, message_id=301))
 
-        self.assertEqual(clock.delays[-2:], [1, 2])
+        self.assertEqual(clock.delays[-2:], [7, 2])
         self.assertEqual(
             responder.presence.sleep_deferred_until,
             clock.value + timedelta(minutes=30),

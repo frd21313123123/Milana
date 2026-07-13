@@ -115,6 +115,7 @@
   "online_behavior": {
     "online_response_min_seconds": 1,
     "online_response_max_seconds": 10,
+    "attention_ramp_seconds": 900,
     "post_reply_online_min_seconds": 30,
     "post_reply_online_max_seconds": 60,
     "spontaneous_online_interval_min_seconds": 900,

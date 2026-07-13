@@ -117,6 +117,8 @@ INITIATIVE_EVENT_MAX_INTERVAL_SECONDS = 90 * 60
 INITIATIVE_EVENT_MAX_CONTACTS = 20
 INITIATIVE_EVENT_HISTORY_MESSAGES = 8
 INITIATIVE_MESSAGE_MAX_LENGTH = 4000
+NIGHT_WAKE_MIN_MESSAGES = 3
+NIGHT_WAKE_MAX_MESSAGES = 8
 
 
 @dataclass(frozen=True)
@@ -879,12 +881,14 @@ class MilanaPresenceController:
         client: TelegramClient,
         routine: WeeklyRoutine,
         *,
+        memory: MilanaMemoryStore | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         randint: Callable[[int, int], int] = SYSTEM_RANDOM.randint,
     ) -> None:
         self.client = client
         self.routine = routine
+        self.memory = memory
         self._now = now
         self._sleep = sleep
         self._randint = randint
@@ -895,6 +899,21 @@ class MilanaPresenceController:
         self._active_responses = 0
         self._last_offline: bool | None = None
         self._lock = asyncio.Lock()
+        self._attention_condition = asyncio.Condition()
+        self._attention_version = 0
+        self._last_attentive_at: datetime | None = None
+        if self.memory is not None:
+            persisted = self.memory.get_last_attentive_at()
+            if persisted is not None:
+                now_value = self.current_time()
+                normalized = self.routine.normalize_datetime(persisted)
+                if normalized > now_value:
+                    normalized = now_value
+                    self.memory.set_last_attentive_at(
+                        normalized,
+                        only_if_later=False,
+                    )
+                self._last_attentive_at = normalized
 
     def current_time(self) -> datetime:
         value = self._now() if self._now is not None else None
@@ -903,6 +922,72 @@ class MilanaPresenceController:
     @property
     def online_until(self) -> datetime | None:
         return self._online_until
+
+    @property
+    def last_attentive_at(self) -> datetime | None:
+        return self._last_attentive_at
+
+    @property
+    def attention_version(self) -> int:
+        return self._attention_version
+
+    def attention_reference_at(self, value: datetime | None = None) -> datetime | None:
+        moment = self.routine.normalize_datetime(value) if value else self.current_time()
+        if self.is_online(moment) and (
+            self._last_attentive_at is None or moment > self._last_attentive_at
+        ):
+            return moment
+        return self._last_attentive_at
+
+    async def wait_for_attention_change(self, version: int) -> int:
+        async with self._attention_condition:
+            await self._attention_condition.wait_for(
+                lambda: self._attention_version != version
+            )
+            return self._attention_version
+
+    async def _record_attentive_locked(
+        self,
+        value: datetime,
+        *,
+        only_if_later: bool = True,
+    ) -> None:
+        moment = self.routine.normalize_datetime(value)
+        previous = self._last_attentive_at
+        if self.memory is not None:
+            stored = self.memory.set_last_attentive_at(
+                moment,
+                only_if_later=only_if_later,
+            )
+            moment = self.routine.normalize_datetime(stored)
+        if only_if_later and previous is not None and moment <= previous:
+            return
+        if not only_if_later and previous == moment:
+            return
+        self._last_attentive_at = moment
+        self._attention_version += 1
+        async with self._attention_condition:
+            self._attention_condition.notify_all()
+
+    async def record_outgoing(self, value: datetime | None = None) -> None:
+        """Record any outgoing account message without changing simulated status."""
+        async with self._lock:
+            sent_at = (
+                self.routine.normalize_datetime(value)
+                if value is not None
+                else self.current_time()
+            )
+            if self._last_outgoing_at is None or sent_at > self._last_outgoing_at:
+                self._last_outgoing_at = sent_at
+                sleep_candidate = sent_at + timedelta(
+                    seconds=self.routine.online_behavior.conversation_sleep_delay_seconds
+                )
+                if (
+                    self._sleep_deferred_until is None
+                    or sleep_candidate > self._sleep_deferred_until
+                ):
+                    self._sleep_deferred_until = sleep_candidate
+            await self._record_attentive_locked(sent_at)
 
     @property
     def sleep_deferred_until(self) -> datetime | None:
@@ -955,6 +1040,7 @@ class MilanaPresenceController:
         """Сразу показывает online перед чтением и отправкой ответа."""
         async with self._lock:
             self._active_responses += 1
+            await self._record_attentive_locked(self.current_time())
             await self._publish_locked()
 
     async def finish_response(self, *, answered: bool) -> int | None:
@@ -962,9 +1048,10 @@ class MilanaPresenceController:
         async with self._lock:
             self._active_responses = max(0, self._active_responses - 1)
             online_seconds: int | None = None
+            finished_at = self.current_time()
             if answered:
                 behavior = self.routine.online_behavior
-                answered_at = self.current_time()
+                answered_at = finished_at
                 self._last_outgoing_at = answered_at
                 sleep_candidate = answered_at + timedelta(
                     seconds=behavior.conversation_sleep_delay_seconds
@@ -978,9 +1065,12 @@ class MilanaPresenceController:
                     behavior.post_reply_online_min_seconds,
                     behavior.post_reply_online_max_seconds,
                 )
-                candidate = self.current_time() + timedelta(seconds=online_seconds)
+                candidate = finished_at + timedelta(seconds=online_seconds)
                 if self._online_until is None or candidate > self._online_until:
                     self._online_until = candidate
+                await self._record_attentive_locked(candidate)
+            else:
+                await self._record_attentive_locked(finished_at)
             await self._publish_locked()
             return online_seconds
 
@@ -1028,6 +1118,7 @@ class MilanaPresenceController:
                 if self._online_until is None or candidate > self._online_until:
                     if candidate > now:
                         self._online_until = candidate
+                        await self._record_attentive_locked(candidate)
                 if online_seconds == 0:
                     online_seconds = None
                 self._schedule_spontaneous_online_locked(candidate)
@@ -1048,6 +1139,13 @@ class MilanaPresenceController:
 
     async def force_offline(self) -> None:
         async with self._lock:
+            now = self.current_time()
+            was_online = self.is_online(now)
+            if was_online:
+                await self._record_attentive_locked(
+                    now,
+                    only_if_later=False,
+                )
             self._active_responses = 0
             self._online_until = None
             self._last_outgoing_at = None
@@ -1096,7 +1194,6 @@ class IncomingEnvelope:
     event: Any
     received_at: datetime
     queued_at: datetime
-    received_while_online: bool
     continues_conversation: bool
 
 
@@ -1141,6 +1238,7 @@ class ChatWorkerState:
     chat_key: int | str
     pending: list[IncomingEnvelope] = field(default_factory=list)
     seen_message_ids: set[int] = field(default_factory=set)
+    night_wake_threshold: int | None = None
     revision: int = 0
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     worker: asyncio.Task[None] | None = None
@@ -1615,6 +1713,7 @@ class MilanaMessageResponder:
         self.presence = presence or MilanaPresenceController(
             client,
             routine,
+            memory=self.memory,
             now=now,
             sleep=sleep,
             randint=randint,
@@ -2251,6 +2350,7 @@ class MilanaMessageResponder:
         chat_key: int | str,
         history_input: list[dict[str, str]],
         messages: list[PreparedIncoming],
+        woke_at_night: bool = False,
     ) -> GeneratedReply:
         max_parts = self.message_flow.max_reply_messages
         context_instructions = (
@@ -2258,6 +2358,14 @@ class MilanaMessageResponder:
             "текущее занятие, сон, статус в сети и связанные с ними правила."
             if self.dev_chat
             else build_schedule_prompt(self.routine, self.current_time())
+        )
+        wake_reply_requirement = (
+            "\n\nСобеседник прислал подряд столько сообщений, что разбудил Милану "
+            "среди ночного сна. Обязательно ответь текстом прямо сейчас сонно и явно "
+            "недовольно из-за того, что её разбудили. Сохраняй естественный стиль Миланы, "
+            "не упоминай числовой порог, расписание или внутреннюю механику пробуждения."
+            if woke_at_night
+            else ""
         )
         instructions = (
             f"{self.config.instructions}\n\n"
@@ -2288,7 +2396,8 @@ class MilanaMessageResponder:
             "блокировки новые сообщения этого человека приходить не будут. Каждая строка массива messages будет отправлена "
             "отдельным сообщением; не добавляй служебные пояснения. Если собеседник просит "
             "написать ему через некоторое время, обязательно вызови schedule_message с готовым "
-            "текстом будущего сообщения и задержкой в секундах, а сейчас коротко подтверди задачу."
+            "текстом будущего сообщения и задержкой в секундах, а сейчас коротко подтверди "
+            f"задачу.{wake_reply_requirement}"
         )
         input_items: list[Any] = [*history_input]
         for message in messages:
@@ -2405,53 +2514,138 @@ class MilanaMessageResponder:
         if delay > 0:
             await self._sleep(delay)
 
+    async def _sleep_until_or_attention_changed(
+        self,
+        target: datetime,
+        attention_version: int,
+    ) -> bool:
+        delay = (target - self.current_time()).total_seconds()
+        if delay <= 0:
+            return self.presence.attention_version != attention_version
+        sleep_task = asyncio.create_task(self._sleep(delay))
+        attention_task = asyncio.create_task(
+            self.presence.wait_for_attention_change(attention_version)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {sleep_task, attention_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return attention_task in done
+        finally:
+            for task in (sleep_task, attention_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleep_task, attention_task, return_exceptions=True)
+
     async def _wait_before_reading(
         self,
+        state: ChatWorkerState,
         received_at: datetime,
         *,
-        received_while_online: bool,
         continues_conversation: bool,
-    ) -> None:
+    ) -> bool:
         if self.dev_chat:
-            return
-        if received_while_online or continues_conversation:
-            behavior = self.routine.online_behavior
-            fast_delay = self._randint(
-                behavior.online_response_min_seconds,
-                behavior.online_response_max_seconds,
-            )
-            fast_target = received_at + timedelta(seconds=fast_delay)
-            print(
-                f"Сообщение получено, пока Милана в сети; "
-                f"чтение запланировано на {fast_target:%d.%m %H:%M:%S} "
-                f"(через {fast_delay} сек.)"
-            )
-            now = self.current_time()
-            if continues_conversation or self.presence.can_respond(now):
-                await self._sleep_until(fast_target)
-                now = self.current_time()
-                if continues_conversation or self.presence.can_respond(now):
-                    return
-                # Если после короткой задержки окно закрылось (редко),
-                # планируем чтение заново от текущего момента.
-                received_at = now
-
-        plan = self.routine.plan_response(received_at, randint=self._randint)
+            return False
+        cursor = received_at
         while True:
             now = self.current_time()
-            delay = max(0.0, (plan.respond_at - now).total_seconds())
-            print(
-                f"Чтение запланировано на {plan.respond_at:%d.%m %H:%M:%S} "
-                f"(через {math.ceil(delay)} сек.; {plan.policy.label})"
+            current = self.routine.state_at(now).current
+            sleeping = current is not None and current.kind == "sleep"
+            active_sleep_conversation = (
+                sleeping
+                and continues_conversation
+                and self.presence.is_sleep_deferred(now)
             )
-            await self._sleep_until(plan.respond_at)
+            if sleeping and not active_sleep_conversation:
+                async with self._chat_states_lock:
+                    if state.night_wake_threshold is None:
+                        state.night_wake_threshold = self._randint(
+                            NIGHT_WAKE_MIN_MESSAGES,
+                            NIGHT_WAKE_MAX_MESSAGES,
+                        )
+                    threshold = state.night_wake_threshold
+                    night_message_count = sum(
+                        1
+                        for envelope in state.pending
+                        if not envelope.continues_conversation
+                        and (
+                            (activity := self.routine.state_at(envelope.queued_at).current)
+                            is not None
+                            and activity.kind == "sleep"
+                        )
+                    )
+                    state.changed.clear()
+                if night_message_count >= threshold:
+                    state.night_wake_threshold = None
+                    print(
+                        "Милану разбудили ночные сообщения: "
+                        f"получено {night_message_count}, порог {threshold}."
+                    )
+                    return True
+
+            attention_version = self.presence.attention_version
+            last_attentive_at = self.presence.attention_reference_at(now)
+            if active_sleep_conversation:
+                policy = self.routine.attentive_response_policy(
+                    self.routine.default_response_policy,
+                    cursor,
+                    last_attentive_at,
+                )
+                delay_seconds = self._randint(
+                    policy.min_delay_seconds,
+                    policy.max_delay_seconds,
+                )
+                if (
+                    isinstance(delay_seconds, bool)
+                    or not isinstance(delay_seconds, int)
+                    or not (
+                        policy.min_delay_seconds
+                        <= delay_seconds
+                        <= policy.max_delay_seconds
+                    )
+                ):
+                    raise ValueError(
+                        "randint должен вернуть целое число внутри диапазона политики"
+                    )
+                respond_at = cursor + timedelta(seconds=delay_seconds)
+            else:
+                plan = self.routine.plan_response(
+                    cursor,
+                    randint=self._randint,
+                    last_attentive_at=last_attentive_at,
+                )
+                policy = plan.policy
+                respond_at = plan.respond_at
+
+            delay = max(0.0, (respond_at - now).total_seconds())
+            print(
+                f"Чтение запланировано на {respond_at:%d.%m %H:%M:%S} "
+                f"(через {math.ceil(delay)} сек.; {policy.label})"
+            )
+            if sleeping and not active_sleep_conversation and delay > 0:
+                if await self._sleep_or_changed(
+                    state,
+                    delay,
+                    attention_version=attention_version,
+                ):
+                    cursor = self.current_time()
+                    continue
+            else:
+                if await self._sleep_until_or_attention_changed(
+                    respond_at,
+                    attention_version,
+                ):
+                    cursor = self.current_time()
+                    continue
             now = self.current_time()
             if self.presence.can_respond(now):
-                return None
+                state.night_wake_threshold = None
+                return False
 
             # Системные часы или расписание могли измениться во время ожидания.
             # Во сне по-прежнему ничего не читаем и строим новый план от «сейчас».
-            plan = self.routine.plan_response(now, randint=self._randint)
+            cursor = now
 
     async def _wait_out_sleep(self, *, continues_conversation: bool = False) -> None:
         while True:
@@ -2524,16 +2718,13 @@ class MilanaMessageResponder:
     async def submit(self, event: events.NewMessage.Event) -> asyncio.Task[None]:
         """Quickly enqueue an event and ensure exactly one worker owns its chat."""
         received_at = self.received_time(event)
-        received_while_online = False
         continues_conversation = False
         if not self.dev_chat:
-            received_while_online = self.presence.is_online(received_at)
             continues_conversation = self.presence.is_sleep_deferred(received_at)
         envelope = IncomingEnvelope(
             event=event,
             received_at=received_at,
             queued_at=self.current_time(),
-            received_while_online=received_while_online,
             continues_conversation=continues_conversation,
         )
         chat_key = self._chat_key(event)
@@ -2615,23 +2806,39 @@ class MilanaMessageResponder:
             return state.revision
 
     async def _sleep_or_changed(
-        self, state: ChatWorkerState, seconds: float
+        self,
+        state: ChatWorkerState,
+        seconds: float,
+        *,
+        attention_version: int | None = None,
     ) -> bool:
         if seconds <= 0:
             return state.changed.is_set()
         sleep_task = asyncio.create_task(self._sleep(seconds))
         changed_task = asyncio.create_task(state.changed.wait())
+        attention_task = (
+            asyncio.create_task(
+                self.presence.wait_for_attention_change(attention_version)
+            )
+            if attention_version is not None
+            else None
+        )
+        tasks = {sleep_task, changed_task}
+        if attention_task is not None:
+            tasks.add(attention_task)
         try:
             done, _ = await asyncio.wait(
-                {sleep_task, changed_task},
+                tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            changed_won = changed_task in done
+            changed_won = changed_task in done or (
+                attention_task is not None and attention_task in done
+            )
         finally:
-            for task in (sleep_task, changed_task):
+            for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(sleep_task, changed_task, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
         # An event can arrive while the losing task is being cancelled above.
         # Check the signal after cleanup so that arrival starts a fresh quiet wait.
         return changed_won or state.changed.is_set()
@@ -2960,12 +3167,14 @@ class MilanaMessageResponder:
         chat_key: int | str,
         history_input: list[dict[str, str]],
         messages: list[PreparedIncoming],
+        woke_at_night: bool = False,
     ) -> GeneratedReply | None:
         generation_task = asyncio.create_task(
             self._generate_answer(
                 chat_key=chat_key,
                 history_input=history_input,
                 messages=messages,
+                woke_at_night=woke_at_night,
             )
         )
         changed_task = asyncio.create_task(state.changed.wait())
@@ -3124,6 +3333,10 @@ class MilanaMessageResponder:
                     scheduled_count=scheduled_count,
                 )
 
+            sent_at = getattr(sent, "date", None)
+            await self.presence.record_outgoing(
+                sent_at if isinstance(sent_at, datetime) else self.current_time()
+            )
             sent_count += 1
             candidate_id = getattr(sent, "id", None)
             try:
@@ -3216,6 +3429,7 @@ class MilanaMessageResponder:
         active: list[PreparedIncoming] = []
         context: IncomingEnvelope | None = None
         skip_schedule_once = False
+        woke_at_night = False
         try:
             while True:
                 if not active:
@@ -3225,9 +3439,9 @@ class MilanaMessageResponder:
                             return
                         continue
                     if not skip_schedule_once:
-                        await self._wait_before_reading(
+                        woke_at_night = await self._wait_before_reading(
+                            state,
                             context.received_at,
-                            received_while_online=context.received_while_online,
                             continues_conversation=context.continues_conversation,
                         )
                     skip_schedule_once = False
@@ -3250,7 +3464,9 @@ class MilanaMessageResponder:
                 assert context is not None
 
                 await self._wait_for_full_online_window(
-                    continues_conversation=context.continues_conversation
+                    continues_conversation=(
+                        context.continues_conversation or woke_at_night
+                    )
                 )
                 # Compact before building the main-model input so the reply that
                 # crosses the 500-message boundary immediately sees the new summary.
@@ -3294,11 +3510,14 @@ class MilanaMessageResponder:
                             chat_key=state.chat_key,
                             history_input=history_input,
                             messages=model_messages,
+                            woke_at_night=woke_at_night,
                         )
                         if reply is None:
                             continue
                         if not self._full_online_window_is_open(
-                            continues_conversation=context.continues_conversation
+                            continues_conversation=(
+                                context.continues_conversation or woke_at_night
+                            )
                         ):
                             continue
                         if await self._revision(state) != revision:
@@ -3312,7 +3531,9 @@ class MilanaMessageResponder:
                             revision=revision,
                             active=active,
                             reply=reply,
-                            continues_conversation=context.continues_conversation,
+                            continues_conversation=(
+                                context.continues_conversation or woke_at_night
+                            ),
                         )
                 except (
                     AgyError,
@@ -3368,6 +3589,8 @@ class MilanaMessageResponder:
                     )
                 active = []
                 context = None
+                if not interrupted:
+                    woke_at_night = False
                 skip_schedule_once = interrupted
         finally:
             async with self._chat_states_lock:
@@ -3398,7 +3621,23 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
         model_client = AsyncOpenAI(api_key=config.api_key)
     memory = MilanaMemoryStore(MEMORY_PATH)
     me = await client.get_me()
-    presence = MilanaPresenceController(client, routine)
+    presence = MilanaPresenceController(client, routine, memory=memory)
+
+    try:
+        async for latest_outgoing in client.iter_messages(
+            None,
+            limit=1,
+            from_user=me,
+        ):
+            latest_outgoing_at = getattr(latest_outgoing, "date", None)
+            if isinstance(latest_outgoing_at, datetime):
+                await presence.record_outgoing(latest_outgoing_at)
+            break
+    except (RPCError, OSError, TypeError, ValueError) as exc:
+        print(
+            f"Не удалось сверить последнюю исходящую активность Telegram: {exc}",
+            file=sys.stderr,
+        )
 
     async def execute_pulse_task(task: PulseTask) -> None:
         if task.action != "send_message":
@@ -3406,7 +3645,21 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
         target: int | str = (
             int(task.chat_id) if task.chat_id.lstrip("-").isdigit() else task.chat_id
         )
-        sent = await client.send_message(target, task.message)
+        presence_started = False
+        answered = False
+        if not dev_chat:
+            await presence.begin_response()
+            presence_started = True
+        try:
+            sent = await client.send_message(target, task.message)
+            answered = True
+            sent_at = getattr(sent, "date", None)
+            await presence.record_outgoing(
+                sent_at if isinstance(sent_at, datetime) else presence.current_time()
+            )
+        finally:
+            if presence_started:
+                await presence.finish_response(answered=answered)
         candidate_id = getattr(sent, "id", None)
         try:
             memory.add_message(
@@ -3450,9 +3703,19 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
         except RuntimeError as exc:
             print(f"Входящее сообщение пропущено при остановке: {exc}", file=sys.stderr)
 
+    async def outgoing_handler(event: events.NewMessage.Event) -> None:
+        sent_at = getattr(event.message, "date", None)
+        await presence.record_outgoing(
+            sent_at if isinstance(sent_at, datetime) else presence.current_time()
+        )
+
     client.add_event_handler(
         handler,
         events.NewMessage(incoming=True),
+    )
+    client.add_event_handler(
+        outgoing_handler,
+        events.NewMessage(outgoing=True),
     )
     pulse_task = asyncio.create_task(pulse.run(), name="milana-pulse")
     own_label = f"@{me.username}" if me.username else str(me.id)
