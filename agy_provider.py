@@ -72,23 +72,27 @@ def _find_structured_payload(text: str) -> dict[str, Any] | None:
             payload, _ = decoder.raw_decode(cleaned[start:])
         except json.JSONDecodeError:
             continue
-        if (
-            isinstance(payload, dict)
-            and isinstance(payload.get("messages"), list)
-            and "reaction" in payload
-        ):
+        if isinstance(payload, dict):
             return payload
     return None
 
 
 def _structured_result(
     text: str,
-) -> tuple[str, tuple[str, ...], tuple[dict[str, Any], ...]]:
+    *,
+    telegram_envelope: bool,
+) -> tuple[
+    str,
+    tuple[str, ...],
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+]:
     """Return the Telegram envelope plus side effects produced by Gemini."""
     cleaned = text.strip()
     if cleaned == READ_ONLY_SENTINEL:
         return (
             json.dumps({"messages": [], "reaction": None}, ensure_ascii=False),
+            (),
             (),
             (),
         )
@@ -121,13 +125,32 @@ def _structured_result(
             )
             else ()
         )
-        return json.dumps(payload, ensure_ascii=False), diary_entries, scheduled_messages
+        raw_sticker_actions = payload.pop("sticker_actions", [])
+        sticker_actions: tuple[dict[str, Any], ...] = ()
+        if isinstance(raw_sticker_actions, list):
+            normalized: list[dict[str, Any]] = []
+            for item in raw_sticker_actions:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    continue
+                arguments = {
+                    key: item[key]
+                    for key in ("pack_id", "sticker_id", "delay_seconds")
+                    if item.get(key) is not None
+                }
+                normalized.append({"name": item["name"], "arguments": arguments})
+            sticker_actions = tuple(normalized)
+        return (
+            json.dumps(payload, ensure_ascii=False),
+            diary_entries,
+            scheduled_messages,
+            sticker_actions,
+        )
 
-    return (
-        json.dumps({"messages": [cleaned], "reaction": None}, ensure_ascii=False),
-        (),
-        (),
-    )
+    if telegram_envelope:
+        cleaned = json.dumps(
+            {"messages": [cleaned], "reaction": None}, ensure_ascii=False
+        )
+    return cleaned, (), (), ()
 
 
 class _AgyResponses:
@@ -166,11 +189,42 @@ class _AgyResponses:
                 pass
             raise
         if "text" in request:
-            output_text, diary_entries, scheduled_messages = _structured_result(raw)
+            format_name = str(
+                ((request.get("text") or {}).get("format") or {}).get("name", "")
+            )
+            response_schema = (
+                ((request.get("text") or {}).get("format") or {}).get("schema") or {}
+            )
+            schema_properties = (
+                response_schema.get("properties", {})
+                if isinstance(response_schema, dict)
+                else {}
+            )
+            output_text, diary_entries, scheduled_messages, sticker_actions = (
+                _structured_result(
+                    raw,
+                    telegram_envelope=(
+                        format_name == "milana_telegram_reply"
+                        or not (
+                            format_name == "milana_initiative_decision"
+                            or (
+                                isinstance(schema_properties, dict)
+                                and "should_write" in schema_properties
+                            )
+                        )
+                        or (
+                            isinstance(schema_properties, dict)
+                            and "messages" in schema_properties
+                            and "reaction" in schema_properties
+                        )
+                    ),
+                )
+            )
         else:
             output_text = raw.strip()
             diary_entries = ()
             scheduled_messages = ()
+            sticker_actions = ()
         if not output_text:
             raise AgyError("agy вернул пустой ответ")
         return SimpleNamespace(
@@ -180,6 +234,7 @@ class _AgyResponses:
             incomplete_details=None,
             agy_diary_entries=diary_entries,
             agy_scheduled_messages=scheduled_messages,
+            agy_sticker_actions=sticker_actions,
         )
 
 
@@ -442,6 +497,16 @@ class AgyModelClient:
                     "в формате {delay_seconds, message}. Если ставить задачу не нужно, верни "
                     "пустой массив."
                 )
+            if self._has_sticker_tools(tools):
+                self._add_sticker_output(response_format)
+                payload["instructions"] = (
+                    f"{payload['instructions']}\n\n"
+                    "В этом провайдере команды стикерного навыка возвращай через массив "
+                    "sticker_actions итогового JSON. Для open_sticker_picker заполни name и "
+                    "pack_id (null для индекса); для send_sticker заполни sticker_id; для "
+                    "schedule_sticker заполни sticker_id и delay_seconds. Не заполняй "
+                    "не относящиеся к действию поля. Если навык не нужен, верни пустой массив."
+                )
             payload["response_format"] = response_format
         return payload
 
@@ -457,6 +522,18 @@ class AgyModelClient:
         return isinstance(tools, list) and any(
             isinstance(tool, dict) and tool.get("name") == "schedule_message"
             for tool in tools
+        )
+
+    @staticmethod
+    def _has_sticker_tools(tools: Any) -> bool:
+        names = {
+            tool.get("name")
+            for tool in tools
+            if isinstance(tool, dict)
+        } if isinstance(tools, list) else set()
+        return bool(
+            names
+            & {"open_sticker_picker", "send_sticker", "schedule_sticker"}
         )
 
     @staticmethod
@@ -508,6 +585,54 @@ class AgyModelClient:
         }
         if "scheduled_messages" not in required:
             required.append("scheduled_messages")
+
+    @staticmethod
+    def _add_sticker_output(response_format: Any) -> None:
+        if not isinstance(response_format, dict):
+            return
+        schema = response_format.get("schema")
+        if not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        required = schema.get("required")
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return
+        properties["sticker_actions"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": [
+                            "open_sticker_picker",
+                            "send_sticker",
+                            "schedule_sticker",
+                        ],
+                    },
+                    "pack_id": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
+                    "sticker_id": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
+                    "delay_seconds": {
+                        "anyOf": [
+                            {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 31_536_000,
+                            },
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "required": ["name", "pack_id", "sticker_id", "delay_seconds"],
+                "additionalProperties": False,
+            },
+        }
+        if "sticker_actions" not in required:
+            required.append("sticker_actions")
 
     def _materialize_media(
         self, value: Any, workspace: Path, media_counter: list[int]

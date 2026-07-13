@@ -20,6 +20,7 @@ from agy_provider import (
     AgyQuotaError,
     strip_ansi,
 )
+from milana_stickers import OPEN_STICKER_PICKER_TOOL, SEND_STICKER_TOOL
 
 
 class StripAnsiTests(unittest.TestCase):
@@ -943,6 +944,83 @@ class AgyResponsesTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, timeout=1)
 
         self.assertTrue(cancellation_seen.is_set())
+
+
+class AgyStickerActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sticker_actions_are_extracted_from_structured_result(self) -> None:
+        client = AgyModelClient()
+        client._query = MagicMock(  # type: ignore[method-assign]
+            return_value=json.dumps(
+                {
+                    "messages": [],
+                    "reaction": None,
+                    "blacklist_sender": False,
+                    "sticker_actions": [
+                        {
+                            "name": "open_sticker_picker",
+                            "pack_id": None,
+                            "sticker_id": None,
+                            "delay_seconds": None,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        response = await client.responses.create(
+            input=[],
+            tools=[OPEN_STICKER_PICKER_TOOL, SEND_STICKER_TOOL],
+            text={
+                "format": {
+                    "name": "milana_telegram_reply",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "messages": {"type": "array"},
+                            "reaction": {},
+                            "blacklist_sender": {"type": "boolean"},
+                        },
+                        "required": ["messages", "reaction", "blacklist_sender"],
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(
+            response.agy_sticker_actions,
+            ({"name": "open_sticker_picker", "arguments": {}},),
+        )
+        self.assertNotIn("sticker_actions", response.output_text)
+
+    async def test_generic_initiative_json_is_not_wrapped_as_telegram_reply(self) -> None:
+        client = AgyModelClient()
+        payload = {
+            "should_write": False,
+            "contact_id": None,
+            "message": None,
+            "note": "не хочу писать",
+            "sticker_actions": [],
+        }
+        client._query = MagicMock(return_value=json.dumps(payload, ensure_ascii=False))  # type: ignore[method-assign]
+
+        response = await client.responses.create(
+            input=[],
+            tools=[OPEN_STICKER_PICKER_TOOL],
+            text={
+                "format": {
+                    "name": "milana_initiative_decision",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"should_write": {"type": "boolean"}},
+                        "required": ["should_write"],
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(json.loads(response.output_text)["should_write"], False)
+        self.assertNotIn("messages", response.output_text)
 
 
 if __name__ == "__main__":

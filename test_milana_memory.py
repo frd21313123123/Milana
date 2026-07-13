@@ -29,6 +29,58 @@ def prepare_test_compaction(
 
 
 class MilanaMemoryStoreTests(unittest.TestCase):
+    def test_legacy_pulse_table_migrates_and_accepts_stickers(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE pulse_tasks (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (action IN ('send_message')),
+                    message TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    source_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                INSERT INTO pulse_tasks (
+                    id, chat_id, action, message, due_at, status, attempts,
+                    created_at, updated_at
+                ) VALUES (
+                    'old', '100', 'send_message', 'старое сообщение',
+                    '2026-07-14T10:00:00+00:00', 'pending', 2,
+                    '2026-07-14T09:00:00+00:00', '2026-07-14T09:00:00+00:00'
+                );
+                """
+            )
+            connection.close()
+
+            store = MilanaMemoryStore(path)
+            old = store.get_pulse_tasks()[0]
+            self.assertEqual(old.message, "старое сообщение")
+            self.assertEqual(old.attempts, 2)
+
+            sticker = store.schedule_pulse_sticker(
+                100,
+                due_at=datetime(2026, 7, 14, 11, 0, tzinfo=timezone.utc),
+                set_id=10,
+                set_access_hash=20,
+                set_short_name="regular",
+                document_id=30,
+                pack_title="Набор",
+                emoji="🙂",
+            )
+            self.assertEqual(sticker.action, "send_sticker")
+            self.assertIsNone(sticker.message)
+            self.assertEqual(sticker.sticker_document_id, 30)
+            store.close()
+
     def test_attention_timestamp_is_atomic_persistent_and_replaceable(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "memory.sqlite3"

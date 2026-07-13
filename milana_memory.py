@@ -71,11 +71,17 @@ class PulseTask:
     id: str
     chat_id: str
     action: str
-    message: str
+    message: str | None
     due_at: datetime
     status: str
     attempts: int
     source_message_id: int | None
+    sticker_set_id: int | None = None
+    sticker_set_access_hash: int | None = None
+    sticker_set_short_name: str | None = None
+    sticker_document_id: int | None = None
+    sticker_pack_title: str | None = None
+    sticker_emoji: str | None = None
 
 
 @dataclass(frozen=True)
@@ -254,8 +260,14 @@ class MilanaMemoryStore:
             CREATE TABLE IF NOT EXISTS pulse_tasks (
                 id TEXT PRIMARY KEY,
                 chat_id TEXT NOT NULL,
-                action TEXT NOT NULL CHECK (action IN ('send_message')),
-                message TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('send_message', 'send_sticker')),
+                message TEXT,
+                sticker_set_id INTEGER,
+                sticker_set_access_hash INTEGER,
+                sticker_set_short_name TEXT,
+                sticker_document_id INTEGER,
+                sticker_pack_title TEXT,
+                sticker_emoji TEXT,
                 due_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
@@ -264,7 +276,18 @@ class MilanaMemoryStore:
                 source_message_id INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                completed_at TEXT
+                completed_at TEXT,
+                CHECK (
+                    (action = 'send_message' AND message IS NOT NULL)
+                    OR
+                    (action = 'send_sticker'
+                        AND sticker_set_id IS NOT NULL
+                        AND sticker_set_access_hash IS NOT NULL
+                        AND sticker_set_short_name IS NOT NULL
+                        AND sticker_document_id IS NOT NULL
+                        AND sticker_pack_title IS NOT NULL
+                        AND sticker_emoji IS NOT NULL)
+                )
             );
 
             CREATE INDEX IF NOT EXISTS idx_pulse_tasks_status_due
@@ -277,7 +300,79 @@ class MilanaMemoryStore:
             );
             """
         )
+        self._migrate_pulse_tasks_for_stickers()
         self._connection.commit()
+
+    def _migrate_pulse_tasks_for_stickers(self) -> None:
+        """Atomically upgrade legacy text-only pulse queues without losing tasks."""
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(pulse_tasks)")
+        }
+        if "sticker_document_id" in columns:
+            return
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute("DROP INDEX IF EXISTS idx_pulse_tasks_status_due")
+            self._connection.execute(
+                "ALTER TABLE pulse_tasks RENAME TO pulse_tasks_legacy_text_only"
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE pulse_tasks (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (action IN ('send_message', 'send_sticker')),
+                    message TEXT,
+                    sticker_set_id INTEGER,
+                    sticker_set_access_hash INTEGER,
+                    sticker_set_short_name TEXT,
+                    sticker_document_id INTEGER,
+                    sticker_pack_title TEXT,
+                    sticker_emoji TEXT,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    source_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    CHECK (
+                        (action = 'send_message' AND message IS NOT NULL)
+                        OR
+                        (action = 'send_sticker'
+                            AND sticker_set_id IS NOT NULL
+                            AND sticker_set_access_hash IS NOT NULL
+                            AND sticker_set_short_name IS NOT NULL
+                            AND sticker_document_id IS NOT NULL
+                            AND sticker_pack_title IS NOT NULL
+                            AND sticker_emoji IS NOT NULL)
+                    )
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT INTO pulse_tasks (
+                    id, chat_id, action, message, due_at, status, attempts,
+                    last_error, source_message_id, created_at, updated_at, completed_at
+                )
+                SELECT id, chat_id, action, message, due_at, status, attempts,
+                    last_error, source_message_id, created_at, updated_at, completed_at
+                FROM pulse_tasks_legacy_text_only
+                """
+            )
+            self._connection.execute("DROP TABLE pulse_tasks_legacy_text_only")
+            self._connection.execute(
+                "CREATE INDEX idx_pulse_tasks_status_due ON pulse_tasks(status, due_at)"
+            )
+            self._connection.execute("PRAGMA user_version = 1")
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     @staticmethod
     def _pulse_task_from_row(row: sqlite3.Row) -> PulseTask:
@@ -285,11 +380,17 @@ class MilanaMemoryStore:
             id=str(row["id"]),
             chat_id=str(row["chat_id"]),
             action=str(row["action"]),
-            message=str(row["message"]),
+            message=(str(row["message"]) if row["message"] is not None else None),
             due_at=_parse_utc_timestamp(str(row["due_at"])),
             status=str(row["status"]),
             attempts=int(row["attempts"]),
             source_message_id=row["source_message_id"],
+            sticker_set_id=row["sticker_set_id"],
+            sticker_set_access_hash=row["sticker_set_access_hash"],
+            sticker_set_short_name=row["sticker_set_short_name"],
+            sticker_document_id=row["sticker_document_id"],
+            sticker_pack_title=row["sticker_pack_title"],
+            sticker_emoji=row["sticker_emoji"],
         )
 
     def schedule_pulse_message(
@@ -319,6 +420,70 @@ class MilanaMemoryStore:
                     task_id,
                     str(chat_id),
                     clean_message,
+                    due_timestamp,
+                    source_message_id,
+                    now_timestamp,
+                    now_timestamp,
+                ),
+            )
+            self._connection.commit()
+            row = self._connection.execute(
+                "SELECT * FROM pulse_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        assert row is not None
+        return self._pulse_task_from_row(row)
+
+    def schedule_pulse_sticker(
+        self,
+        chat_id: int | str,
+        *,
+        due_at: datetime,
+        set_id: int,
+        set_access_hash: int,
+        set_short_name: str,
+        document_id: int,
+        pack_title: str,
+        emoji: str,
+        source_message_id: int | None = None,
+    ) -> PulseTask:
+        """Persist an exact sticker identity; its expiring file reference is refreshed later."""
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (
+            set_id,
+            set_access_hash,
+            document_id,
+        )):
+            raise TypeError("Telegram ID стикера и набора должны быть целыми числами")
+        clean_short_name = _normalize_content(
+            set_short_name, maximum=255, label="Короткое имя стикерпака"
+        )
+        clean_title = _normalize_content(
+            pack_title, maximum=255, label="Название стикерпака"
+        )
+        if not isinstance(emoji, str):
+            raise TypeError("Эмодзи стикера должен быть строкой")
+        clean_emoji = emoji.strip()
+        task_id = uuid4().hex
+        due_timestamp = _utc_timestamp(due_at)
+        now_timestamp = _utc_timestamp(datetime.now(timezone.utc))
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO pulse_tasks (
+                    id, chat_id, action, message,
+                    sticker_set_id, sticker_set_access_hash, sticker_set_short_name,
+                    sticker_document_id, sticker_pack_title, sticker_emoji,
+                    due_at, status, attempts, source_message_id, created_at, updated_at
+                ) VALUES (?, ?, 'send_sticker', NULL, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    str(chat_id),
+                    set_id,
+                    set_access_hash,
+                    clean_short_name,
+                    document_id,
+                    clean_title,
+                    clean_emoji,
                     due_timestamp,
                     source_message_id,
                     now_timestamp,

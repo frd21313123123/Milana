@@ -3,6 +3,7 @@ import asyncio
 import gzip
 import io
 import json
+import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -18,10 +19,17 @@ from telethon import functions, types
 from agy_provider import AgyError, AgyQuotaError
 from milana_memory import MilanaMemoryStore
 from milana_schedule import load_routine
+from milana_stickers import (
+    StickerChoice,
+    StickerPickerOutput,
+    StickerReference,
+)
 from telegram_client import (
     AIConfig,
+    ChatWorkerState,
     Config,
     GeminiQuotaFallbackClient,
+    GeneratedReply,
     MessageFlowConfig,
     MilanaMessageResponder,
     MilanaPresenceController,
@@ -30,7 +38,9 @@ from telegram_client import (
     ai_positive_int,
     ai_string,
     build_parser,
+    convert_gif_to_mp4,
     display_name,
+    deliver_pulse_task,
     image_mime_type_from_bytes,
     inter_message_typing_delay,
     load_ai_config,
@@ -45,6 +55,7 @@ from telegram_client import (
     run,
     run_ai_bot,
     split_telegram_text,
+    telegram_gif_video_data_url,
     telegram_image_mime_type,
     telegram_sticker_info,
     telegram_video_mime_type,
@@ -93,6 +104,40 @@ class GatedClock(AdvancingClock):
         await self.sleep_calls.put((seconds, release))
         await release.wait()
         self.value += timedelta(seconds=seconds)
+
+
+class FakeStickerPickerSession:
+    def __init__(self, choice: StickerChoice) -> None:
+        self.choice = choice
+        self.opened: list[str | None] = []
+
+    async def open(self, pack_id=None) -> StickerPickerOutput:
+        self.opened.append(pack_id)
+        return StickerPickerOutput(
+            ({"type": "input_text", "text": json.dumps({"status": "ok", "pack_id": pack_id})},)
+        )
+
+    def choose(self, sticker_id) -> StickerChoice:
+        if sticker_id != "P001:S001" or "P001" not in self.opened:
+            raise ValueError("Стикер не показан")
+        return self.choice
+
+
+class FakeStickerSkill:
+    def __init__(self) -> None:
+        self.choice = StickerChoice(
+            StickerReference(10, 20, "regular", 30, "Набор", "🙂"),
+            SimpleNamespace(id=30),
+        )
+        self.sessions: list[FakeStickerPickerSession] = []
+
+    def new_session(self) -> FakeStickerPickerSession:
+        session = FakeStickerPickerSession(self.choice)
+        self.sessions.append(session)
+        return session
+
+    async def resolve_reference(self, reference) -> StickerChoice:
+        return StickerChoice(reference, self.choice.document)
 
 
 def structured_response(
@@ -496,6 +541,67 @@ class SplitTelegramTextTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(image_mime_type_from_bytes(payload), expected)
 
+    def test_gif_converter_produces_mp4_with_animation_frames(self) -> None:
+        try:
+            from imageio_ffmpeg import get_ffmpeg_exe
+            from PIL import Image
+        except ImportError as exc:
+            self.skipTest(f"optional GIF converter is not installed: {exc}")
+
+        output = io.BytesIO()
+        first = Image.new("RGB", (15, 17), (255, 0, 0))
+        second = Image.new("RGB", (15, 17), (0, 0, 255))
+        first.save(
+            output,
+            format="GIF",
+            save_all=True,
+            append_images=[second],
+            duration=200,
+            loop=0,
+        )
+
+        video_bytes = convert_gif_to_mp4(output.getvalue())
+
+        self.assertEqual(video_bytes[4:8], b"ftyp")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "animation.mp4"
+            path.write_bytes(video_bytes)
+            decoded = subprocess.run(
+                [
+                    get_ffmpeg_exe(),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "pipe:1",
+                ],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        self.assertEqual(decoded.returncode, 0, decoded.stderr)
+        self.assertGreaterEqual(len(decoded.stdout), 16 * 18 * 3 * 2)
+
+    def test_gif_data_url_downloads_and_converts_animation(self) -> None:
+        event = make_event(
+            datetime(2026, 7, 13, 21, 0, tzinfo=YEKT),
+            mime_type="image/gif",
+            image_bytes=b"GIF89a-animation",
+        )
+
+        with patch(
+            "telegram_client.convert_gif_to_mp4", return_value=b"mp4-animation"
+        ):
+            data_url = asyncio.run(telegram_gif_video_data_url(event))
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        self.assertEqual(data_url, "data:video/mp4;base64,bXA0LWFuaW1hdGlvbg==")
+
     def test_tgs_renderer_uses_middle_animation_frame(self) -> None:
         rendered_frames: list[int] = []
 
@@ -847,11 +953,56 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             routine,
             memory,
             presence,
+            sticker_skill=unittest.mock.ANY,
         )
         reflector.run.assert_called_once_with()
         presence.run.assert_called_once_with()
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
+
+    async def test_delayed_sticker_refreshes_and_sends_original_document(self) -> None:
+        memory = MilanaMemoryStore()
+        task = memory.schedule_pulse_sticker(
+            100,
+            due_at=datetime(2026, 7, 13, 19, 0, tzinfo=timezone.utc),
+            set_id=10,
+            set_access_hash=20,
+            set_short_name="regular",
+            document_id=30,
+            pack_title="Набор",
+            emoji="🙂",
+        )
+        client = MagicMock()
+        client.send_file = AsyncMock(
+            return_value=SimpleNamespace(
+                id=902,
+                date=datetime(2026, 7, 13, 19, 0, tzinfo=timezone.utc),
+            )
+        )
+        presence = MagicMock()
+        presence.begin_response = AsyncMock()
+        presence.finish_response = AsyncMock()
+        presence.record_outgoing = AsyncMock()
+        sticker_skill = FakeStickerSkill()
+        sticker_skill.resolve_reference = AsyncMock(
+            return_value=sticker_skill.choice
+        )
+
+        with patch("builtins.print"):
+            await deliver_pulse_task(
+                client,
+                presence,
+                memory,
+                sticker_skill,
+                task,
+                dev_chat=False,
+            )
+
+        sticker_skill.resolve_reference.assert_awaited_once()
+        client.send_file.assert_awaited_once_with(100, sticker_skill.choice.document)
+        self.assertIn("Набор", memory.get_chat_history(100)[-1].content)
+        presence.finish_response.assert_awaited_once_with(answered=True)
+        memory.close()
 
 
 class MilanaInitiativeReflectorTests(unittest.IsolatedAsyncioTestCase):
@@ -958,6 +1109,85 @@ class MilanaInitiativeReflectorTests(unittest.IsolatedAsyncioTestCase):
         history = responder.memory.get_chat_history(100, limit=2)
         self.assertEqual(history[-1].role, "assistant")
         self.assertEqual(history[-1].telegram_message_id, 901)
+        responder.presence.finish_response.assert_awaited_once_with(answered=True)
+
+    async def test_reflection_can_send_only_a_sticker(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 18, 30, tzinfo=YEKT))
+        responder, client, model_client = make_responder(clock)
+        responder.presence.begin_response = AsyncMock()
+        responder.presence.finish_response = AsyncMock()
+        entity = SimpleNamespace(id=100, bot=False, deleted=False, is_self=False)
+        client.iter_dialogs.return_value = self._dialogs(
+            SimpleNamespace(
+                id=100,
+                name="Лена",
+                entity=entity,
+                is_user=True,
+                message=SimpleNamespace(raw_text="привет", out=False),
+            )
+        )
+        client.send_file = AsyncMock(return_value=SimpleNamespace(id=902))
+        calls = [
+            SimpleNamespace(
+                type="function_call",
+                name="open_sticker_picker",
+                arguments='{"pack_id":null}',
+                call_id="initiative-index",
+            ),
+            SimpleNamespace(
+                type="function_call",
+                name="open_sticker_picker",
+                arguments='{"pack_id":"P001"}',
+                call_id="initiative-pack",
+            ),
+            SimpleNamespace(
+                type="function_call",
+                name="send_sticker",
+                arguments='{"sticker_id":"P001:S001"}',
+                call_id="initiative-send",
+            ),
+        ]
+        model_client.responses.create.side_effect = [
+            SimpleNamespace(output_text="", output=[calls[0]]),
+            SimpleNamespace(output_text="", output=[calls[1]]),
+            SimpleNamespace(output_text="", output=[calls[2]]),
+            SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "should_write": True,
+                        "contact_id": "100",
+                        "message": None,
+                        "note": "хочу поддержать",
+                    },
+                    ensure_ascii=False,
+                ),
+                output=[],
+            ),
+        ]
+        sticker_skill = FakeStickerSkill()
+        reflector = MilanaInitiativeReflector(
+            client,
+            model_client,
+            responder.config,
+            responder.routine,
+            responder.memory,
+            responder.presence,
+            sticker_skill=sticker_skill,
+            now=clock.now,
+            sleep=clock.sleep,
+        )
+
+        with patch("builtins.print"):
+            decision = await reflector.reflect(
+                responder.routine.activity_at("mon", 18 * 60 + 30),
+                clock.value,
+            )
+
+        self.assertIsNone(decision.message if decision else "missing")
+        client.send_message.assert_not_awaited()
+        client.send_file.assert_awaited_once_with(entity, sticker_skill.choice.document)
+        history = responder.memory.get_chat_history(100)
+        self.assertIn("Набор", history[-1].content)
         responder.presence.finish_response.assert_awaited_once_with(answered=True)
 
     async def test_reflection_may_naturally_decide_not_to_write(self) -> None:
@@ -1963,7 +2193,9 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             await responder.process(event)
 
         event.message.download_media.assert_awaited_once_with(file=bytes)
-        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        content = model_client.responses.create.await_args.kwargs["input"][-1][
+            "content"
+        ]
         self.assertEqual(content[0]["type"], "input_video")
         self.assertEqual(
             content[0]["video_url"],
@@ -1974,6 +2206,54 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             without_sent_at(content[1]["text"]),
             "неизвестно: [видео без подписи]",
         )
+
+    async def test_gemini_gif_is_converted_and_sent_as_video(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="",
+            mime_type="image/gif",
+            image_bytes=b"GIF89a-animation",
+        )
+
+        with (
+            patch("telegram_client.convert_gif_to_mp4", return_value=b"mp4-animation"),
+            patch("builtins.print"),
+        ):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        content = model_client.responses.create.await_args.kwargs["input"][-1][
+            "content"
+        ]
+        self.assertEqual(content[0]["type"], "input_video")
+        self.assertEqual(
+            content[0]["video_url"],
+            "data:video/mp4;base64,bXA0LWFuaW1hdGlvbg==",
+        )
+        self.assertEqual(content[1]["type"], "input_text")
+        self.assertEqual(
+            without_sent_at(content[1]["text"]),
+            "неизвестно: [GIF-анимация без подписи]",
+        )
+
+    async def test_openai_gif_remains_an_image(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="Смотри",
+            mime_type="image/gif",
+            image_bytes=b"GIF89a-animation",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[1]["type"], "input_image")
+        self.assertTrue(content[1]["image_url"].startswith("data:image/gif;base64,"))
 
     async def test_gemini_voice_message_is_sent_as_original_audio(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
@@ -2672,6 +2952,192 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         second_input = openai_client.responses.create.await_args_list[1].kwargs["input"]
         self.assertNotIn("Секрет чата A", str(second_input))
         self.assertIn("Сообщение чата B", str(second_input))
+
+    async def test_sticker_picker_sends_viewed_sticker_after_text(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        sticker_skill = FakeStickerSkill()
+        responder.sticker_skill = sticker_skill
+        client.send_file = AsyncMock(
+            return_value=SimpleNamespace(id=901, date=clock.value)
+        )
+        open_index = SimpleNamespace(
+            type="function_call",
+            name="open_sticker_picker",
+            arguments='{"pack_id":null}',
+            call_id="picker-index",
+        )
+        open_pack = SimpleNamespace(
+            type="function_call",
+            name="open_sticker_picker",
+            arguments='{"pack_id":"P001"}',
+            call_id="picker-pack",
+        )
+        send_sticker = SimpleNamespace(
+            type="function_call",
+            name="send_sticker",
+            arguments='{"sticker_id":"P001:S001"}',
+            call_id="picker-send",
+        )
+        openai_client.responses.create.side_effect = [
+            structured_response(output=[open_index]),
+            structured_response(output=[open_pack]),
+            structured_response(output=[send_sticker]),
+            structured_response("держи"),
+        ]
+
+        with patch("builtins.print"):
+            await responder.process(make_event(clock.value, text="пришли стикер"))
+
+        client.send_message.assert_awaited_once_with(100, "держи")
+        client.send_file.assert_awaited_once_with(100, sticker_skill.choice.document)
+        self.assertEqual(sticker_skill.sessions[0].opened, [None, "P001"])
+        self.assertIn(
+            "open_sticker_picker",
+            {tool["name"] for tool in openai_client.responses.create.await_args_list[0].kwargs["tools"]},
+        )
+        history = responder.memory.get_chat_history(100)
+        self.assertTrue(any("Набор" in item.content for item in history))
+
+    async def test_sticker_can_be_scheduled_after_picker(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, openai_client = make_responder(clock, dev_chat=True)
+        responder.sticker_skill = FakeStickerSkill()
+        responder.pulse = MagicMock()
+        calls = [
+            SimpleNamespace(
+                type="function_call",
+                name="open_sticker_picker",
+                arguments='{"pack_id":null}',
+                call_id="index",
+            ),
+            SimpleNamespace(
+                type="function_call",
+                name="open_sticker_picker",
+                arguments='{"pack_id":"P001"}',
+                call_id="pack",
+            ),
+            SimpleNamespace(
+                type="function_call",
+                name="schedule_sticker",
+                arguments='{"sticker_id":"P001:S001","delay_seconds":300}',
+                call_id="schedule-sticker",
+            ),
+        ]
+        openai_client.responses.create.side_effect = [
+            structured_response(output=[calls[0]]),
+            structured_response(output=[calls[1]]),
+            structured_response(output=[calls[2]]),
+            structured_response("окей"),
+        ]
+
+        with patch("builtins.print"):
+            await responder.process(make_event(clock.value, text="стикер через 5 минут"))
+
+        tasks = responder.memory.get_pulse_tasks(status="pending")
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].action, "send_sticker")
+        self.assertEqual(tasks[0].sticker_document_id, 30)
+        self.assertEqual(
+            tasks[0].due_at,
+            clock.value.astimezone(timezone.utc) + timedelta(minutes=5),
+        )
+        responder.pulse.wake.assert_called_once_with()
+
+    async def test_new_revision_after_text_cancels_remaining_sticker(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, _ = make_responder(clock, dev_chat=True)
+        client.send_file = AsyncMock()
+        choice = FakeStickerSkill().choice
+        state = ChatWorkerState(chat_key=100, revision=1)
+        event = make_event(clock.value)
+
+        async def send_text(chat_id, text):
+            state.revision += 1
+            return SimpleNamespace(id=901, date=clock.value)
+
+        client.send_message.side_effect = send_text
+        outcome = await responder._send_generated_reply(
+            state,
+            revision=1,
+            active=[SimpleNamespace(event=event)],
+            reply=GeneratedReply(messages=("текст",), staged_stickers=(choice,)),
+            continues_conversation=True,
+        )
+
+        self.assertTrue(outcome.interrupted)
+        self.assertEqual(outcome.sent_count, 1)
+        self.assertEqual(outcome.sticker_sent_count, 0)
+        client.send_file.assert_not_awaited()
+
+    async def test_agy_sticker_actions_use_same_picker(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        responder.sticker_skill = FakeStickerSkill()
+        first = structured_response()
+        first.agy_sticker_actions = (
+            {"name": "open_sticker_picker", "arguments": {}},
+        )
+        second = structured_response("готово")
+        second.agy_sticker_actions = (
+            {"name": "open_sticker_picker", "arguments": {"pack_id": "P001"}},
+        )
+        third = structured_response("готово")
+        third.agy_sticker_actions = (
+            {"name": "send_sticker", "arguments": {"sticker_id": "P001:S001"}},
+        )
+        model_client.responses.create.side_effect = [first, second, third]
+
+        reply = await responder._generate_answer(
+            chat_key=100,
+            history_input=[],
+            messages=[],
+        )
+
+        self.assertEqual(reply.messages, ("готово",))
+        self.assertEqual(len(reply.staged_stickers), 1)
+        self.assertEqual(reply.staged_stickers[0].document.id, 30)
+
+    async def test_multiple_sticker_calls_are_preserved_in_order(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, dev_chat=True)
+        responder.sticker_skill = FakeStickerSkill()
+        open_index = SimpleNamespace(
+            type="function_call",
+            name="open_sticker_picker",
+            arguments='{"pack_id":null}',
+            call_id="multi-index",
+        )
+        open_pack = SimpleNamespace(
+            type="function_call",
+            name="open_sticker_picker",
+            arguments='{"pack_id":"P001"}',
+            call_id="multi-pack",
+        )
+        send_calls = [
+            SimpleNamespace(
+                type="function_call",
+                name="send_sticker",
+                arguments='{"sticker_id":"P001:S001"}',
+                call_id=f"multi-send-{index}",
+            )
+            for index in range(2)
+        ]
+        model_client.responses.create.side_effect = [
+            structured_response(output=[open_index]),
+            structured_response(output=[open_pack]),
+            structured_response(output=send_calls),
+            structured_response(),
+        ]
+
+        reply = await responder._generate_answer(
+            chat_key=100,
+            history_input=[],
+            messages=[],
+        )
+
+        self.assertEqual(len(reply.staged_stickers), 2)
+        self.assertEqual([item.document.id for item in reply.staged_stickers], [30, 30])
 
     async def test_model_can_write_shared_diary_with_a_function_call(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
