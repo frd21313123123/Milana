@@ -150,6 +150,7 @@ def make_event(
     sender_id: int = 200,
     message_id: int = 300,
     photo: bool = False,
+    voice: bool = False,
     mime_type: str | None = None,
     image_bytes: bytes = b"test-image",
     sticker: bool = False,
@@ -173,6 +174,7 @@ def make_event(
     message = SimpleNamespace(
         date=value,
         photo=object() if photo else None,
+        voice=object() if voice else None,
         file=file_info,
         sticker=sticker_document,
     )
@@ -187,6 +189,7 @@ def make_event(
         id=message_id,
         raw_text=text,
         photo=message.photo,
+        voice=message.voice,
         file=file_info,
         sticker=sticker_document,
         message=message,
@@ -1514,6 +1517,65 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             content[1],
             {"type": "input_text", "text": "неизвестно: [видео без подписи]"},
         )
+
+    async def test_gemini_voice_message_is_sent_as_original_audio(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="",
+            voice=True,
+            mime_type="audio/ogg",
+            image_bytes=b"ogg-opus-voice",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_awaited_once_with(file=bytes)
+        content = model_client.responses.create.await_args.kwargs["input"][-1]["content"]
+        self.assertEqual(content[0]["type"], "input_audio")
+        self.assertEqual(
+            content[0]["audio_url"],
+            "data:audio/ogg;base64,b2dnLW9wdXMtdm9pY2U=",
+        )
+        self.assertEqual(
+            content[1],
+            {"type": "input_text", "text": "неизвестно: [голосовое сообщение]"},
+        )
+
+    async def test_openai_mode_still_ignores_captionless_voice_message(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock)
+        event = make_event(
+            clock.value,
+            text="",
+            voice=True,
+            mime_type="audio/ogg",
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_not_awaited()
+        model_client.responses.create.assert_not_awaited()
+
+    async def test_gemini_oversized_voice_message_is_not_downloaded(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, _, model_client = make_responder(clock, provider="gemini")
+        event = make_event(
+            clock.value,
+            text="",
+            voice=True,
+            mime_type="audio/ogg",
+            file_size=20 * 1024 * 1024,
+        )
+
+        with patch("builtins.print"):
+            await responder.process(event)
+
+        event.message.download_media.assert_not_awaited()
+        model_client.responses.create.assert_not_awaited()
 
     async def test_gemini_video_caption_is_included_after_video(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))

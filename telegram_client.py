@@ -76,12 +76,28 @@ SUPPORTED_GEMINI_VIDEO_MIME_TYPES = {
     "video/wmv",
     "video/x-flv",
 }
+SUPPORTED_GEMINI_AUDIO_MIME_TYPES = {
+    "audio/aac",
+    "audio/flac",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/opus",
+    "audio/wav",
+    "audio/webm",
+}
+GEMINI_AUDIO_MIME_ALIASES = {
+    "audio/mp3": "audio/mpeg",
+    "audio/x-m4a": "audio/mp4",
+    "audio/x-wav": "audio/wav",
+}
 GEMINI_VIDEO_MIME_ALIASES = {
     "video/quicktime": "video/mov",
     "video/x-msvideo": "video/avi",
     "video/x-ms-wmv": "video/wmv",
 }
 MAX_GEMINI_INLINE_VIDEO_BYTES = 20 * 1024 * 1024
+MAX_GEMINI_INLINE_AUDIO_BYTES = 20 * 1024 * 1024
 ANIMATED_STICKER_MIME_TYPE = "application/x-tgsticker"
 VIDEO_STICKER_MIME_TYPE = "video/webm"
 SAFE_REACTIONS = ("👍", "❤", "🔥", "🤣", "😢", "🎉", "🤔")
@@ -482,6 +498,26 @@ def telegram_video_mime_type(event: Any) -> str | None:
     return normalized if normalized in SUPPORTED_GEMINI_VIDEO_MIME_TYPES else None
 
 
+def telegram_voice_mime_type(event: Any) -> str | None:
+    """Возвращает поддерживаемый Gemini MIME голосового сообщения Telegram."""
+    message = getattr(event, "message", None)
+    voice = getattr(event, "voice", None)
+    if voice is None and message is not None and message is not event:
+        voice = getattr(message, "voice", None)
+    if not voice:
+        return None
+
+    file_info = getattr(event, "file", None)
+    if file_info is None and message is not None and message is not event:
+        file_info = getattr(message, "file", None)
+    mime_type = getattr(file_info, "mime_type", None)
+    if not isinstance(mime_type, str):
+        # Telegram voice notes are OGG/Opus even when File has no MIME metadata.
+        return "audio/ogg"
+    normalized = GEMINI_AUDIO_MIME_ALIASES.get(mime_type.lower(), mime_type.lower())
+    return normalized if normalized in SUPPORTED_GEMINI_AUDIO_MIME_TYPES else None
+
+
 def telegram_sticker_info(event: Any) -> TelegramStickerInfo | None:
     """Возвращает описание стикера и доступное растровое превью."""
     message = getattr(event, "message", None)
@@ -627,6 +663,43 @@ async def telegram_video_data_url(event: Any, mime_type: str) -> str:
             f"({len(video_bytes)} байт; лимит меньше {MAX_GEMINI_INLINE_VIDEO_BYTES})"
         )
     encoded = base64.b64encode(video_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+async def telegram_voice_data_url(event: Any, mime_type: str) -> str:
+    """Скачивает голосовое Telegram и кодирует его для Gemini-адаптера."""
+    if mime_type not in SUPPORTED_GEMINI_AUDIO_MIME_TYPES:
+        raise ValueError(f"Неподдерживаемый Gemini формат аудио: {mime_type}")
+
+    message = getattr(event, "message", None)
+    file_info = getattr(event, "file", None)
+    if file_info is None and message is not None and message is not event:
+        file_info = getattr(message, "file", None)
+    declared_size = getattr(file_info, "size", None)
+    if (
+        isinstance(declared_size, int)
+        and declared_size >= MAX_GEMINI_INLINE_AUDIO_BYTES
+    ):
+        raise ValueError(
+            "Голосовое сообщение слишком большое для прямой передачи Gemini "
+            f"({declared_size} байт; лимит меньше {MAX_GEMINI_INLINE_AUDIO_BYTES})"
+        )
+
+    download_media = getattr(message, "download_media", None)
+    if not callable(download_media):
+        download_media = getattr(event, "download_media", None)
+    if not callable(download_media):
+        raise ValueError("Telegram не предоставил способ скачать голосовое сообщение")
+
+    audio_bytes = await download_media(file=bytes)
+    if not isinstance(audio_bytes, bytes) or not audio_bytes:
+        raise ValueError("Не удалось скачать голосовое сообщение из Telegram")
+    if len(audio_bytes) >= MAX_GEMINI_INLINE_AUDIO_BYTES:
+        raise ValueError(
+            "Голосовое сообщение слишком большое для прямой передачи Gemini "
+            f"({len(audio_bytes)} байт; лимит меньше {MAX_GEMINI_INLINE_AUDIO_BYTES})"
+        )
+    encoded = base64.b64encode(audio_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
 
 
@@ -1019,6 +1092,7 @@ class PreparedIncoming:
     text: str
     image_data_url: str | None
     video_data_url: str | None
+    audio_data_url: str | None
 
 
 @dataclass(frozen=True)
@@ -1145,6 +1219,11 @@ class MilanaMessageResponder:
                         text = sticker_info.description
                     elif telegram_image_mime_type(message) is not None:
                         text = "[фото без подписи]"
+                    elif (
+                        self.config.provider == GEMINI_LLM_CHOICE
+                        and telegram_voice_mime_type(message) is not None
+                    ):
+                        text = "[голосовое сообщение]"
                     elif (
                         self.config.provider == GEMINI_LLM_CHOICE
                         and telegram_video_mime_type(message) is not None
@@ -1685,7 +1764,20 @@ class MilanaMessageResponder:
         input_items: list[Any] = [*history_input]
         for message in messages:
             current_text = f"{message.sender_name}: {message.text}"
-            if message.video_data_url is not None:
+            if message.audio_data_url is not None:
+                input_items.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "audio_url": message.audio_data_url,
+                            },
+                            {"type": "input_text", "text": current_text},
+                        ],
+                    }
+                )
+            elif message.video_data_url is not None:
                 input_items.append(
                     {
                         "role": "user",
@@ -2099,10 +2191,16 @@ class MilanaMessageResponder:
                 if self.config.provider == GEMINI_LLM_CHOICE
                 else None
             )
+            voice_mime_type = (
+                telegram_voice_mime_type(event)
+                if self.config.provider == GEMINI_LLM_CHOICE
+                else None
+            )
             if (
                 not text
                 and image_mime_type is None
                 and video_mime_type is None
+                and voice_mime_type is None
                 and sticker_info is None
             ):
                 print(
@@ -2112,6 +2210,7 @@ class MilanaMessageResponder:
 
             image_data_url: str | None = None
             video_data_url: str | None = None
+            audio_data_url: str | None = None
             if image_mime_type is not None:
                 try:
                     image_data_url = await telegram_image_data_url(
@@ -2123,6 +2222,25 @@ class MilanaMessageResponder:
                         file=sys.stderr,
                     )
                     if not text and sticker_info is None:
+                        continue
+            elif voice_mime_type is not None:
+                try:
+                    audio_data_url = await telegram_voice_data_url(
+                        event, voice_mime_type
+                    )
+                except (
+                    RPCError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    AttributeError,
+                    IndexError,
+                ) as exc:
+                    print(
+                        f"Не удалось загрузить голосовое message_id={event.id}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if not text:
                         continue
             elif video_mime_type is not None:
                 try:
@@ -2217,6 +2335,8 @@ class MilanaMessageResponder:
                     if text
                     else sticker_info.description
                 )
+            elif voice_mime_type is not None:
+                stored_text = text or "[голосовое сообщение]"
             elif video_mime_type is not None:
                 stored_text = text or "[видео без подписи]"
             else:
@@ -2256,6 +2376,7 @@ class MilanaMessageResponder:
                     text=stored_text,
                     image_data_url=image_data_url,
                     video_data_url=video_data_url,
+                    audio_data_url=audio_data_url,
                 )
             )
         return prepared

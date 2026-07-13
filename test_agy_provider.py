@@ -387,6 +387,39 @@ class AgyModelClientTests(unittest.TestCase):
             self.assertEqual(local_path.suffix, ".mp4")
             self.assertEqual(local_path.read_bytes(), video_bytes)
 
+    def test_request_payload_materializes_audio_data_url(self) -> None:
+        client = AgyModelClient()
+        audio_bytes = b"OggS-opus-voice"
+        request = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "audio_url": (
+                                "data:audio/ogg;base64,"
+                                + base64.b64encode(audio_bytes).decode("ascii")
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            payload = client._request_payload(request, workspace)
+            audio_item = payload["input"][0]["content"][0]
+
+            self.assertTrue(client._contains_media(request["input"]))
+            self.assertNotIn("audio_url", audio_item)
+            self.assertEqual(audio_item["mime_type"], "audio/ogg")
+            local_path = Path(audio_item["local_path"])
+            self.assertTrue(local_path.is_absolute())
+            self.assertEqual(local_path.suffix, ".ogg")
+            self.assertEqual(local_path.read_bytes(), audio_bytes)
+
     def test_request_payload_rejects_invalid_or_mismatched_video_data(self) -> None:
         client = AgyModelClient()
         invalid_items = (
