@@ -8,9 +8,10 @@ import sqlite3
 import threading
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 DEFAULT_HISTORY_LIMIT = 40
@@ -64,6 +65,20 @@ class DiaryEntry:
 
 
 @dataclass(frozen=True)
+class PulseTask:
+    """One persisted delayed action claimed by Milana's pulse."""
+
+    id: str
+    chat_id: str
+    action: str
+    message: str
+    due_at: datetime
+    status: str
+    attempts: int
+    source_message_id: int | None
+
+
+@dataclass(frozen=True)
 class ChatSummary:
     """Compressed long-term context for one chat (per-user)."""
     summary: str
@@ -93,6 +108,25 @@ class ChatCompactionPlan:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError("Время должно быть datetime")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _utc_timestamp(value: datetime) -> str:
+    return _utc_datetime(value).isoformat(timespec="microseconds")
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _normalize_content(content: str, *, maximum: int, label: str) -> str:
@@ -176,9 +210,211 @@ class MilanaMemoryStore:
                 chat_id TEXT PRIMARY KEY,
                 backfilled_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS pulse_tasks (
+                id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('send_message')),
+                message TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                source_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pulse_tasks_status_due
+                ON pulse_tasks(status, due_at);
             """
         )
         self._connection.commit()
+
+    @staticmethod
+    def _pulse_task_from_row(row: sqlite3.Row) -> PulseTask:
+        return PulseTask(
+            id=str(row["id"]),
+            chat_id=str(row["chat_id"]),
+            action=str(row["action"]),
+            message=str(row["message"]),
+            due_at=_parse_utc_timestamp(str(row["due_at"])),
+            status=str(row["status"]),
+            attempts=int(row["attempts"]),
+            source_message_id=row["source_message_id"],
+        )
+
+    def schedule_pulse_message(
+        self,
+        chat_id: int | str,
+        message: str,
+        *,
+        due_at: datetime,
+        source_message_id: int | None = None,
+    ) -> PulseTask:
+        """Persist one delayed Telegram send and return its immutable snapshot."""
+        clean_message = _normalize_content(
+            message, maximum=4_000, label="Отложенное сообщение"
+        )
+        task_id = uuid4().hex
+        due_timestamp = _utc_timestamp(due_at)
+        now_timestamp = _utc_timestamp(datetime.now(timezone.utc))
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO pulse_tasks (
+                    id, chat_id, action, message, due_at, status, attempts,
+                    source_message_id, created_at, updated_at
+                ) VALUES (?, ?, 'send_message', ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    str(chat_id),
+                    clean_message,
+                    due_timestamp,
+                    source_message_id,
+                    now_timestamp,
+                    now_timestamp,
+                ),
+            )
+            self._connection.commit()
+            row = self._connection.execute(
+                "SELECT * FROM pulse_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        assert row is not None
+        return self._pulse_task_from_row(row)
+
+    def claim_due_pulse_tasks(
+        self,
+        now: datetime,
+        *,
+        limit: int = 20,
+        lease_seconds: int = 300,
+    ) -> list[PulseTask]:
+        """Atomically claim due tasks, recovering abandoned running leases."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("Лимит задач должен быть положительным целым числом")
+        if lease_seconds <= 0:
+            raise ValueError("Срок аренды задачи должен быть положительным")
+        now_utc = _utc_datetime(now)
+        now_timestamp = _utc_timestamp(now_utc)
+        expired_timestamp = _utc_timestamp(now_utc - timedelta(seconds=lease_seconds))
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._connection.execute(
+                    """
+                    UPDATE pulse_tasks
+                    SET status = 'pending', updated_at = ?
+                    WHERE status = 'running' AND updated_at <= ?
+                    """,
+                    (now_timestamp, expired_timestamp),
+                )
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM pulse_tasks
+                    WHERE status = 'pending' AND due_at <= ?
+                    ORDER BY due_at, created_at, id
+                    LIMIT ?
+                    """,
+                    (now_timestamp, limit),
+                ).fetchall()
+                task_ids = [str(row["id"]) for row in rows]
+                if task_ids:
+                    placeholders = ",".join("?" for _ in task_ids)
+                    self._connection.execute(
+                        f"""
+                        UPDATE pulse_tasks
+                        SET status = 'running', attempts = attempts + 1, updated_at = ?
+                        WHERE id IN ({placeholders}) AND status = 'pending'
+                        """,
+                        (now_timestamp, *task_ids),
+                    )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            if not task_ids:
+                return []
+            placeholders = ",".join("?" for _ in task_ids)
+            claimed = self._connection.execute(
+                f"SELECT * FROM pulse_tasks WHERE id IN ({placeholders})",
+                task_ids,
+            ).fetchall()
+        by_id = {str(row["id"]): row for row in claimed}
+        return [self._pulse_task_from_row(by_id[task_id]) for task_id in task_ids]
+
+    def complete_pulse_task(self, task_id: str, *, completed_at: datetime) -> bool:
+        timestamp = _utc_timestamp(completed_at)
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                UPDATE pulse_tasks
+                SET status = 'completed', completed_at = ?, updated_at = ?, last_error = NULL
+                WHERE id = ? AND status = 'running'
+                """,
+                (timestamp, timestamp, task_id),
+            )
+            self._connection.commit()
+            return cursor.rowcount > 0
+
+    def retry_pulse_task(
+        self,
+        task_id: str,
+        *,
+        error: str,
+        retry_at: datetime,
+        max_attempts: int,
+    ) -> bool:
+        """Return a failed claim to the queue or mark it permanently failed."""
+        retry_timestamp = _utc_timestamp(retry_at)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT attempts FROM pulse_tasks WHERE id = ? AND status = 'running'",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            failed = int(row["attempts"]) >= max_attempts
+            cursor = self._connection.execute(
+                """
+                UPDATE pulse_tasks
+                SET status = ?, due_at = ?, last_error = ?, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (
+                    "failed" if failed else "pending",
+                    retry_timestamp,
+                    error[:2_000],
+                    _utc_timestamp(datetime.now(timezone.utc)),
+                    task_id,
+                ),
+            )
+            self._connection.commit()
+            return cursor.rowcount > 0
+
+    def next_pulse_due_at(self) -> datetime | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT due_at FROM pulse_tasks WHERE status = 'pending' ORDER BY due_at LIMIT 1"
+            ).fetchone()
+        return _parse_utc_timestamp(str(row["due_at"])) if row is not None else None
+
+    def get_pulse_tasks(self, *, status: str | None = None) -> list[PulseTask]:
+        """Return pulse tasks for diagnostics and tests, oldest first."""
+        with self._lock:
+            if status is None:
+                rows = self._connection.execute(
+                    "SELECT * FROM pulse_tasks ORDER BY created_at, id"
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    "SELECT * FROM pulse_tasks WHERE status = ? ORDER BY created_at, id",
+                    (status,),
+                ).fetchall()
+        return [self._pulse_task_from_row(row) for row in rows]
 
     def close(self) -> None:
         with self._lock:

@@ -13,7 +13,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -31,6 +31,13 @@ from milana_memory import (
     MilanaMemoryStore,
     WRITE_DIARY_TOOL,
     ChatMessage,
+    PulseTask,
+)
+from milana_pulse import (
+    SCHEDULE_MESSAGE_TOOL,
+    MilanaPulse,
+    StagedScheduledMessage,
+    validate_scheduled_message,
 )
 from milana_schedule import (
     Activity,
@@ -1110,6 +1117,7 @@ class GeneratedReply:
     reaction: str | None = None
     blacklist_sender: bool = False
     staged_diary_entries: tuple[str, ...] = ()
+    staged_scheduled_messages: tuple[StagedScheduledMessage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1542,10 +1550,16 @@ class SendOutcome:
     interrupted: bool
     reaction_sent: bool = False
     blacklisted: bool = False
+    scheduled_count: int = 0
 
     @property
     def answered(self) -> bool:
-        return self.blacklisted or self.reaction_sent or self.sent_count > 0
+        return (
+            self.blacklisted
+            or self.reaction_sent
+            or self.sent_count > 0
+            or self.scheduled_count > 0
+        )
 
 
 class MilanaMessageResponder:
@@ -1561,6 +1575,7 @@ class MilanaMessageResponder:
         dev_chat: bool = False,
         memory: MilanaMemoryStore | None = None,
         presence: MilanaPresenceController | None = None,
+        pulse: MilanaPulse | None = None,
         history_limit: int | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -1594,6 +1609,7 @@ class MilanaMessageResponder:
             sleep=sleep,
             randint=randint,
         )
+        self.pulse = pulse
         self._chat_states: dict[int | str, ChatWorkerState] = {}
         self._chat_states_lock = asyncio.Lock()
         self._closing = False
@@ -1746,7 +1762,7 @@ class MilanaMessageResponder:
             "model": self.config.model,
             "instructions": instructions,
             "input": input_items,
-            "tools": [WRITE_DIARY_TOOL],
+            "tools": [WRITE_DIARY_TOOL, SCHEDULE_MESSAGE_TOOL],
             "tool_choice": "auto",
             "max_output_tokens": self.config.max_output_tokens,
         }
@@ -1932,6 +1948,57 @@ class MilanaMessageResponder:
                 source_message_id=source_message_id,
             )
 
+    def _staged_schedule_call(
+        self,
+        call: Any,
+        staged: list[StagedScheduledMessage],
+    ) -> str:
+        """Validate a delayed send without persisting a stale model draft."""
+        try:
+            arguments = json.loads(call.arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("arguments должен быть объектом")
+            scheduled = validate_scheduled_message(
+                arguments.get("delay_seconds"), arguments.get("message")
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            return json.dumps(
+                {"status": "error", "message": str(exc)}, ensure_ascii=False
+            )
+
+        if scheduled not in staged:
+            staged.append(scheduled)
+            status = "accepted"
+        else:
+            status = "already_accepted"
+        due_at = self.current_time() + timedelta(seconds=scheduled.delay_seconds)
+        return json.dumps(
+            {"status": status, "scheduled_at": due_at.isoformat(timespec="seconds")},
+            ensure_ascii=False,
+        )
+
+    def _commit_staged_schedules(
+        self,
+        entries: tuple[StagedScheduledMessage, ...],
+        *,
+        chat_key: int | str,
+        source_message_id: int | None,
+    ) -> int:
+        """Persist accepted delayed sends and wake the background pulse."""
+        scheduled_count = 0
+        base_time = self.current_time()
+        for entry in entries:
+            self.memory.schedule_pulse_message(
+                chat_key,
+                entry.message,
+                due_at=base_time + timedelta(seconds=entry.delay_seconds),
+                source_message_id=source_message_id,
+            )
+            scheduled_count += 1
+        if scheduled_count and self.pulse is not None:
+            self.pulse.wake()
+        return scheduled_count
+
     # --- Summarization for long-term per-chat context + dynamic user window ---
 
     async def _generate_summary(
@@ -2106,6 +2173,7 @@ class MilanaMessageResponder:
         *,
         structured: bool,
         staged_diary_entries: list[str],
+        staged_scheduled_messages: list[StagedScheduledMessage],
     ) -> GeneratedReply:
         self._raise_if_incomplete(response)
 
@@ -2114,6 +2182,7 @@ class MilanaMessageResponder:
             return GeneratedReply(
                 messages=(refusal,),
                 staged_diary_entries=tuple(staged_diary_entries),
+                staged_scheduled_messages=tuple(staged_scheduled_messages),
             )
 
         output_text = str(getattr(response, "output_text", "") or "").strip()
@@ -2122,12 +2191,14 @@ class MilanaMessageResponder:
                 return GeneratedReply(
                     messages=(),
                     staged_diary_entries=tuple(staged_diary_entries),
+                    staged_scheduled_messages=tuple(staged_scheduled_messages),
                 )
             if not output_text:
                 raise ValueError("Модель вернула пустой ответ")
             return GeneratedReply(
                 messages=(output_text,),
                 staged_diary_entries=tuple(staged_diary_entries),
+                staged_scheduled_messages=tuple(staged_scheduled_messages),
             )
 
         try:
@@ -2158,6 +2229,7 @@ class MilanaMessageResponder:
             reaction=reaction,
             blacklist_sender=blacklist_sender,
             staged_diary_entries=tuple(staged_diary_entries),
+            staged_scheduled_messages=tuple(staged_scheduled_messages),
         )
 
     async def _generate_answer(
@@ -2201,7 +2273,9 @@ class MilanaMessageResponder:
             "спаме; не блокируй из-за обычного несогласия, единичной грубости, шутки или одной "
             "просьбы собеседника. При желании сначала добавь в messages последнюю реплику; после "
             "блокировки новые сообщения этого человека приходить не будут. Каждая строка массива messages будет отправлена "
-            "отдельным сообщением; не добавляй служебные пояснения."
+            "отдельным сообщением; не добавляй служебные пояснения. Если собеседник просит "
+            "написать ему через некоторое время, обязательно вызови schedule_message с готовым "
+            "текстом будущего сообщения и задержкой в секундах, а сейчас коротко подтверди задачу."
         )
         input_items: list[Any] = [*history_input]
         for message in messages:
@@ -2246,6 +2320,7 @@ class MilanaMessageResponder:
                 )
 
         staged_diary_entries: list[str] = []
+        staged_scheduled_messages: list[StagedScheduledMessage] = []
         for _ in range(4):
             response, structured = await self._create_model_response(
                 instructions=instructions,
@@ -2259,25 +2334,39 @@ class MilanaMessageResponder:
                     ),
                     staged_diary_entries,
                 )
+            for entry in tuple(
+                getattr(response, "agy_scheduled_messages", ()) or ()
+            ):
+                self._staged_schedule_call(
+                    SimpleNamespace(arguments=json.dumps(entry, ensure_ascii=False)),
+                    staged_scheduled_messages,
+                )
             output = list(getattr(response, "output", None) or [])
             calls = [
                 item
                 for item in output
                 if getattr(item, "type", None) == "function_call"
-                and getattr(item, "name", None) == "write_diary"
+                and getattr(item, "name", None)
+                in {"write_diary", "schedule_message"}
             ]
             if not calls:
                 return self._parse_generated_reply(
                     response,
                     structured=structured,
                     staged_diary_entries=staged_diary_entries,
+                    staged_scheduled_messages=staged_scheduled_messages,
                 )
 
             # The Responses API expects the model output followed by one result
             # for every function call on the next request.
             input_items.extend(output)
             for call in calls:
-                result = self._staged_diary_call(call, staged_diary_entries)
+                if call.name == "write_diary":
+                    result = self._staged_diary_call(call, staged_diary_entries)
+                else:
+                    result = self._staged_schedule_call(
+                        call, staged_scheduled_messages
+                    )
                 input_items.append(
                     {
                         "type": "function_call_output",
@@ -2286,7 +2375,7 @@ class MilanaMessageResponder:
                     }
                 )
 
-        raise ValueError("Модель превысила лимит последовательных записей в дневник")
+        raise ValueError("Модель превысила лимит последовательных вызовов инструментов")
 
     def current_time(self) -> datetime:
         value = self._now() if self._now is not None else None
@@ -2907,6 +2996,21 @@ class MilanaMessageResponder:
         reaction_sent = False
         blacklisted = False
         diary_committed = False
+        scheduled_count = 0
+
+        if await self._revision(state) != revision:
+            return SendOutcome(sent_count=0, interrupted=True)
+        try:
+            scheduled_count = self._commit_staged_schedules(
+                reply.staged_scheduled_messages,
+                chat_key=state.chat_key,
+                source_message_id=getattr(reply_event, "id", None),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Не удалось сохранить отложенную задачу: {exc}",
+                file=sys.stderr,
+            )
 
         def commit_diary_once() -> None:
             nonlocal diary_committed
@@ -2927,11 +3031,19 @@ class MilanaMessageResponder:
 
         if reply.reaction is not None:
             if await self._revision(state) != revision:
-                return SendOutcome(sent_count=0, interrupted=True)
+                return SendOutcome(
+                    sent_count=0,
+                    interrupted=True,
+                    scheduled_count=scheduled_count,
+                )
             if not self._full_online_window_is_open(
                 continues_conversation=continues_conversation
             ):
-                return SendOutcome(sent_count=0, interrupted=True)
+                return SendOutcome(
+                    sent_count=0,
+                    interrupted=True,
+                    scheduled_count=scheduled_count,
+                )
             try:
                 peer = await self._action_target(reply_event)
                 await self.client(
@@ -2964,6 +3076,7 @@ class MilanaMessageResponder:
                         sent_count=sent_count,
                         interrupted=True,
                         reaction_sent=reaction_sent,
+                        scheduled_count=scheduled_count,
                     )
 
             if await self._revision(state) != revision:
@@ -2971,6 +3084,7 @@ class MilanaMessageResponder:
                     sent_count=sent_count,
                     interrupted=True,
                     reaction_sent=reaction_sent,
+                    scheduled_count=scheduled_count,
                 )
             if index == 0 and not self._full_online_window_is_open(
                 continues_conversation=continues_conversation
@@ -2979,6 +3093,7 @@ class MilanaMessageResponder:
                     sent_count=sent_count,
                     interrupted=True,
                     reaction_sent=reaction_sent,
+                    scheduled_count=scheduled_count,
                 )
 
             try:
@@ -2993,6 +3108,7 @@ class MilanaMessageResponder:
                     sent_count=sent_count,
                     interrupted=False,
                     reaction_sent=reaction_sent,
+                    scheduled_count=scheduled_count,
                 )
 
             sent_count += 1
@@ -3020,6 +3136,7 @@ class MilanaMessageResponder:
                     sent_count=sent_count,
                     interrupted=True,
                     reaction_sent=reaction_sent,
+                    scheduled_count=scheduled_count,
                 )
             if not self._full_online_window_is_open(
                 continues_conversation=continues_conversation
@@ -3028,6 +3145,7 @@ class MilanaMessageResponder:
                     sent_count=sent_count,
                     interrupted=True,
                     reaction_sent=reaction_sent,
+                    scheduled_count=scheduled_count,
                 )
             try:
                 sender = await reply_event.get_input_sender()
@@ -3049,6 +3167,7 @@ class MilanaMessageResponder:
             interrupted=False,
             reaction_sent=reaction_sent,
             blacklisted=blacklisted,
+            scheduled_count=scheduled_count,
         )
 
     async def _update_summary_while_idle(self, state: ChatWorkerState) -> None:
@@ -3267,6 +3386,40 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     memory = MilanaMemoryStore(MEMORY_PATH)
     me = await client.get_me()
     presence = MilanaPresenceController(client, routine)
+
+    async def execute_pulse_task(task: PulseTask) -> None:
+        if task.action != "send_message":
+            raise ValueError(f"Неизвестное действие пульса: {task.action}")
+        target: int | str = (
+            int(task.chat_id) if task.chat_id.lstrip("-").isdigit() else task.chat_id
+        )
+        sent = await client.send_message(target, task.message)
+        candidate_id = getattr(sent, "id", None)
+        try:
+            memory.add_message(
+                task.chat_id,
+                "assistant",
+                task.message,
+                telegram_message_id=(
+                    candidate_id if isinstance(candidate_id, int) else None
+                ),
+                sender_name="Милана",
+            )
+        except Exception as exc:  # noqa: BLE001 - delivery already succeeded
+            print(
+                f"Пульс отправил задачу {task.id}, но не сохранил её в истории: {exc}",
+                file=sys.stderr,
+            )
+        print(
+            f"Пульс выполнил отложенную задачу {task.id} "
+            f"для chat_id={task.chat_id}"
+        )
+
+    pulse = MilanaPulse(
+        memory,
+        execute_pulse_task,
+        now=lambda: datetime.now(timezone.utc),
+    )
     responder = MilanaMessageResponder(
         client,
         model_client,
@@ -3275,6 +3428,7 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
         dev_chat=dev_chat,
         memory=memory,
         presence=presence,
+        pulse=pulse,
     )
 
     async def handler(event: events.NewMessage.Event) -> None:
@@ -3287,11 +3441,13 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
         handler,
         events.NewMessage(incoming=True),
     )
+    pulse_task = asyncio.create_task(pulse.run(), name="milana-pulse")
     own_label = f"@{me.username}" if me.username else str(me.id)
     if dev_chat:
         print(
             f"ИИ-бот запущен для аккаунта {own_label} в режиме DEV-общения: "
             f"ответы без расписания и искусственных пауз, "
+            f"пульс отложенных задач включён, "
             f"провайдер={config.provider}, модель={config.model}. "
             "Для остановки нажмите Ctrl+C."
         )
@@ -3299,7 +3455,8 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     else:
         print(
             f"ИИ-бот запущен для аккаунта {own_label}: обрабатываю входящие "
-            f"текстовые сообщения, фото, видео Gemini и стикеры, "
+            f"текстовые сообщения, фото, видео Gemini и стикеры; "
+            f"пульс отложенных задач включён, "
             f"провайдер={config.provider}, модель={config.model}. "
             "Для остановки нажмите Ctrl+C."
         )
@@ -3325,6 +3482,8 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     try:
         await client.run_until_disconnected()
     finally:
+        pulse_task.cancel()
+        await asyncio.gather(pulse_task, return_exceptions=True)
         if initiative_task is not None:
             initiative_task.cancel()
             await asyncio.gather(initiative_task, return_exceptions=True)

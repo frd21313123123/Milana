@@ -2431,6 +2431,45 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("Лена предпочитает зелёный чай", other_chat_instructions)
 
+    async def test_model_can_schedule_message_for_current_chat(self) -> None:
+        clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
+        responder, client, openai_client = make_responder(clock, dev_chat=True)
+        responder.pulse = MagicMock()
+        schedule_call = SimpleNamespace(
+            type="function_call",
+            name="schedule_message",
+            arguments=json.dumps(
+                {"delay_seconds": 300, "message": "Ну что, пять минут прошло 🙂"},
+                ensure_ascii=False,
+            ),
+            call_id="schedule-1",
+        )
+        openai_client.responses.create.side_effect = [
+            structured_response(output=[schedule_call]),
+            structured_response("Хорошо, напишу через пять минут"),
+        ]
+
+        with patch("builtins.print"):
+            await responder.process(
+                make_event(clock.value, text="Напиши мне через пять минут", chat_id=100)
+            )
+
+        tasks = responder.memory.get_pulse_tasks(status="pending")
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].chat_id, "100")
+        self.assertEqual(tasks[0].message, "Ну что, пять минут прошло 🙂")
+        self.assertEqual(
+            tasks[0].due_at,
+            clock.value.astimezone(timezone.utc) + timedelta(minutes=5),
+        )
+        responder.pulse.wake.assert_called_once_with()
+        client.send_message.assert_awaited_once_with(
+            100, "Хорошо, напишу через пять минут"
+        )
+        tool_input = openai_client.responses.create.await_args_list[1].kwargs["input"]
+        self.assertEqual(tool_input[-1]["call_id"], "schedule-1")
+        self.assertIn("scheduled_at", tool_input[-1]["output"])
+
     async def test_agy_diary_entries_are_staged_in_generated_reply(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, _, openai_client = make_responder(clock)

@@ -838,6 +838,29 @@ class AgyResponsesTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("diary_entries", response.output_text)
 
+    async def test_structured_scheduled_messages_are_exposed_outside_output_text(self) -> None:
+        client = AgyModelClient()
+        client._query = MagicMock(  # type: ignore[method-assign]
+            return_value=json.dumps(
+                {
+                    "messages": ["напишу через пять минут"],
+                    "reaction": None,
+                    "scheduled_messages": [
+                        {"delay_seconds": 300, "message": "Пять минут прошло"}
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        response = await client.responses.create(input=[], text={"format": {}})
+
+        self.assertEqual(
+            response.agy_scheduled_messages,
+            ({"delay_seconds": 300, "message": "Пять минут прошло"},),
+        )
+        self.assertNotIn("scheduled_messages", response.output_text)
+
     async def test_structured_request_wraps_unstructured_answer(self) -> None:
         client = AgyModelClient()
         client._query = MagicMock(  # type: ignore[method-assign]

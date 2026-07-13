@@ -311,7 +311,7 @@ def collect_status() -> dict[str, Any]:
     out_tail = _tail(OUT_LOG, 6)
     err_tail = _tail(ERR_LOG, 4)
 
-    status_text = "РАБОТАЕТ" if running else "НЕ ЗАПУЩЕНА"
+    status_text = "ЗАПУЩЕНА" if running else "НЕ ЗАПУЩЕНА"
 
     return {
         "running": running,
@@ -447,17 +447,18 @@ INDEX_HTML = """<!DOCTYPE html>
         <div>
           <div class="flex items-center gap-x-3">
             <div id="status-badge" 
-                 class="status-badge inline-flex items-center px-4 py-1.5 rounded-2xl text-sm font-semibold tracking-wide">
-              <!-- filled by JS -->
+                 class="status-badge inline-flex items-center px-4 py-1.5 rounded-2xl text-sm font-semibold tracking-wide bg-slate-700 text-slate-300">
+              ○ Загрузка...
             </div>
             <div id="pids-text" class="text-sm text-slate-400 font-mono"></div>
           </div>
-          <div id="mode-text" class="mt-2 text-xl font-semibold"></div>
+          <div id="milana-state" class="mt-2 text-base font-semibold text-slate-400">Милана: Проверяем состояние...</div>
+          <div id="mode-text" class="mt-1.5 text-xl font-semibold"></div>
           <div id="llm-text" class="text-sm text-violet-300 mt-0.5"></div>
         </div>
 
         <div class="flex gap-2">
-          <button onclick="refreshAll(true)" 
+          <button onclick="refreshAll(false)" 
                   class="px-4 py-2 text-sm bg-slate-800 hover:bg-slate-700 active:bg-slate-900 transition rounded-2xl border border-slate-700 flex items-center gap-x-2">
             <span>⟳</span>
             <span>Обновить</span>
@@ -526,6 +527,8 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
       
       <div class="milana-card bg-slate-900 border border-slate-800 rounded-3xl p-5">
+        <!-- Launch state inside "Текущее состояние Миланы" for visibility -->
+        <div id="schedule-launch-state" class="mb-3 text-sm font-semibold"></div>
         <!-- Metrics -->
         <div id="metrics-row" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
         
@@ -592,13 +595,51 @@ INDEX_HTML = """<!DOCTYPE html>
       }, 2800);
     }
 
+    function setInitialLoadingState() {
+      const badge = document.getElementById('status-badge');
+      if (badge) {
+        badge.className = 'status-badge inline-flex items-center px-4 py-1.5 rounded-2xl text-sm font-semibold tracking-wide bg-slate-700 text-slate-300';
+        badge.textContent = '○ Загрузка...';
+      }
+      const stateEl = document.getElementById('milana-state');
+      if (stateEl) {
+        stateEl.innerHTML = '<span class="text-slate-400">Милана: Проверяем состояние...</span>';
+      }
+      const pidsEl = document.getElementById('pids-text');
+      if (pidsEl) pidsEl.textContent = '';
+      const modeEl = document.getElementById('mode-text');
+      if (modeEl) modeEl.textContent = '';
+      const llmEl = document.getElementById('llm-text');
+      if (llmEl) llmEl.textContent = 'Модель: ...';
+      const schedLaunch = document.getElementById('schedule-launch-state');
+      if (schedLaunch) schedLaunch.textContent = 'Милана: Проверяем...';
+    }
+
+    function setErrorState() {
+      const badge = document.getElementById('status-badge');
+      if (badge) {
+        badge.className = 'status-badge inline-flex items-center px-4 py-1.5 rounded-2xl text-sm font-semibold tracking-wide bg-rose-900 text-rose-200';
+        badge.textContent = '⚠ ОШИБКА СВЯЗИ';
+      }
+      const stateEl = document.getElementById('milana-state');
+      if (stateEl) {
+        stateEl.innerHTML = '<span class="text-rose-400">Милана: Состояние недоступно (нажмите Обновить)</span>';
+      }
+      const dot = document.getElementById('connection-dot');
+      if (dot) {
+        dot.className = 'w-2.5 h-2.5 bg-rose-500 rounded-full';
+      }
+      const schedLaunch = document.getElementById('schedule-launch-state');
+      if (schedLaunch) schedLaunch.innerHTML = '<span class="text-rose-400">Милана: Состояние недоступно</span>';
+    }
+
     function setBadge(running, text) {
       const badge = document.getElementById('status-badge');
       if (!badge) return;
       
       if (running) {
         badge.className = 'status-badge inline-flex items-center px-4 py-1.5 rounded-2xl text-sm font-semibold tracking-wide bg-emerald-500 text-emerald-950';
-        badge.textContent = '● ' + (text || 'РАБОТАЕТ');
+        badge.textContent = '● ' + (text || 'ЗАПУЩЕНА');
       } else {
         badge.className = 'status-badge inline-flex items-center px-4 py-1.5 rounded-2xl text-sm font-semibold tracking-wide bg-slate-700 text-slate-300';
         badge.textContent = '○ ' + (text || 'НЕ ЗАПУЩЕНА');
@@ -681,7 +722,7 @@ INDEX_HTML = """<!DOCTYPE html>
       
       // pids
       const pidsEl = document.getElementById('pids-text');
-      pidsEl.textContent = data.pids && data.pids.length ? 'PID: ' + data.pids.join(', ') : '';
+      if (pidsEl) pidsEl.textContent = data.pids && data.pids.length ? 'PID: ' + data.pids.join(', ') : '';
       
       // mode
       const modeEl = document.getElementById('mode-text');
@@ -690,12 +731,32 @@ INDEX_HTML = """<!DOCTYPE html>
       else if (data.mode === 'NORMAL') modeLabel = 'Обычный режим (по расписанию)';
       else if (data.mode === 'MIXED') modeLabel = 'СМЕШАННЫЙ РЕЖИМ (внимание!)';
       else if (data.mode === 'UNKNOWN') modeLabel = 'Режим неизвестен';
-      else modeLabel = 'Не запущена';
-      modeEl.textContent = modeLabel;
+      if (modeEl) modeEl.textContent = modeLabel;
       
       // llm
-      document.getElementById('llm-text').textContent = 'Модель: ' + (data.llm_label || data.llm);
+      const llmEl = document.getElementById('llm-text');
+      if (llmEl) llmEl.textContent = 'Модель: ' + (data.llm_label || data.llm);
       updateLLMButtons(data.llm);
+      
+      // explicit launch state for "состояние Миланы (Запущена или нет)"
+      const stateEl = document.getElementById('milana-state');
+      if (stateEl) {
+        if (data.running) {
+          stateEl.innerHTML = '<span class="text-emerald-400">Милана: Запущена</span>';
+        } else {
+          stateEl.innerHTML = '<span class="text-slate-400">Милана: Не запущена</span>';
+        }
+      }
+      
+      // also show in the "Текущее состояние Миланы" section
+      const schedLaunch = document.getElementById('schedule-launch-state');
+      if (schedLaunch) {
+        if (data.running) {
+          schedLaunch.innerHTML = '<span class="text-emerald-400">● Милана запущена</span>';
+        } else {
+          schedLaunch.innerHTML = '<span class="text-slate-400">○ Милана не запущена</span>';
+        }
+      }
       
       // processes
       renderProcessDetails(data.processes);
@@ -714,7 +775,8 @@ INDEX_HTML = """<!DOCTYPE html>
       
       // server time
       if (data.timestamp) {
-        document.getElementById('server-time').textContent = data.timestamp;
+        const timeEl = document.getElementById('server-time');
+        if (timeEl) timeEl.textContent = data.timestamp;
       }
     }
 
@@ -725,6 +787,9 @@ INDEX_HTML = """<!DOCTYPE html>
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const data = await res.json();
           updateUI(data);
+          // restore dot if it was errored
+          const dot = document.getElementById('connection-dot');
+          if (dot) dot.className = 'w-2.5 h-2.5 bg-emerald-400 rounded-full animate-pulse';
           return data;
         } catch (e) {
           if (attempt < 2) {
@@ -733,6 +798,7 @@ INDEX_HTML = """<!DOCTYPE html>
           }
           if (!silent) showToast('Не удалось подключиться к серверу. Попробуйте обновить страницу.', 'error');
           console.error(e);
+          setErrorState();
         }
       }
     }
@@ -749,7 +815,8 @@ INDEX_HTML = """<!DOCTYPE html>
         errEl.textContent = (data.errors || []).join('\n') || 'Нет записей';
         
         if (data.timestamp) {
-          document.getElementById('server-time').textContent = data.timestamp;
+          const timeEl = document.getElementById('server-time');
+          if (timeEl) timeEl.textContent = data.timestamp;
         }
       } catch (e) {
         showToast('Не удалось загрузить логи', 'error');
@@ -757,6 +824,7 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     async function refreshAll(silent = false) {
+      if (!silent) setInitialLoadingState();
       await refreshStatus(silent);
       await refreshLogs();
     }
@@ -816,6 +884,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     async function init() {
       // Tailwind script already loaded via CDN
+      setInitialLoadingState();
       await refreshAll(true);
       startPolling();
       

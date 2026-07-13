@@ -81,12 +81,15 @@ def _find_structured_payload(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _structured_result(text: str) -> tuple[str, tuple[str, ...]]:
-    """Return the Telegram envelope plus diary entries produced by Gemini."""
+def _structured_result(
+    text: str,
+) -> tuple[str, tuple[str, ...], tuple[dict[str, Any], ...]]:
+    """Return the Telegram envelope plus side effects produced by Gemini."""
     cleaned = text.strip()
     if cleaned == READ_ONLY_SENTINEL:
         return (
             json.dumps({"messages": [], "reaction": None}, ensure_ascii=False),
+            (),
             (),
         )
 
@@ -99,10 +102,30 @@ def _structured_result(text: str) -> tuple[str, tuple[str, ...]]:
             and all(isinstance(item, str) for item in raw_entries)
             else ()
         )
-        return json.dumps(payload, ensure_ascii=False), diary_entries
+        raw_scheduled = payload.pop("scheduled_messages", [])
+        scheduled_messages = (
+            tuple(
+                {
+                    "delay_seconds": item["delay_seconds"],
+                    "message": item["message"],
+                }
+                for item in raw_scheduled
+            )
+            if isinstance(raw_scheduled, list)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("delay_seconds"), int)
+                and not isinstance(item.get("delay_seconds"), bool)
+                and isinstance(item.get("message"), str)
+                for item in raw_scheduled
+            )
+            else ()
+        )
+        return json.dumps(payload, ensure_ascii=False), diary_entries, scheduled_messages
 
     return (
         json.dumps({"messages": [cleaned], "reaction": None}, ensure_ascii=False),
+        (),
         (),
     )
 
@@ -143,10 +166,11 @@ class _AgyResponses:
                 pass
             raise
         if "text" in request:
-            output_text, diary_entries = _structured_result(raw)
+            output_text, diary_entries, scheduled_messages = _structured_result(raw)
         else:
             output_text = raw.strip()
             diary_entries = ()
+            scheduled_messages = ()
         if not output_text:
             raise AgyError("agy вернул пустой ответ")
         return SimpleNamespace(
@@ -155,6 +179,7 @@ class _AgyResponses:
             status="completed",
             incomplete_details=None,
             agy_diary_entries=diary_entries,
+            agy_scheduled_messages=scheduled_messages,
         )
 
 
@@ -408,6 +433,15 @@ class AgyModelClient:
                     "добавь новые записи в массив diary_entries итогового JSON. Если "
                     "записывать нечего, верни пустой массив."
                 )
+            if self._has_schedule_tool(tools):
+                self._add_schedule_output(response_format)
+                payload["instructions"] = (
+                    f"{payload['instructions']}\n\n"
+                    "В этом провайдере не вызывай schedule_message напрямую. Вместо вызова "
+                    "добавь отложенные сообщения в массив scheduled_messages итогового JSON "
+                    "в формате {delay_seconds, message}. Если ставить задачу не нужно, верни "
+                    "пустой массив."
+                )
             payload["response_format"] = response_format
         return payload
 
@@ -415,6 +449,13 @@ class AgyModelClient:
     def _has_diary_tool(tools: Any) -> bool:
         return isinstance(tools, list) and any(
             isinstance(tool, dict) and tool.get("name") == "write_diary"
+            for tool in tools
+        )
+
+    @staticmethod
+    def _has_schedule_tool(tools: Any) -> bool:
+        return isinstance(tools, list) and any(
+            isinstance(tool, dict) and tool.get("name") == "schedule_message"
             for tool in tools
         )
 
@@ -436,6 +477,37 @@ class AgyModelClient:
         }
         if "diary_entries" not in required:
             required.append("diary_entries")
+
+    @staticmethod
+    def _add_schedule_output(response_format: Any) -> None:
+        if not isinstance(response_format, dict):
+            return
+        schema = response_format.get("schema")
+        if not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        required = schema.get("required")
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return
+        properties["scheduled_messages"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "delay_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 31_536_000,
+                    },
+                    "message": {"type": "string", "minLength": 1, "maxLength": 4_000},
+                },
+                "required": ["delay_seconds", "message"],
+                "additionalProperties": False,
+            },
+            "maxItems": 4,
+        }
+        if "scheduled_messages" not in required:
+            required.append("scheduled_messages")
 
     def _materialize_media(
         self, value: Any, workspace: Path, media_counter: list[int]
