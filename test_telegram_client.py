@@ -1189,7 +1189,7 @@ class MilanaInitiativeReflectorTests(unittest.IsolatedAsyncioTestCase):
             "13.07.2026 18:00:00 UTC+05:00",
         )
         self.assertIn("json_schema", str(request["text"]))
-        client.action.assert_called_once_with(entity, "typing")
+        client.action.assert_not_called()
         client.send_message.assert_awaited_once_with(
             entity,
             "Только вернулась с прогулки — было так хорошо 🙂",
@@ -1396,7 +1396,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             [call(100, "Первая часть"), call(100, "Вторая часть")]
         )
 
-    async def test_typing_action_covers_generation_and_sending(self) -> None:
+    async def test_typing_action_covers_only_generation(self) -> None:
         clock = AdvancingClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         responder, client, openai_client = make_responder(clock)
         event = make_event(clock.value)
@@ -1419,7 +1419,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
 
         async def send_while_typing(chat_id: int, text: str):
             self.assertEqual(chat_id, 100)
-            self.assertTrue(action_active)
+            self.assertFalse(action_active)
             return SimpleNamespace(id=301)
 
         openai_client.responses.create.side_effect = generate_while_typing
@@ -1431,7 +1431,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
         client.action.assert_called_once_with("peer", "typing")
         self.assertFalse(action_active)
 
-    async def test_next_message_length_controls_delay_while_typing_is_visible(self) -> None:
+    async def test_next_message_length_controls_delay_without_typing(self) -> None:
         clock = GatedClock(datetime(2026, 7, 13, 21, 0, tzinfo=YEKT))
         flow = MessageFlowConfig(
             input_quiet_seconds=0,
@@ -1463,7 +1463,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             worker = asyncio.create_task(responder.process(make_event(clock.value)))
             delay, release = await asyncio.wait_for(clock.sleep_calls.get(), timeout=1)
             self.assertAlmostEqual(delay, 0.8 + len(second_message) / 11)
-            self.assertTrue(action_active)
+            self.assertFalse(action_active)
             client.send_message.assert_awaited_once_with(100, "первое")
             release.set()
             await asyncio.wait_for(worker, timeout=1)

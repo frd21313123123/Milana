@@ -386,12 +386,6 @@ class TelegramSkillExecutor:
             raise TypeError("telegram.open must return an object")
         context = dict(raw_context)
         self._register_targets(stage, context)
-        target_token = context.get("target_token")
-        if isinstance(target_token, str):
-            self._start_typing(stage.turn_id, target_token)
-            # Give the best-effort task one scheduling turn so the typing RPC
-            # starts promptly, without awaiting its network completion.
-            await asyncio.sleep(0)
         if self.context_enricher is not None:
             extra = self.context_enricher(stage, context)
             if inspect.isawaitable(extra):
@@ -404,16 +398,29 @@ class TelegramSkillExecutor:
                 context[str(key)] = value
         return context
 
-    def _start_typing(self, turn_id: str, target_token: str) -> None:
+    async def set_model_typing(
+        self, turn_id: str, target_token: str, active: bool
+    ) -> None:
+        """Update typing without extending the model or delivery phase.
+
+        The caller invokes this immediately around a model request. Activation
+        and message sending never start typing by themselves.
+        """
+
         task = asyncio.create_task(
-            self._typing_request(turn_id, target_token),
-            name=f"milana-telegram-typing:{turn_id}",
+            self._typing_request(turn_id, target_token, active),
+            name=f"milana-telegram-typing:{turn_id}:{'on' if active else 'off'}",
         )
         self._typing_tasks.add(task)
         task.add_done_callback(self._typing_tasks.discard)
         task.add_done_callback(self._consume_typing_result)
+        # Give the signal one loop turn to reach the RPC writer, without
+        # waiting for the remote cosmetic operation to complete.
+        await asyncio.sleep(0)
 
-    async def _typing_request(self, turn_id: str, target_token: str) -> None:
+    async def _typing_request(
+        self, turn_id: str, target_token: str, active: bool
+    ) -> None:
         try:
             async with asyncio.timeout(0.5):
                 await self.gateway.request(
@@ -422,7 +429,7 @@ class TelegramSkillExecutor:
                         "turn_id": turn_id,
                         "target_token": target_token,
                         "action": "typing",
-                        "arguments": {"active": True},
+                        "arguments": {"active": active},
                     },
                     timeout=0.5,
                 )

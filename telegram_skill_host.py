@@ -1251,8 +1251,7 @@ class TelethonTelegramAdapter:
                         minimum_seconds=float(minimum),
                         maximum_seconds=float(maximum),
                     )
-                    async with self.client.action(target, "typing"):
-                        await asyncio.sleep(delay)
+                    await asyncio.sleep(delay)
                     request.raise_if_cancelled()
                 try:
                     random_id = _part_random_id(

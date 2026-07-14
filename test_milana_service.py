@@ -625,7 +625,15 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             for item in self.supervisor.calls
             if item[0] == "telegram.execute"
         ]
-        self.assertEqual(actions, ["typing", "send_messages", "acknowledge"])
+        self.assertEqual(
+            actions, ["typing", "typing", "send_messages", "acknowledge"]
+        )
+        typing_states = [
+            item[1]["arguments"]["active"]
+            for item in self.supervisor.calls
+            if item[0] == "telegram.execute" and item[1].get("action") == "typing"
+        ]
+        self.assertEqual(typing_states, [True, False])
         history = self.memory.get_chat_history(77)
         self.assertEqual([item.role for item in history], ["user", "assistant"])
         self.assertEqual(history[0].content, "привет")
@@ -888,8 +896,15 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             actions,
             [
                 "typing",
+                "typing",
                 "open_sticker_picker",
+                "typing",
+                "typing",
                 "open_sticker_picker",
+                "typing",
+                "typing",
+                "typing",
+                "typing",
                 "send_sticker",
                 "acknowledge",
             ],
@@ -1046,7 +1061,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             for call in self.supervisor.calls
             if call[0] == "telegram.execute"
         ]
-        self.assertEqual(actions, ["typing", "acknowledge"])
+        self.assertEqual(actions, ["typing", "typing", "acknowledge"])
         self.assertEqual(self.memory.get_chat_history(77)[0].content, "привет")
 
     async def test_hanging_presence_never_delays_network_send(self):

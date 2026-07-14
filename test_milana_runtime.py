@@ -92,7 +92,7 @@ class RuntimeStagingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [call[0] for call in self.gateway.calls],
-            ["telegram.open", "telegram.execute", "telegram.execute"],
+            ["telegram.open", "telegram.execute"],
         )
         self.assertIs(self.gateway.calls[0][1]["include_history"], False)
         self.assertCountEqual(
@@ -101,7 +101,7 @@ class RuntimeStagingTests(unittest.IsolatedAsyncioTestCase):
                 for call in self.gateway.calls
                 if call[0] == "telegram.execute"
             ],
-            ["typing", "open_sticker_picker"],
+            ["open_sticker_picker"],
         )
 
     async def test_target_ref_activation_always_sends_empty_notice_array(self):
@@ -167,7 +167,20 @@ class RuntimeStagingTests(unittest.IsolatedAsyncioTestCase):
             ),
             timeout=0.1,
         )
-        await asyncio.sleep(0)
+        self.assertFalse(
+            any(
+                call[0] == "telegram.execute"
+                and call[1].get("action") == "typing"
+                for call in gateway.calls
+            )
+        )
+
+        await asyncio.wait_for(
+            telegram.set_model_typing(
+                self.trigger.id, "only-this-turn", True
+            ),
+            timeout=0.1,
+        )
 
         typing_call = next(
             call

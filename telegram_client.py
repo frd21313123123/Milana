@@ -1924,8 +1924,7 @@ class MilanaInitiativeReflector:
         await self.presence.begin_response()
         try:
             if decision.message is not None:
-                async with self.client.action(contact.entity, "typing"):
-                    sent = await self.client.send_message(contact.entity, decision.message)
+                sent = await self.client.send_message(contact.entity, decision.message)
                 answered = True
                 candidate_id = getattr(sent, "id", None)
                 sent_at = getattr(sent, "date", None)
@@ -4136,8 +4135,8 @@ class MilanaMessageResponder:
                 outcome: SendOutcome | None = None
 
                 try:
-                    # Telethon renews the action while this context is active, so
-                    # «печатает…» covers generation, pauses and every sent part.
+                    # Keep Telegram's visual state bound to the model request,
+                    # never to later scheduling checks or delivery.
                     async with self.client.action(action_target, "typing"):
                         reply = await self._generate_or_change(
                             state,
@@ -4147,29 +4146,29 @@ class MilanaMessageResponder:
                             messages=model_messages,
                             woke_at_night=woke_at_night,
                         )
-                        if reply is None:
-                            continue
-                        if not self._full_online_window_is_open(
-                            continues_conversation=(
-                                context.continues_conversation or woke_at_night
-                            )
-                        ):
-                            continue
-                        if await self._revision(state) != revision:
-                            continue
-
-                        if not self.dev_chat:
-                            await self.presence.begin_response()
-                            presence_started = True
-                        outcome = await self._send_generated_reply(
-                            state,
-                            revision=revision,
-                            active=active,
-                            reply=reply,
-                            continues_conversation=(
-                                context.continues_conversation or woke_at_night
-                            ),
+                    if reply is None:
+                        continue
+                    if not self._full_online_window_is_open(
+                        continues_conversation=(
+                            context.continues_conversation or woke_at_night
                         )
+                    ):
+                        continue
+                    if await self._revision(state) != revision:
+                        continue
+
+                    if not self.dev_chat:
+                        await self.presence.begin_response()
+                        presence_started = True
+                    outcome = await self._send_generated_reply(
+                        state,
+                        revision=revision,
+                        active=active,
+                        reply=reply,
+                        continues_conversation=(
+                            context.continues_conversation or woke_at_night
+                        ),
+                    )
                 except (
                     AgyError,
                     OpenAIError,

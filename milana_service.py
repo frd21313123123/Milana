@@ -370,6 +370,7 @@ class MilanaService:
             ),
             state_context=self._state_context,
             tool_result_content=self._tool_result_media,
+            model_generation_observer=self._set_telegram_model_typing,
         )
         self.heartbeat = MilanaHeartbeat(
             state,
@@ -1855,6 +1856,21 @@ class MilanaService:
             raise
         except Exception:
             pass
+
+    async def _set_telegram_model_typing(
+        self, trigger: TurnTrigger, active: bool
+    ) -> None:
+        """Show typing only while the selected Telegram turn calls the model."""
+
+        if trigger.kind != "telegram_notice":
+            return
+        try:
+            stage = self.staging.get(trigger.id)
+        except RuntimeError:
+            return
+        token = stage.default_target_token
+        if token is not None:
+            await self.telegram_executor.set_model_typing(trigger.id, token, active)
 
     def _schedule_cosmetic(self, operation: Any) -> None:
         async def run() -> None:

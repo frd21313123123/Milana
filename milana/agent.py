@@ -122,6 +122,7 @@ SchemaContributor = Callable[[tuple[str, ...], TurnTrigger], Mapping[str, Any]]
 ToolResultContentProvider = Callable[
     [ToolResult], Sequence[Mapping[str, Any]] | Awaitable[Sequence[Mapping[str, Any]]]
 ]
+ModelGenerationObserver = Callable[[TurnTrigger, bool], None | Awaitable[None]]
 
 
 class SkillActivationRequired(RuntimeError):
@@ -148,6 +149,7 @@ class MilanaAgent:
         state_context: StateContextProvider | None = None,
         schema_contributor: SchemaContributor | None = None,
         tool_result_content: ToolResultContentProvider | None = None,
+        model_generation_observer: ModelGenerationObserver | None = None,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
     ) -> None:
         if not isinstance(persona, str) or not persona.strip():
@@ -184,6 +186,7 @@ class MilanaAgent:
         self.state_context = state_context
         self.schema_contributor = schema_contributor
         self.tool_result_content = tool_result_content
+        self.model_generation_observer = model_generation_observer
         self.max_tool_rounds = max_tool_rounds
         self._supports_temperature: bool | None = None
         self._supports_structured_output: bool | None = None
@@ -308,28 +311,37 @@ class MilanaAgent:
 
         for _ in range(1 if direct_telegram else self.max_tool_rounds):
             response_started = perf_counter()
-            response = await self._create_response(
-                instructions=instructions,
-                input_items=input_items,
-                tools=(
-                    []
-                    if direct_telegram or force_final_payload
-                    else (
-                        self._sticker_tools(session.tools)
-                        if sticker_telegram
-                        else list(session.tools)
-                    )
-                ),
-                schema=self._response_schema(session.active_skill_ids, trigger),
-                max_output_tokens=self._max_output_tokens_for(
-                    session.active_skill_ids, trigger
-                ),
-                agy_priority=(
-                    "interactive"
-                    if trigger.kind == "telegram_notice"
-                    else "background"
-                ),
+            showing_typing = (
+                trigger.kind == "telegram_notice" and session.is_active("telegram")
             )
+            if showing_typing:
+                await self._notify_model_generation(trigger, True)
+            try:
+                response = await self._create_response(
+                    instructions=instructions,
+                    input_items=input_items,
+                    tools=(
+                        []
+                        if direct_telegram or force_final_payload
+                        else (
+                            self._sticker_tools(session.tools)
+                            if sticker_telegram
+                            else list(session.tools)
+                        )
+                    ),
+                    schema=self._response_schema(session.active_skill_ids, trigger),
+                    max_output_tokens=self._max_output_tokens_for(
+                        session.active_skill_ids, trigger
+                    ),
+                    agy_priority=(
+                        "interactive"
+                        if trigger.kind == "telegram_notice"
+                        else "background"
+                    ),
+                )
+            finally:
+                if showing_typing:
+                    await self._notify_model_generation(trigger, False)
             wall_elapsed_ms = (perf_counter() - response_started) * 1000.0
             agy_queue_wait_ms = (
                 self._optional_response_metric(response, "agy_queue_wait_ms") or 0.0
@@ -486,6 +498,17 @@ class MilanaAgent:
             )
 
         raise RuntimeError("Модель превысила лимит последовательных вызовов инструментов")
+
+    async def _notify_model_generation(
+        self, trigger: TurnTrigger, active: bool
+    ) -> None:
+        """Keep channel-only visual state scoped to one model request."""
+
+        if self.model_generation_observer is None:
+            return
+        result = self.model_generation_observer(trigger, active)
+        if hasattr(result, "__await__"):
+            await result  # type: ignore[misc]
 
     async def _tool_result_media(
         self, result: ToolResult
