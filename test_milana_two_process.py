@@ -155,6 +155,7 @@ class TwoProcessMilanaTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 actions,
                 [
+                    "typing",
                     "open_sticker_picker",
                     "open_sticker_picker",
                     "send_sticker",

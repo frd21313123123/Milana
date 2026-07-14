@@ -12,7 +12,7 @@ from milana_heartbeat import HeartbeatReason, HeartbeatTrigger
 from milana_ipc import MediaPathValidator
 from milana_memory import MilanaMemoryStore
 from milana_schedule import load_routine
-from milana_service import MilanaService, build_heartbeat_changes
+from milana_service import MilanaService, TurnPreemptedError, build_heartbeat_changes
 from milana_state import MilanaStateStore, StateConflictError
 from telegram_client import AIConfig, MessageFlowConfig
 
@@ -200,6 +200,27 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("tg:77:9", service._seen_notices)
 
+    async def test_pending_notice_is_restored_from_durable_journal(self):
+        service = self.service()
+        service.dev_mode = True
+        payload = {
+            "source": "telegram",
+            "notice_id": "tg:77:12",
+            "chat_id": 77,
+            "message_id": 12,
+            "timestamp": NOW.isoformat(),
+            "sender": {"id": 88, "display_name": "Лера"},
+            "media_type": "text",
+        }
+        self.state.record_telegram_notice(payload, received_at=NOW)
+
+        await service._restore_pending_telegram_notices()
+        trigger = await asyncio.wait_for(service._turn_queue.get(), timeout=1)
+
+        self.assertEqual(trigger.metadata["notice_ids"], ["tg:77:12"])
+        self.assertEqual(trigger.metadata["notices"], [payload])
+        service._turn_queue.task_done()
+
     async def test_new_notice_does_not_cancel_commit_phase(self):
         service = self.service()
         release = asyncio.Event()
@@ -244,6 +265,84 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await active_task
 
+    async def test_new_notice_preempts_generation_and_retries_heartbeat(self):
+        service = self.service()
+        started = asyncio.Event()
+
+        async def blocking_turn(_trigger):
+            started.set()
+            await asyncio.Event().wait()
+
+        service.agent.run_turn = AsyncMock(side_effect=blocking_turn)
+        queue = asyncio.Queue()
+        completion = asyncio.get_running_loop().create_future()
+        trigger = TurnTrigger(
+            kind="heartbeat",
+            occurred_at=NOW,
+            revision=0,
+            metadata={"_completion_future": completion},
+        )
+        worker = asyncio.create_task(service._worker_loop("__life__", queue))
+        await queue.put(trigger)
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        params = {
+            "source": "telegram",
+            "notice_id": "tg:77:10",
+            "chat_id": 77,
+            "message_id": 10,
+            "timestamp": NOW.isoformat(),
+            "sender": {"id": 88, "display_name": "Лера"},
+            "media_type": "text",
+        }
+        await service._rpc_telegram_notice(params, SimpleNamespace())
+        quiet_task = service._notice_tasks["77"]
+        quiet_task.cancel()
+        await asyncio.gather(quiet_task, return_exceptions=True)
+
+        with self.assertRaises(TurnPreemptedError):
+            await asyncio.wait_for(completion, timeout=1)
+        self.assertNotIn("__life__", service._active_turn_tasks)
+
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_failed_telegram_generation_retries_same_turn_and_notice(self):
+        service = self.service()
+        calls = []
+        completed = asyncio.Event()
+
+        async def execute(trigger):
+            calls.append(trigger)
+            if len(calls) == 1:
+                raise ValueError("invalid telegram draft")
+            completed.set()
+            return SimpleNamespace(turn_id=trigger.id)
+
+        service._execute_turn = execute
+        queue = asyncio.Queue()
+        trigger = TurnTrigger(
+            kind="telegram_notice",
+            occurred_at=NOW,
+            revision=0,
+            metadata={
+                "chat_id": 77,
+                "notice_ids": ["tg:77:10"],
+                "notices": [{"notice_id": "tg:77:10"}],
+            },
+        )
+        worker = asyncio.create_task(service._worker_loop("77", queue))
+        await queue.put(trigger)
+        await asyncio.wait_for(completed.wait(), timeout=1)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].id, trigger.id)
+        self.assertEqual(calls[1].metadata["_generation_retry"], 1)
+        self.assertIn("tg:77:10", service._seen_notices)
+
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
     async def test_notice_opens_telegram_then_commits_reply_and_read(self):
         final = empty_turn_payload(telegram=True)
         final["telegram"] = {
@@ -258,6 +357,16 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 _final(final),
             ]
         )
+        notice_payload = {
+            "source": "telegram",
+            "notice_id": "tg:77:9",
+            "chat_id": 77,
+            "message_id": 9,
+            "timestamp": NOW.isoformat(),
+            "sender": {"id": 88, "display_name": "Лера"},
+            "media_type": "text",
+        }
+        self.state.record_telegram_notice(notice_payload, received_at=NOW)
         trigger = TurnTrigger(
             kind="telegram_notice",
             occurred_at=NOW,
@@ -276,13 +385,18 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             for item in self.supervisor.calls
             if item[0] == "telegram.execute"
         ]
-        self.assertEqual(actions, ["send_messages", "acknowledge"])
+        self.assertEqual(actions, ["typing", "send_messages", "acknowledge"])
         history = self.memory.get_chat_history(77)
         self.assertEqual([item.role for item in history], ["user", "assistant"])
         self.assertEqual(history[0].content, "привет")
         self.assertEqual(history[1].content, "приветик")
         audit = self.state.list_skill_audit(turn_id=trigger.id)
         self.assertEqual([item.skill_id for item in audit], ["telegram"])
+        self.assertEqual(self.state.list_pending_telegram_notices(), [])
+        self.assertEqual(
+            self.state.record_telegram_notice(notice_payload, received_at=NOW),
+            "handled",
+        )
 
     async def test_telegram_activation_reveals_existing_durable_chat_memory(self):
         self.memory.add_message(
@@ -419,6 +533,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             actions,
             [
+                "typing",
                 "open_sticker_picker",
                 "open_sticker_picker",
                 "send_sticker",
@@ -479,7 +594,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             for call in self.supervisor.calls
             if call[0] == "telegram.execute"
         ]
-        self.assertEqual(actions, ["acknowledge"])
+        self.assertEqual(actions, ["typing", "acknowledge"])
         self.assertEqual(self.memory.get_chat_history(77)[0].content, "привет")
 
     def test_tool_result_media_is_validated_and_encoded_for_the_model(self):

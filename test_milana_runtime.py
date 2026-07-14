@@ -89,7 +89,15 @@ class RuntimeStagingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [call[0] for call in self.gateway.calls],
-            ["telegram.open", "telegram.execute"],
+            ["telegram.open", "telegram.execute", "telegram.execute"],
+        )
+        self.assertEqual(
+            [
+                call[1].get("action")
+                for call in self.gateway.calls
+                if call[0] == "telegram.execute"
+            ],
+            ["typing", "open_sticker_picker"],
         )
 
     async def test_unknown_sticker_is_rejected_without_rpc_or_staging(self):

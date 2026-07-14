@@ -64,10 +64,48 @@ class StateMigrationTests(unittest.TestCase):
                     "relationships",
                     "world_summaries",
                     "skill_audit",
+                    "telegram_notice_journal",
                     "chat_messages",
                     "pulse_tasks",
                 }.issubset(names)
             )
+
+    def test_pending_telegram_notice_survives_reopen_until_handled(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "milana.sqlite3"
+            payload = {
+                "source": "telegram",
+                "notice_id": "tg:10:7",
+                "chat_id": 10,
+                "message_id": 7,
+                "timestamp": NOW.isoformat(),
+                "sender": {"id": 20, "display_name": "Лера"},
+                "media_type": "text",
+            }
+            store = MilanaStateStore(path)
+            self.assertEqual(
+                store.record_telegram_notice(payload, received_at=NOW), "created"
+            )
+            store.close()
+
+            reopened = MilanaStateStore(path)
+            try:
+                self.assertEqual(reopened.list_pending_telegram_notices(), [payload])
+                self.assertEqual(
+                    reopened.record_telegram_notice(payload, received_at=NOW),
+                    "pending",
+                )
+                self.assertEqual(
+                    reopened.complete_telegram_notices(["tg:10:7"], handled_at=NOW),
+                    1,
+                )
+                self.assertEqual(reopened.list_pending_telegram_notices(), [])
+                self.assertEqual(
+                    reopened.record_telegram_notice(payload, received_at=NOW),
+                    "handled",
+                )
+            finally:
+                reopened.close()
 
 
 class WorldStateTests(unittest.TestCase):

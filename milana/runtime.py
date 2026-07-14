@@ -263,6 +263,21 @@ class TelegramSkillExecutor:
             raise TypeError("telegram.open must return an object")
         context = dict(raw_context)
         self._register_targets(stage, context)
+        target_token = context.get("target_token")
+        if isinstance(target_token, str):
+            try:
+                await self.gateway.request(
+                    "telegram.execute",
+                    {
+                        "turn_id": stage.turn_id,
+                        "target_token": target_token,
+                        "action": "typing",
+                        "arguments": {"active": True},
+                    },
+                    timeout=10.0,
+                )
+            except Exception:  # noqa: BLE001 - presence is best-effort
+                pass
         if self.context_enricher is not None:
             extra = self.context_enricher(stage, context)
             if inspect.isawaitable(extra):

@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from milana.subprocesses import hidden_subprocess_kwargs
+
 # --- пути (как в bot_control.bat) ---
 BASE_DIR = Path(__file__).resolve().parent
 PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
@@ -98,6 +100,7 @@ def _run_ps(cmd: str, timeout: float = 6.0) -> str:
             [PS, "-NoProfile", "-Command", cmd],
             stderr=subprocess.DEVNULL,
             timeout=timeout,
+            **hidden_subprocess_kwargs(),
         )
         return out.decode("utf-8", errors="replace")
     except Exception:
@@ -111,7 +114,11 @@ def is_pid_running(pid: int) -> bool:
         f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; "
         f"if ($p -and $p.ProcessName -match '^pythonw?$') {{ exit 0 }}; exit 1"
     )
-    res = subprocess.run([PS, "-NoProfile", "-Command", cmd], capture_output=True)
+    res = subprocess.run(
+        [PS, "-NoProfile", "-Command", cmd],
+        capture_output=True,
+        **hidden_subprocess_kwargs(),
+    )
     return res.returncode == 0
 
 
@@ -201,7 +208,11 @@ def resolve_mode(pids: list[int]) -> str:
             "if (-not $p -or [string]::IsNullOrWhiteSpace($p.CommandLine)) { exit 2 }; "
             "if ($p.CommandLine -match '(?i)(?:^|\\s)--dev-chat(?:\\s|$)') { exit 0 }; exit 1"
         )
-        res = subprocess.run([PS, "-NoProfile", "-Command", ps], capture_output=True)
+        res = subprocess.run(
+            [PS, "-NoProfile", "-Command", ps],
+            capture_output=True,
+            **hidden_subprocess_kwargs(),
+        )
         if res.returncode == 0:
             found_dev = True
         elif res.returncode == 1:
@@ -303,6 +314,7 @@ def run_bat_command(args: list[str], timeout: float = 35.0) -> dict[str, Any]:
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            **hidden_subprocess_kwargs(),
         )
         output = (proc.stdout or "") + (proc.stderr or "")
         return {

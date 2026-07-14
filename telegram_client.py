@@ -25,6 +25,7 @@ from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
 
 from agy_provider import AgyError, AgyModelClient, AgyQuotaError
+from milana.subprocesses import hidden_subprocess_kwargs
 from milana_memory import (
     MAX_DIARY_ENTRY_LENGTH,
     USER_WINDOW_RESET_TARGET,
@@ -741,6 +742,7 @@ def convert_gif_to_mp4(gif_bytes: bytes) -> bytes:
                 capture_output=True,
                 timeout=30,
                 check=False,
+                **hidden_subprocess_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ValueError(f"FFmpeg не смог преобразовать GIF: {exc}") from exc

@@ -622,7 +622,7 @@ class AgyModelClientTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 client._run_windows(["agy"], workspace)
 
-        spawn.assert_called_once_with(["agy"], cwd=str(workspace))
+        spawn.assert_called_once_with(["agy"], cwd=str(workspace), backend=0)
         select_call.assert_called_once()
         process.read.assert_not_called()
         process.terminate.assert_called_once_with(force=True)

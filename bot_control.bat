@@ -125,8 +125,10 @@ if errorlevel 1 (
 )
 
 rem MilanaService records the PID of the real interpreter itself. This avoids
-rem saving the short-lived venv launcher PID on Windows.
-for /L %%N in (1,1,20) do (
+rem saving the venv launcher PID on Windows.  Cold Windows imports and the
+rem launcher handoff can take longer than five seconds, so allow up to twenty
+rem seconds before declaring startup failure.
+for /L %%N in (1,1,80) do (
     if not exist "%PID_FILE%" "%PS%" -NoProfile -Command "Start-Sleep -Milliseconds 250"
 )
 

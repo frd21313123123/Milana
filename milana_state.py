@@ -562,6 +562,18 @@ class MilanaStateStore:
         CREATE INDEX IF NOT EXISTS idx_skill_audit_turn_created
             ON skill_audit(turn_id, created_at);
 
+        CREATE TABLE IF NOT EXISTS telegram_notice_journal (
+            notice_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'handled')),
+            received_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            handled_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_telegram_notice_journal_status_received
+            ON telegram_notice_journal(status, received_at);
+
         INSERT OR IGNORE INTO agent_state (id, updated_at)
         VALUES (1, strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'));
 
@@ -577,6 +589,98 @@ class MilanaStateStore:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    def record_telegram_notice(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        received_at: datetime | None = None,
+    ) -> str:
+        """Durably accept a metadata-only Telegram notice before scheduling it."""
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("Telegram notice payload должен быть mapping")
+        notice_id = _identifier(payload.get("notice_id"), "Telegram notice ID")
+        serialized = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
+        timestamp = _timestamp(received_at or _now())
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    "SELECT status FROM telegram_notice_journal WHERE notice_id = ?",
+                    (notice_id,),
+                ).fetchone()
+                if row is not None and row["status"] == "handled":
+                    self._connection.commit()
+                    return "handled"
+                if row is None:
+                    self._connection.execute(
+                        """
+                        INSERT INTO telegram_notice_journal (
+                            notice_id, payload_json, status, received_at, updated_at
+                        ) VALUES (?, ?, 'pending', ?, ?)
+                        """,
+                        (notice_id, serialized, timestamp, timestamp),
+                    )
+                    result = "created"
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE telegram_notice_journal
+                        SET payload_json = ?, updated_at = ?
+                        WHERE notice_id = ? AND status = 'pending'
+                        """,
+                        (serialized, timestamp, notice_id),
+                    )
+                    result = "pending"
+                self._connection.commit()
+                return result
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    def list_pending_telegram_notices(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        limit = _integer(limit, "Лимит Telegram notices", 1, 10_000)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload_json FROM telegram_notice_journal
+                WHERE status = 'pending'
+                ORDER BY received_at ASC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        notices: list[dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            if isinstance(payload, dict):
+                notices.append(payload)
+        return notices
+
+    def complete_telegram_notices(
+        self,
+        notice_ids: Iterable[str],
+        *,
+        handled_at: datetime | None = None,
+    ) -> int:
+        normalized = tuple(
+            dict.fromkeys(_identifier(item, "Telegram notice ID") for item in notice_ids)
+        )
+        if not normalized:
+            return 0
+        timestamp = _timestamp(handled_at or _now())
+        placeholders = ", ".join("?" for _ in normalized)
+        with self._lock:
+            cursor = self._connection.execute(
+                f"""
+                UPDATE telegram_notice_journal
+                SET status = 'handled', handled_at = ?, updated_at = ?
+                WHERE notice_id IN ({placeholders}) AND status = 'pending'
+                """,
+                (timestamp, timestamp, *normalized),
+            )
+            self._connection.commit()
+            return int(cursor.rowcount)
 
     def __enter__(self) -> "MilanaStateStore":
         return self

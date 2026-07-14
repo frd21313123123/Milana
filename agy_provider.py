@@ -20,6 +20,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
 
+from milana.subprocesses import hidden_subprocess_kwargs
+
 
 ANSI_CSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_RE = re.compile(r"\x1B\][^\x07]*(?:\x07|\x1B\\)")
@@ -892,6 +894,7 @@ class AgyModelClient:
             errors="replace",
             timeout=self.timeout_seconds + 10,
             stdin=subprocess.DEVNULL,
+            **hidden_subprocess_kwargs(),
         )
         if completed.returncode != 0:
             details = self._safe_error_details(completed.stderr or completed.stdout)
@@ -1013,7 +1016,10 @@ class AgyModelClient:
         except ImportError:
             return self._run_direct(command, workspace)
 
-        process = PtyProcess.spawn(command, cwd=str(workspace))
+        # Force native ConPTY.  pywinpty's legacy WinPTY fallback creates a
+        # regular conhost window for every model round, which visibly flashes
+        # when Milana is running under pythonw.  ConPTY uses a headless conhost.
+        process = PtyProcess.spawn(command, cwd=str(workspace), backend=0)
         chunks: list[str] = []
         deadline = time.monotonic() + self.timeout_seconds + 10
         exit_status: int | None = None

@@ -1,4 +1,6 @@
 import asyncio
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,8 +9,10 @@ from unittest.mock import patch
 from milana.host_supervisor import (
     RESTART_BACKOFF_SECONDS,
     SkillHostSupervisor,
+    _default_process_factory,
     restart_delay,
 )
+from milana.subprocesses import hidden_subprocess_kwargs
 from milana_ipc import JsonRpcServer
 
 
@@ -47,6 +51,27 @@ class _FakeProcess:
 
 
 class HostSupervisorRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_factory_hides_child_console_on_windows(self):
+        sentinel = object()
+        with patch(
+            "milana.host_supervisor.asyncio.create_subprocess_exec",
+            return_value=sentinel,
+        ) as create:
+            result = await _default_process_factory(("pythonw.exe", "host.py"))
+
+        self.assertIs(result, sentinel)
+        args, kwargs = create.call_args
+        self.assertEqual(args, ("pythonw.exe", "host.py"))
+        if sys.platform == "win32":
+            expected = hidden_subprocess_kwargs()
+            self.assertEqual(kwargs["creationflags"], expected["creationflags"])
+            self.assertTrue(
+                kwargs["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW
+            )
+            self.assertEqual(kwargs["startupinfo"].wShowWindow, subprocess.SW_HIDE)
+        else:
+            self.assertEqual(kwargs, {})
+
     async def test_crashed_child_is_restarted(self):
         server = JsonRpcServer("secret")
         await server.start()

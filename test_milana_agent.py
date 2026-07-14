@@ -107,6 +107,59 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "tool calls and a final payload"):
             MilanaAgent._normalize_step(response)
 
+    async def test_flattened_provider_state_is_restored_before_validation(self):
+        flattened = {
+            "mood_label": "задумчивое",
+            "valence": 5,
+            "arousal": 45,
+            "social": 50,
+            "rest": 50,
+            "novelty": 50,
+            "achievement": 50,
+            "current_intention": "ответить после пробуждения",
+        }
+        agent, *_ = self._agent([_final(flattened)])
+
+        result = await agent.run_turn(
+            TurnTrigger(kind="heartbeat", occurred_at=datetime.now(timezone.utc))
+        )
+
+        self.assertEqual(result.payload["state_update"]["mood_label"], "задумчивое")
+        self.assertEqual(result.payload["entity_updates"], [])
+        self.assertEqual(result.payload["life_events"], [])
+        self.assertEqual(result.payload["goal_updates"], [])
+        self.assertEqual(result.payload["relationship_updates"], [])
+
+    async def test_invalid_telegram_final_is_corrected_inside_the_same_turn(self):
+        valid = empty_turn_payload(telegram=True)
+        valid["telegram"] = {
+            "target_token": "token-for-turn",
+            "messages": ["второй ответ"],
+            "reaction": None,
+            "blacklist_sender": False,
+        }
+        agent, model, *_ = self._agent(
+            [
+                _function_call("open_skill", {"skill_id": "telegram"}, "open"),
+                _final(empty_turn_payload()),
+                _final(valid),
+            ]
+        )
+
+        result = await agent.run_turn(
+            TurnTrigger(
+                kind="telegram_notice",
+                occurred_at=datetime.now(timezone.utc),
+                metadata={"notice_ids": ["tg:77:10"]},
+            )
+        )
+
+        self.assertEqual(result.payload["telegram"]["messages"], ["второй ответ"])
+        self.assertEqual(len(model.responses.requests), 3)
+        self.assertEqual(model.responses.requests[2]["tools"], [])
+        correction = model.responses.requests[2]["input"][-1]["content"]
+        self.assertIn("Обязательно верни ветку telegram", correction)
+
     async def test_heartbeat_starts_without_telegram_schema_or_tools(self):
         agent, model, *_ = self._agent([_final(empty_turn_payload())])
         result = await agent.run_turn(
@@ -276,6 +329,8 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
         agent, *_ = self._agent(
             [
                 _function_call("open_skill", {"skill_id": "telegram"}, "open"),
+                _final(invalid),
+                _final(invalid),
                 _final(invalid),
             ]
         )

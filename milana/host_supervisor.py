@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from milana_ipc import ConnectionClosedError, JsonRpcPeer, JsonRpcServer
+from milana.subprocesses import hidden_subprocess_kwargs
 
 
 RESTART_BACKOFF_SECONDS = (1, 2, 5, 10, 30, 60)
@@ -24,7 +25,9 @@ ProcessFactory = Callable[[Sequence[str]], Awaitable[Any]]
 
 
 async def _default_process_factory(command: Sequence[str]) -> Any:
-    return await asyncio.create_subprocess_exec(*command)
+    return await asyncio.create_subprocess_exec(
+        *command, **hidden_subprocess_kwargs()
+    )
 
 
 class SkillHostSupervisor:

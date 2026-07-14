@@ -162,16 +162,22 @@ class MilanaAgent:
         ]
         all_results: list[ToolResult] = []
         activation_reminders = 0
+        telegram_final_corrections = 0
+        force_final_payload = False
 
         for _ in range(self.max_tool_rounds):
             response = await self._create_response(
                 instructions=instructions,
                 input_items=input_items,
-                tools=list(session.tools),
+                tools=[] if force_final_payload else list(session.tools),
                 schema=self._response_schema(session.active_skill_ids, trigger),
             )
             step = self._normalize_step(response)
             if step.tool_calls:
+                if force_final_payload:
+                    raise ValueError(
+                        "Модель вернула tool calls в обязательной финальной фазе"
+                    )
                 raw_output = list(getattr(response, "output", None) or [])
                 if raw_output:
                     input_items.extend(raw_output)
@@ -258,12 +264,43 @@ class MilanaAgent:
                     }
                 )
                 continue
-            payload = dict(step.final_payload)
-            validated_changes = self._validate_final_payload(
-                payload,
+            payload = self._normalize_final_shape(
+                step.final_payload,
                 session.active_skill_ids,
-                trigger,
             )
+            try:
+                validated_changes = self._validate_final_payload(
+                    payload,
+                    session.active_skill_ids,
+                    trigger,
+                )
+            except (TypeError, ValueError, PermissionError) as exc:
+                if (
+                    not session.is_active("telegram")
+                    or telegram_final_corrections >= 2
+                ):
+                    raise
+                telegram_final_corrections += 1
+                force_final_payload = True
+                input_items.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": json.dumps(payload, ensure_ascii=False),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "Финальный JSON не прошёл проверку активного Telegram-"
+                                f"навыка: {exc}. Исправь финальный payload по текущей "
+                                "схеме. Обязательно верни ветку telegram с target_token "
+                                "из этого хода, даже если messages пуст. Уже успешные "
+                                "инструменты повторять не нужно."
+                            ),
+                        },
+                    ]
+                )
+                continue
             return TurnResult(
                 turn_id=trigger.id,
                 trigger=trigger,
@@ -274,6 +311,64 @@ class MilanaAgent:
             )
 
         raise RuntimeError("Модель превысила лимит последовательных вызовов инструментов")
+
+    @staticmethod
+    def _normalize_final_shape(
+        payload: Mapping[str, Any],
+        active_skills: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Repair only unambiguous provider flattening before strict validation.
+
+        Some JSON-schema adapters return the properties of ``state_update`` at
+        the root and omit required empty patch arrays.  This is a transport
+        shape error, not a model decision, so it is safe to restore the wrapper.
+        Telegram capabilities are wrapped only when every required field is
+        present; target tokens are never invented.
+        """
+
+        result = dict(payload)
+        state_fields = (
+            "mood_label",
+            "valence",
+            "arousal",
+            "social",
+            "rest",
+            "novelty",
+            "achievement",
+            "current_intention",
+        )
+        if "state_update" not in result and all(
+            field in result for field in state_fields
+        ):
+            result["state_update"] = {
+                field: result.pop(field) for field in state_fields
+            }
+
+        state_update = result.get("state_update")
+        if isinstance(state_update, Mapping) and set(state_update) == set(state_fields):
+            for field in (
+                "entity_updates",
+                "life_events",
+                "goal_updates",
+                "relationship_updates",
+            ):
+                result.setdefault(field, [])
+
+        telegram_fields = (
+            "target_token",
+            "messages",
+            "reaction",
+            "blacklist_sender",
+        )
+        if (
+            "telegram" in active_skills
+            and "telegram" not in result
+            and all(field in result for field in telegram_fields)
+        ):
+            result["telegram"] = {
+                field: result.pop(field) for field in telegram_fields
+            }
+        return result
 
     def _instructions(
         self, catalog_prompt: str, state_context: Mapping[str, Any]

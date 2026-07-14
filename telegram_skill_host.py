@@ -55,6 +55,7 @@ RPC_PRESENCE = "telegram.presence"
 NOTICE_SOURCE = "telegram"
 MAX_NOTICE_CACHE = 4096
 MAX_BACKFILL_NOTICES = 500
+DEFAULT_BACKFILL_POLL_SECONDS = 20.0
 MAX_OUTGOING_MESSAGES = 10
 MAX_MESSAGE_LENGTH = 4096
 SIDE_EFFECT_ACTIONS = frozenset(
@@ -70,7 +71,10 @@ SIDE_EFFECT_ACTIONS = frozenset(
 )
 LOCAL_STAGED_ACTIONS = frozenset({"schedule_message", "schedule_sticker"})
 READ_ACTIONS = frozenset({"open_sticker_picker"})
-ALLOWED_ACTIONS = SIDE_EFFECT_ACTIONS | LOCAL_STAGED_ACTIONS | READ_ACTIONS
+SIGNAL_ACTIONS = frozenset({"typing"})
+ALLOWED_ACTIONS = (
+    SIDE_EFFECT_ACTIONS | LOCAL_STAGED_ACTIONS | READ_ACTIONS | SIGNAL_ACTIONS
+)
 
 
 def _utc_iso(value: datetime | str | None = None) -> str:
@@ -186,9 +190,16 @@ class TelegramSkillHost:
         runtime_root: str | os.PathLike[str],
         *,
         max_backfill: int = MAX_BACKFILL_NOTICES,
+        backfill_poll_seconds: float = DEFAULT_BACKFILL_POLL_SECONDS,
     ) -> None:
         if isinstance(max_backfill, bool) or not 0 < max_backfill <= MAX_BACKFILL_NOTICES:
             raise ValueError(f"max_backfill must be between 1 and {MAX_BACKFILL_NOTICES}")
+        if (
+            isinstance(backfill_poll_seconds, bool)
+            or not isinstance(backfill_poll_seconds, (int, float))
+            or backfill_poll_seconds <= 0
+        ):
+            raise ValueError("backfill_poll_seconds must be positive")
         root = Path(runtime_root).expanduser()
         root.mkdir(parents=True, exist_ok=True)
         self.runtime_root = root.resolve(strict=True)
@@ -201,8 +212,11 @@ class TelegramSkillHost:
             shutil.rmtree(validated_stale_turns)
         self.adapter = adapter
         self.max_backfill = max_backfill
+        self.backfill_poll_seconds = float(backfill_poll_seconds)
         self.peer: JsonRpcPeer | None = None
         self._started = False
+        self._backfill_lock = asyncio.Lock()
+        self._backfill_task: asyncio.Task[None] | None = None
         self._turn_files: dict[str, set[Path]] = {}
         self._turn_dirs: dict[str, Path] = {}
         self._grants: dict[str, dict[str, _TargetGrant]] = {}
@@ -263,18 +277,47 @@ class TelegramSkillHost:
     async def _publish_backfill(self) -> None:
         """Publish one oldest-first unread page without marking it read."""
 
-        for notice in await self.adapter.backfill(self.max_backfill):
-            await self.publish_notice(notice)
+        async with self._backfill_lock:
+            for notice in await self.adapter.backfill(self.max_backfill):
+                await self.publish_notice(notice)
+
+    async def _backfill_loop(self) -> None:
+        """Recover a live NewMessage event that Telethon did not deliver."""
+
+        while self._started:
+            await asyncio.sleep(self.backfill_poll_seconds)
+            peer = self.peer
+            if peer is None or peer.closed:
+                return
+            try:
+                await self._publish_backfill()
+            except ConnectionClosedError:
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep live updates running
+                print(
+                    f"Telegram backfill poll failed: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
     async def run_until_closed(self) -> None:
         if self.peer is None:
             raise RuntimeError("Telegram host is not connected")
+        if self._backfill_task is None or self._backfill_task.done():
+            self._backfill_task = asyncio.create_task(
+                self._backfill_loop(), name="telegram-backfill-poll"
+            )
         try:
             await self.peer.wait_closed()
         finally:
             await self.stop()
 
     async def stop(self) -> None:
+        backfill_task, self._backfill_task = self._backfill_task, None
+        if backfill_task is not None and not backfill_task.done():
+            backfill_task.cancel()
+            await asyncio.gather(backfill_task, return_exceptions=True)
         if self._started:
             self._started = False
             await self.adapter.stop()
@@ -602,6 +645,7 @@ class TelethonTelegramAdapter:
             self.client, animated_renderer=render_sticker_png
         )
         self._sticker_sessions: dict[str, Any] = {}
+        self._typing_contexts: dict[str, Any] = {}
 
     async def start(self, on_notice: NoticeCallback) -> None:
         self._notice_callback = on_notice
@@ -620,6 +664,8 @@ class TelethonTelegramAdapter:
         self.client.add_event_handler(incoming, self._events.NewMessage(incoming=True))
 
     async def stop(self) -> None:
+        for turn_id in tuple(self._typing_contexts):
+            await self._stop_typing(turn_id)
         if self._handler is not None:
             self.client.remove_event_handler(self._handler)
             self._handler = None
@@ -739,6 +785,17 @@ class TelethonTelegramAdapter:
         request: RequestContext,
     ) -> Mapping[str, Any]:
         target = arguments["_target"]
+        if action == "typing":
+            active = arguments.get("active")
+            if not isinstance(active, bool):
+                raise ValueError("typing active must be boolean")
+            await self._stop_typing(turn_id)
+            if active:
+                context = self.client.action(target, "typing")
+                await context.__aenter__()
+                self._typing_contexts[turn_id] = context
+            return {"status": "typing", "active": active}
+
         if action == "send_messages":
             messages = arguments.get("messages")
             if not isinstance(messages, list) or not messages or len(messages) > MAX_OUTGOING_MESSAGES:
@@ -887,7 +944,13 @@ class TelethonTelegramAdapter:
         raise ValueError(f"Unsupported action: {action}")
 
     async def cleanup_turn(self, turn_id: str) -> None:
+        await self._stop_typing(turn_id)
         self._sticker_sessions.pop(turn_id, None)
+
+    async def _stop_typing(self, turn_id: str) -> None:
+        context = self._typing_contexts.pop(turn_id, None)
+        if context is not None:
+            await context.__aexit__(None, None, None)
 
     async def _notice_from_message(
         self, message: Any, *, event: Any | None = None
@@ -1118,6 +1181,7 @@ __all__ = [
     "RPC_OPEN",
     "RPC_PRESENCE",
     "SIDE_EFFECT_ACTIONS",
+    "SIGNAL_ACTIONS",
     "TelegramAdapter",
     "TelegramNotice",
     "TelegramSkillHost",

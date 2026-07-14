@@ -80,6 +80,7 @@ DEFAULT_WEB_PORT = 8765
 PID_FILE = BASE_DIR / "bot.pid"
 MODE_FILE = BASE_DIR / "bot.mode"
 MAX_TELEGRAM_NOTICES_PER_TURN = 100
+MAX_TELEGRAM_GENERATION_RETRIES = 3
 _WORKER_STOP = object()
 
 
@@ -269,6 +270,10 @@ def _target_ref(value: Any) -> str | int:
     return value
 
 
+class TurnPreemptedError(RuntimeError):
+    """A lower-priority model turn yielded to an incoming user message."""
+
+
 class MilanaService:
     """Own the model, memory, world, schedule, heartbeat and skill registry."""
 
@@ -355,6 +360,9 @@ class MilanaService:
         self._web_panel: Any | None = None
         self.last_turn_error: str | None = None
         self.last_turn_at: datetime | None = None
+        self.last_telegram_notice_at: datetime | None = None
+        self.last_telegram_notice_id: str | None = None
+        self.telegram_notice_count = 0
         self._random = random.SystemRandom()
         self._presence_lock = asyncio.Lock()
         self._presence_online = False
@@ -439,8 +447,18 @@ class MilanaService:
             self._tasks.append(
                 asyncio.create_task(self._presence_loop(), name="milana-presence")
             )
+        await self._restore_pending_telegram_notices()
         if web_port is not None:
             self._start_web_panel(web_port)
+
+    async def _restore_pending_telegram_notices(self) -> None:
+        for payload in self.state.list_pending_telegram_notices():
+            try:
+                await self._rpc_telegram_notice(payload, None)  # type: ignore[arg-type]
+            except Exception as exc:  # noqa: BLE001 - retain it for the next restart
+                self.last_turn_error = (
+                    f"Telegram notice restore failed: {type(exc).__name__}: {exc}"
+                )
 
     async def run_forever(self, *, web_port: int | None = DEFAULT_WEB_PORT) -> None:
         await self.start(web_port=web_port)
@@ -512,6 +530,14 @@ class MilanaService:
             chat_id, (str, int)
         ):
             raise ValueError("Telegram notice IDs are invalid")
+        self.last_telegram_notice_at = self._now()
+        self.last_telegram_notice_id = notice_id
+        self.telegram_notice_count += 1
+        journal_status = self.state.record_telegram_notice(
+            dict(params), received_at=self.last_telegram_notice_at
+        )
+        if journal_status == "handled":
+            return {"accepted": True, "duplicate": True}
         if notice_id in self._seen_notices:
             return {"accepted": True, "duplicate": True}
         self._seen_notices.add(notice_id)
@@ -545,6 +571,13 @@ class MilanaService:
                         and item.get("notice_id") not in known
                     ]
             active_task.cancel()
+        life_task = self._active_turn_tasks.get("__life__")
+        if (
+            life_task is not None
+            and not life_task.done()
+            and self._turn_phases.get("__life__") == "generation"
+        ):
+            life_task.cancel()
         self._notice_tasks[chat_key] = asyncio.create_task(
             self._flush_notices(chat_key), name=f"telegram-quiet:{chat_key}"
         )
@@ -686,6 +719,12 @@ class MilanaService:
                 if self._stopping:
                     raise
                 # A newer notice reinserted the cancelled input into its buffer.
+                if isinstance(completion, asyncio.Future) and not completion.done():
+                    completion.set_exception(
+                        TurnPreemptedError(
+                            "Background Milana turn yielded to a Telegram notice"
+                        )
+                    )
             except StateConflictError:
                 await queue.put(
                     TurnTrigger(
@@ -702,7 +741,44 @@ class MilanaService:
                     f"Ход Миланы завершился ошибкой: {self.last_turn_error}",
                     file=sys.stderr,
                 )
-                if isinstance(completion, asyncio.Future) and not completion.done():
+                phase = self._turn_phases.get(key)
+                retry_scheduled = False
+                raw_attempt = trigger.metadata.get("_generation_retry", 0)
+                attempt = (
+                    raw_attempt
+                    if isinstance(raw_attempt, int) and not isinstance(raw_attempt, bool)
+                    else 0
+                )
+                if (
+                    trigger.kind == "telegram_notice"
+                    and phase == "generation"
+                    and attempt < MAX_TELEGRAM_GENERATION_RETRIES
+                ):
+                    metadata = dict(trigger.metadata)
+                    metadata["_generation_retry"] = attempt + 1
+                    raw_notice_ids = metadata.get("notice_ids", ())
+                    if isinstance(raw_notice_ids, (list, tuple)):
+                        self._seen_notices.update(
+                            notice_id
+                            for notice_id in raw_notice_ids
+                            if isinstance(notice_id, str)
+                        )
+                    await queue.put(
+                        TurnTrigger(
+                            kind=trigger.kind,
+                            occurred_at=self._now(),
+                            source_skill=trigger.source_skill,
+                            revision=self.state.get_agent_state().revision,
+                            metadata=metadata,
+                            id=trigger.id,
+                        )
+                    )
+                    retry_scheduled = True
+                if (
+                    not retry_scheduled
+                    and isinstance(completion, asyncio.Future)
+                    and not completion.done()
+                ):
                     completion.set_exception(exc)
             finally:
                 if self._active_turn_tasks.get(key) is task:
@@ -722,6 +798,17 @@ class MilanaService:
             if self._active_triggers.get(turn_key) is trigger:
                 self._turn_phases[turn_key] = "commit"
             result = await self._commit_turn(result, stage)
+            if trigger.kind == "telegram_notice":
+                raw_notice_ids = trigger.metadata.get("notice_ids", ())
+                if isinstance(raw_notice_ids, (list, tuple)):
+                    self.state.complete_telegram_notices(
+                        (
+                            notice_id
+                            for notice_id in raw_notice_ids
+                            if isinstance(notice_id, str)
+                        ),
+                        handled_at=self._now(),
+                    )
             self.last_turn_error = None
             self.last_turn_at = self._now()
             self._record_skill_audit(result)
@@ -1712,6 +1799,19 @@ class MilanaService:
             "active_chats": [key for key in self._active_turn_tasks if key != "__life__"],
             "last_turn_at": self.last_turn_at.isoformat() if self.last_turn_at else None,
             "last_turn_error": self.last_turn_error,
+            "telegram_notices": {
+                "count": self.telegram_notice_count,
+                "last_id": self.last_telegram_notice_id,
+                "last_at": (
+                    self.last_telegram_notice_at.isoformat()
+                    if self.last_telegram_notice_at
+                    else None
+                ),
+                "buffered": sum(len(items) for items in self._notice_buffers.values()),
+                "quiet_tasks": sum(
+                    1 for task in self._notice_tasks.values() if not task.done()
+                ),
+            },
             "heartbeat_paused": state.heartbeat_paused,
         }
 
