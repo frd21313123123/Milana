@@ -25,6 +25,7 @@ import os
 import secrets
 import shutil
 import sys
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -56,6 +57,7 @@ NOTICE_SOURCE = "telegram"
 MAX_NOTICE_CACHE = 4096
 MAX_BACKFILL_NOTICES = 500
 DEFAULT_BACKFILL_POLL_SECONDS = 20.0
+SIGNAL_TIMEOUT_SECONDS = 0.4
 MAX_OUTGOING_MESSAGES = 10
 MAX_MESSAGE_LENGTH = 4096
 SIDE_EFFECT_ACTIONS = frozenset(
@@ -150,6 +152,8 @@ class TelegramAdapter(Protocol):
 
     async def backfill(self, limit: int) -> Sequence[TelegramNotice]: ...
 
+    async def acknowledge_terminal_notice(self, notice: TelegramNotice) -> bool: ...
+
     async def materialize(
         self,
         notice_ids: Sequence[str],
@@ -157,6 +161,7 @@ class TelegramAdapter(Protocol):
         turn_id: str,
         turn_dir: Path,
         target_ref: str | int | None = None,
+        include_history: bool = True,
     ) -> Mapping[str, Any]: ...
 
     async def execute_action(
@@ -179,6 +184,21 @@ class _TargetGrant:
     target: str | int
     message_ids: frozenset[int] = field(default_factory=frozenset)
     sender_ids: frozenset[str | int] = field(default_factory=frozenset)
+
+
+@dataclass(frozen=True)
+class _SendReceipt:
+    id: int | None
+    deduplicated: bool = False
+
+
+@dataclass(frozen=True)
+class _NoticeReceipt:
+    """Durable disposition returned by the Milana notice journal."""
+
+    accepted: bool
+    safe_to_ack: bool
+    terminal: bool
 
 
 class TelegramSkillHost:
@@ -217,6 +237,7 @@ class TelegramSkillHost:
         self._started = False
         self._backfill_lock = asyncio.Lock()
         self._backfill_task: asyncio.Task[None] | None = None
+        self._backfill_refresh_task: asyncio.Task[None] | None = None
         self._turn_files: dict[str, set[Path]] = {}
         self._turn_dirs: dict[str, Path] = {}
         self._grants: dict[str, dict[str, _TargetGrant]] = {}
@@ -275,11 +296,49 @@ class TelegramSkillHost:
             raise
 
     async def _publish_backfill(self) -> None:
-        """Publish one oldest-first unread page without marking it read."""
+        """Publish one oldest-first unread page and retire safe terminal items.
+
+        A request/response exchange is required when the connected peer supports
+        it.  Merely notifying the service is not enough evidence to advance a
+        Telegram read marker: the notice may have been deferred or may still be
+        waiting for generation.  Terminal notices (already handled or declared
+        poison by the durable journal) are acknowledged only through the
+        adapter's gap-safe terminal acknowledgement primitive.
+        """
 
         async with self._backfill_lock:
+            terminal_prefix: dict[str, list[TelegramNotice]] = {}
+            blocked_chats: set[str] = set()
             for notice in await self.adapter.backfill(self.max_backfill):
-                await self.publish_notice(notice)
+                receipt = await self.publish_notice(
+                    notice, wait_for_acceptance=True
+                )
+                chat_key = str(notice.chat_id)
+                if receipt is None:
+                    # Compatibility with an old peer that only implements
+                    # notifications.  Delivery still happens, but read state is
+                    # deliberately left untouched until a confirmable poll.
+                    blocked_chats.add(chat_key)
+                    continue
+                if chat_key in blocked_chats:
+                    continue
+                if not receipt.accepted or not receipt.safe_to_ack:
+                    blocked_chats.add(chat_key)
+                    continue
+                if receipt.terminal:
+                    # Retain every safe item in the contiguous terminal prefix.
+                    # The real adapter deliberately refuses to acknowledge a
+                    # newer terminal item while an older incoming item is still
+                    # unread, so advancing only to the highest candidate would
+                    # deadlock a prefix containing two handled/poison notices.
+                    terminal_prefix.setdefault(chat_key, []).append(notice)
+
+            for chat_key, notices in terminal_prefix.items():
+                for notice in sorted(notices, key=lambda item: item.message_id):
+                    acknowledged = await self._acknowledge_terminal_notice(notice)
+                    if not acknowledged:
+                        blocked_chats.add(chat_key)
+                        break
 
     async def _backfill_loop(self) -> None:
         """Recover a live NewMessage event that Telethon did not deliver."""
@@ -318,6 +377,13 @@ class TelegramSkillHost:
         if backfill_task is not None and not backfill_task.done():
             backfill_task.cancel()
             await asyncio.gather(backfill_task, return_exceptions=True)
+        refresh_task, self._backfill_refresh_task = (
+            self._backfill_refresh_task,
+            None,
+        )
+        if refresh_task is not None and not refresh_task.done():
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
         if self._started:
             self._started = False
             await self.adapter.stop()
@@ -327,17 +393,65 @@ class TelegramSkillHost:
         if peer is not None and not peer.closed:
             await peer.close()
 
-    async def publish_notice(self, notice: TelegramNotice) -> None:
+    async def publish_notice(
+        self, notice: TelegramNotice, *, wait_for_acceptance: bool = False
+    ) -> _NoticeReceipt | None:
         peer = self.peer
         if peer is None or peer.closed:
             # The adapter must not mark the message read.  Its startup backfill
             # will surface it when the service/host connection is restored.
             raise ConnectionClosedError("Milana service is unavailable")
-        await peer.notify(
-            RPC_NOTICE,
-            notice.to_payload(),
-            idempotency_key=f"notice:{notice.notice_id}",
-        )
+        payload = notice.to_payload()
+        idempotency_key = f"notice:{notice.notice_id}"
+        request = getattr(peer, "request", None)
+        if wait_for_acceptance and callable(request):
+            # A disposition is mutable (pending -> handled/dead).  Reusing the
+            # live-delivery idempotency key would make the RPC cache replay a
+            # stale ``safe_to_ack=False`` forever.  The service notice journal
+            # already supplies durable input idempotency, so probes deliberately
+            # bypass the transport response cache.
+            result = await request(
+                RPC_NOTICE,
+                payload,
+            )
+            if not isinstance(result, Mapping) or not isinstance(
+                result.get("accepted"), bool
+            ):
+                raise RuntimeError(
+                    "Milana service returned an invalid Telegram notice receipt"
+                )
+            # Older services returned only ``accepted``.  Missing safety fields
+            # fail closed: the notice was delivered, but no read marker may move.
+            safe_to_ack = result.get("safe_to_ack", False)
+            terminal = result.get("terminal", False)
+            if not isinstance(safe_to_ack, bool) or not isinstance(terminal, bool):
+                raise RuntimeError(
+                    "Milana service returned an invalid Telegram notice receipt"
+                )
+            return _NoticeReceipt(
+                accepted=result["accepted"],
+                safe_to_ack=safe_to_ack,
+                terminal=terminal,
+            )
+        await peer.notify(RPC_NOTICE, payload, idempotency_key=idempotency_key)
+        return None
+
+    async def _acknowledge_terminal_notice(self, notice: TelegramNotice) -> bool:
+        """Advance a poison/handled notice only through a gap-safe adapter API."""
+
+        acknowledge = getattr(self.adapter, "acknowledge_terminal_notice", None)
+        if not callable(acknowledge):
+            # Old adapters remain usable, but cannot automatically retire poison
+            # notices because their generic max-id acknowledgement is unsafe.
+            return False
+        result = acknowledge(notice)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, bool):
+            raise RuntimeError(
+                "Telegram terminal acknowledgement returned a non-boolean result"
+            )
+        return result
 
     def _turn_dir(self, turn_id: str) -> Path:
         existing = self._turn_dirs.get(turn_id)
@@ -403,7 +517,7 @@ class TelegramSkillHost:
     ) -> Mapping[str, Any]:
         payload = _params_object(params)
         turn_id = _required_string(payload, "turn_id", max_length=256)
-        raw_notice_ids = payload.get("notice_ids", ())
+        raw_notice_ids = payload.get("notice_ids", [])
         if not isinstance(raw_notice_ids, list) or not all(
             isinstance(item, str) and item for item in raw_notice_ids
         ):
@@ -420,16 +534,25 @@ class TelegramSkillHost:
             raise JsonRpcError(
                 INVALID_PARAMS, "telegram.open needs notice_ids or target_ref"
             )
+        include_history = payload.get("include_history", True)
+        if not isinstance(include_history, bool):
+            raise JsonRpcError(INVALID_PARAMS, "include_history must be boolean")
 
         turn_dir = self._turn_dir(turn_id)
-        result = dict(
-            await self.adapter.materialize(
-                tuple(raw_notice_ids),
-                turn_id=turn_id,
-                turn_dir=turn_dir,
-                target_ref=target_ref,
+        try:
+            result = dict(
+                await self.adapter.materialize(
+                    tuple(raw_notice_ids),
+                    turn_id=turn_id,
+                    turn_dir=turn_dir,
+                    target_ref=target_ref,
+                    include_history=include_history,
+                )
             )
-        )
+        except MediaPathError:
+            raise
+        except ValueError as exc:
+            raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
         if "_target" not in result:
             raise JsonRpcError(INVALID_PARAMS, "Adapter did not resolve a Telegram target")
         try:
@@ -438,6 +561,24 @@ class TelegramSkillHost:
             raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
         message_ids = _internal_id_set(result.pop("_message_ids", ()), "message")
         sender_ids = _internal_scalar_id_set(result.pop("_sender_ids", ()), "sender")
+        expected_message_ids: set[int] = set()
+        for notice_id in raw_notice_ids:
+            try:
+                _, message_id = _parse_notice_id(notice_id)
+            except ValueError as exc:
+                raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
+            expected_message_ids.add(message_id)
+        missing_message_ids = expected_message_ids.difference(message_ids)
+        if missing_message_ids:
+            missing = ", ".join(
+                notice_id
+                for notice_id in raw_notice_ids
+                if _parse_notice_id(notice_id)[1] in missing_message_ids
+            )
+            raise JsonRpcError(
+                INVALID_PARAMS,
+                f"Telegram notices were not materialized: {missing}",
+            )
         self._track_media_paths(turn_id, result)
 
         token = secrets.token_urlsafe(24)
@@ -477,6 +618,8 @@ class TelegramSkillHost:
         normalized = dict(arguments)
         normalized["_target"] = grant.target
         self._validate_granted_action(action, normalized, grant)
+        if action == "acknowledge":
+            await self._reconcile_before_ack(grant, normalized["message_ids"])
         turn_dir = self._turn_dir(turn_id)
         if action == "send_media":
             path = normalized.get("media_path")
@@ -500,8 +643,94 @@ class TelegramSkillHost:
             # A startup page is bounded.  Once its oldest prefix is read, reveal
             # the next unread page immediately so a later live-message max_id
             # can never skip historical messages that Milana has not opened.
-            await self._publish_backfill()
+            self._schedule_backfill_refresh()
         return result
+
+    async def _reconcile_before_ack(
+        self, grant: _TargetGrant, message_ids: Sequence[int]
+    ) -> None:
+        """Publish every unread message that a Telegram max-id ack would cross.
+
+        ``send_read_acknowledge(max_id=N)`` also reads N-1.  A delayed NewMessage
+        callback for N-1 would therefore disappear from the normal unread
+        backfill if the read marker advanced first.  The real adapter exposes a
+        targeted, unbounded scan for this window.  It is detected dynamically so
+        older/test adapters keep their existing protocol compatibility.
+
+        Reconciliation is deliberately part of the acknowledgement transaction:
+        if the service cannot durably accept a recovered notice, the read marker
+        is not advanced and startup/periodic backfill can try again later.
+        """
+
+        reconcile = getattr(self.adapter, "backfill_before_ack", None)
+        if not callable(reconcile):
+            return
+        through_message_id = max(message_ids)
+        async with self._backfill_lock:
+            notices = reconcile(grant.target, through_message_id)
+            if inspect.isawaitable(notices):
+                notices = await notices
+            if not isinstance(notices, Sequence):
+                raise RuntimeError("Telegram pre-ack reconciliation returned invalid notices")
+            explicitly_acknowledged = frozenset(message_ids)
+            for notice in notices:
+                if not isinstance(notice, TelegramNotice):
+                    raise RuntimeError(
+                        "Telegram pre-ack reconciliation returned an invalid notice"
+                    )
+                if (
+                    str(notice.chat_id) != str(grant.target)
+                    or notice.message_id > through_message_id
+                ):
+                    raise RuntimeError(
+                        "Telegram pre-ack reconciliation escaped the acknowledged window"
+                    )
+                if notice.message_id in explicitly_acknowledged:
+                    # The current turn is the authority for its own opened
+                    # notice.  Its journal row remains pending until this action
+                    # succeeds, so asking the service for ``safe_to_ack`` here
+                    # would deadlock every normal acknowledgement.
+                    continue
+                receipt = await self.publish_notice(
+                    notice, wait_for_acceptance=True
+                )
+                if (
+                    receipt is None
+                    or not receipt.accepted
+                    or not receipt.safe_to_ack
+                ):
+                    raise RuntimeError(
+                        "Telegram acknowledgement is blocked by an unconfirmed "
+                        f"notice: {notice.notice_id}"
+                    )
+
+    def _schedule_backfill_refresh(self) -> None:
+        """Reveal the next unread page without coupling it to read-ack success."""
+
+        current = self._backfill_refresh_task
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._publish_backfill(), name="telegram-backfill-after-ack"
+        )
+        self._backfill_refresh_task = task
+
+        def completed(done: asyncio.Task[None]) -> None:
+            if self._backfill_refresh_task is done:
+                self._backfill_refresh_task = None
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except (ConnectionClosedError, asyncio.CancelledError):
+                return
+            except Exception as exc:  # noqa: BLE001 - periodic poll will retry
+                print(
+                    f"Telegram post-ack backfill failed: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+
+        task.add_done_callback(completed)
 
     def _validate_granted_action(
         self, action: str, arguments: Mapping[str, Any], grant: _TargetGrant
@@ -576,7 +805,10 @@ class TelegramSkillHost:
             raise JsonRpcError(INVALID_PARAMS, "Adapter does not support presence")
         result = callback(online)
         if inspect.isawaitable(result):
-            await result
+            try:
+                await asyncio.wait_for(result, timeout=SIGNAL_TIMEOUT_SECONDS)
+            except TimeoutError:
+                return {"online": online, "applied": False, "timed_out": True}
         return {"online": online}
 
 
@@ -584,6 +816,15 @@ def _params_object(params: Any) -> Mapping[str, Any]:
     if not isinstance(params, Mapping):
         raise JsonRpcError(INVALID_PARAMS, "params must be an object")
     return params
+
+
+def _consume_background_task(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 def _required_string(
@@ -639,6 +880,7 @@ class TelethonTelegramAdapter:
         self._notice_callback: NoticeCallback | None = None
         self._handler: Any | None = None
         self._messages: OrderedDict[str, Any] = OrderedDict()
+        self._senders: OrderedDict[str, Any] = OrderedDict()
         self._dev_chat = bool(dev_chat)
         self._render_sticker_png = render_sticker_png
         self._sticker_skill = MilanaStickerSkill(
@@ -695,19 +937,147 @@ class TelethonTelegramAdapter:
                 read_inbox_max_id, int
             ):
                 read_inbox_max_id = 0
+            wanted_incoming = min(unread, remaining)
+            top_message_id = getattr(dialog_state, "top_message", None)
+            if isinstance(top_message_id, bool) or not isinstance(
+                top_message_id, int
+            ):
+                top_message_id = getattr(
+                    getattr(dialog, "message", None), "id", None
+                )
+            options: dict[str, Any] = {
+                "min_id": max(0, read_inbox_max_id),
+                "reverse": True,
+            }
+            if (
+                isinstance(top_message_id, int)
+                and not isinstance(top_message_id, bool)
+                and top_message_id > read_inbox_max_id
+            ):
+                # Freeze a finite ID window.  Telethon pages through it lazily;
+                # outgoing messages do not consume the incoming notice budget.
+                options["max_id"] = top_message_id + 1
             messages = self.client.iter_messages(
                 dialog.entity,
-                limit=min(unread, remaining),
-                min_id=max(0, read_inbox_max_id),
-                reverse=True,
+                limit=None,
+                **options,
             )
+            incoming_count = 0
             async for message in messages:
                 if bool(getattr(message, "out", False)):
                     continue
                 notice = await self._notice_from_message(message)
                 self._remember(notice.notice_id, message)
                 notices.append(notice)
+                incoming_count += 1
+                if incoming_count >= wanted_incoming:
+                    break
         return tuple(notices[:limit])
+
+    async def backfill_before_ack(
+        self, target: str | int, through_message_id: int
+    ) -> Sequence[TelegramNotice]:
+        """Return the complete unread prefix that ``max_id`` would mark read."""
+
+        if (
+            isinstance(through_message_id, bool)
+            or not isinstance(through_message_id, int)
+            or through_message_id <= 0
+        ):
+            raise ValueError("through_message_id must be a positive integer")
+
+        matched_dialog: Any | None = None
+        async for dialog in self.client.iter_dialogs():
+            if str(getattr(dialog, "id", "")) == str(target):
+                matched_dialog = dialog
+                break
+        if matched_dialog is None:
+            # Failing closed is important here: acknowledging without knowing the
+            # current inbox marker could permanently hide an older unread message.
+            raise RuntimeError("Telegram target is absent from the dialog list")
+
+        dialog_state = getattr(matched_dialog, "dialog", None)
+        read_inbox_max_id = getattr(dialog_state, "read_inbox_max_id", 0)
+        if isinstance(read_inbox_max_id, bool) or not isinstance(
+            read_inbox_max_id, int
+        ):
+            read_inbox_max_id = 0
+        if read_inbox_max_id >= through_message_id:
+            return ()
+
+        notices: list[TelegramNotice] = []
+        messages = self.client.iter_messages(
+            matched_dialog.entity,
+            limit=None,
+            min_id=max(0, read_inbox_max_id),
+            max_id=through_message_id + 1,
+            reverse=True,
+        )
+        async for message in messages:
+            message_id = getattr(message, "id", None)
+            if (
+                isinstance(message_id, bool)
+                or not isinstance(message_id, int)
+                or message_id <= read_inbox_max_id
+                or message_id > through_message_id
+                or bool(getattr(message, "out", False))
+            ):
+                continue
+            notice = await self._notice_from_message(message)
+            self._remember(notice.notice_id, message)
+            notices.append(notice)
+        return tuple(notices)
+
+    async def acknowledge_terminal_notice(self, notice: TelegramNotice) -> bool:
+        """Mark one handled/poison notice read without crossing an unread gap.
+
+        Telegram's read API advances a per-chat max-id marker.  Before using it,
+        re-read the complete interval between the current marker and the terminal
+        notice.  Any older incoming message blocks the operation; it must first
+        receive its own durable service disposition on a later backfill pass.
+        """
+
+        target = notice.chat_id
+        through_message_id = notice.message_id
+        matched_dialog: Any | None = None
+        async for dialog in self.client.iter_dialogs():
+            if str(getattr(dialog, "id", "")) == str(target):
+                matched_dialog = dialog
+                break
+        if matched_dialog is None:
+            raise RuntimeError("Telegram target is absent from the dialog list")
+
+        dialog_state = getattr(matched_dialog, "dialog", None)
+        read_inbox_max_id = getattr(dialog_state, "read_inbox_max_id", 0)
+        if isinstance(read_inbox_max_id, bool) or not isinstance(
+            read_inbox_max_id, int
+        ):
+            read_inbox_max_id = 0
+        if read_inbox_max_id >= through_message_id:
+            return True
+
+        messages = self.client.iter_messages(
+            matched_dialog.entity,
+            limit=None,
+            min_id=max(0, read_inbox_max_id),
+            max_id=through_message_id + 1,
+            reverse=True,
+        )
+        async for message in messages:
+            if bool(getattr(message, "out", False)):
+                continue
+            message_id = getattr(message, "id", None)
+            if isinstance(message_id, bool) or not isinstance(message_id, int):
+                raise RuntimeError(
+                    "Telegram returned an incoming message without a stable ID"
+                )
+            if read_inbox_max_id < message_id < through_message_id:
+                return False
+
+        await self.client.send_read_acknowledge(
+            matched_dialog.entity, max_id=through_message_id
+        )
+        return True
 
     async def materialize(
         self,
@@ -716,8 +1086,9 @@ class TelethonTelegramAdapter:
         turn_id: str,
         turn_dir: Path,
         target_ref: str | int | None = None,
+        include_history: bool = True,
     ) -> Mapping[str, Any]:
-        selected: list[Any] = []
+        selected: list[tuple[str, Any]] = []
         target: str | int | None = target_ref
         for notice_id in notice_ids:
             message = self._messages.get(notice_id)
@@ -725,7 +1096,9 @@ class TelethonTelegramAdapter:
                 chat_id, message_id = _parse_notice_id(notice_id)
                 message = await self.client.get_messages(chat_id, ids=message_id)
             if message is None:
-                continue
+                raise ValueError(
+                    f"Telegram notice could not be materialized: {notice_id}"
+                )
             message_chat = getattr(message, "chat_id", None)
             if message_chat is None:
                 message_chat, _ = _parse_notice_id(notice_id)
@@ -733,15 +1106,19 @@ class TelethonTelegramAdapter:
                 target = message_chat
             if str(message_chat) != str(target):
                 raise ValueError("All opened notices must belong to one Telegram chat")
-            selected.append(message)
+            self._remember(notice_id, message)
+            selected.append((notice_id, message))
         if target is None:
             raise ValueError("Telegram target could not be resolved")
 
         materialized: list[dict[str, Any]] = []
         message_ids: set[int] = set()
         sender_ids: set[str | int] = set()
-        for message in selected:
-            item = await self._message_content(message, turn_dir=turn_dir)
+        for notice_id, message in selected:
+            sender = await self._sender_for_message(message, notice_id=notice_id)
+            item = await self._message_content(
+                message, turn_dir=turn_dir, sender=sender
+            )
             materialized.append(item)
             message_id = item.get("message_id")
             if isinstance(message_id, int):
@@ -751,22 +1128,23 @@ class TelethonTelegramAdapter:
                 sender_ids.add(sender["id"])
 
         history: list[dict[str, Any]] = []
-        async for message in self.client.iter_messages(target, limit=30):
-            message_id = getattr(message, "id", None)
-            if message_id in message_ids:
-                continue
-            sender = await message.get_sender()
-            history.append(
-                {
-                    "message_id": message_id,
-                    "timestamp": _utc_iso(getattr(message, "date", None)),
-                    "sender": _sender_payload(sender),
-                    "outgoing": bool(getattr(message, "out", False)),
-                    "text": str(getattr(message, "raw_text", "") or ""),
-                    "media_type": _media_type(message),
-                }
-            )
-        history.reverse()
+        if include_history:
+            async for message in self.client.iter_messages(target, limit=30):
+                message_id = getattr(message, "id", None)
+                if message_id in message_ids:
+                    continue
+                sender = await self._sender_for_message(message)
+                history.append(
+                    {
+                        "message_id": message_id,
+                        "timestamp": _utc_iso(getattr(message, "date", None)),
+                        "sender": _sender_payload(sender),
+                        "outgoing": bool(getattr(message, "out", False)),
+                        "text": str(getattr(message, "raw_text", "") or ""),
+                        "media_type": _media_type(message),
+                    }
+                )
+            history.reverse()
         return {
             "_target": target,
             "_message_ids": sorted(message_ids),
@@ -789,10 +1167,31 @@ class TelethonTelegramAdapter:
             active = arguments.get("active")
             if not isinstance(active, bool):
                 raise ValueError("typing active must be boolean")
-            await self._stop_typing(turn_id)
+            deadline = asyncio.get_running_loop().time() + SIGNAL_TIMEOUT_SECONDS
+            await self._stop_typing(turn_id, timeout=SIGNAL_TIMEOUT_SECONDS)
             if active:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return {
+                        "status": "typing",
+                        "active": False,
+                        "timed_out": True,
+                    }
                 context = self.client.action(target, "typing")
-                await context.__aenter__()
+                try:
+                    await asyncio.wait_for(
+                        context.__aenter__(), timeout=remaining
+                    )
+                except TimeoutError:
+                    await self._close_typing_context(context, timeout=0)
+                    return {
+                        "status": "typing",
+                        "active": False,
+                        "timed_out": True,
+                    }
+                except BaseException:
+                    await self._close_typing_context(context, timeout=0)
+                    raise
                 self._typing_contexts[turn_id] = context
             return {"status": "typing", "active": active}
 
@@ -810,6 +1209,26 @@ class TelethonTelegramAdapter:
             ):
                 raise ValueError("Outgoing Telegram messages are invalid")
             sent_ids: list[int] = []
+            sent_part_indexes: list[int] = []
+            deduplicated_part_indexes: list[int] = []
+            batch_id = arguments.get("batch_id", f"{turn_id}:send_messages")
+            if (
+                not isinstance(batch_id, str)
+                or not batch_id.strip()
+                or len(batch_id) > 256
+            ):
+                raise ValueError(
+                    "batch_id must be a non-empty string up to 256 characters"
+                )
+            start_index = arguments.get("start_index", 0)
+            if (
+                isinstance(start_index, bool)
+                or not isinstance(start_index, int)
+                or not 0 <= start_index <= len(messages)
+            ):
+                raise ValueError(
+                    "start_index must identify a message part or completion"
+                )
             minimum = arguments.get("inter_message_min_delay_seconds", 1.0)
             maximum = arguments.get("inter_message_max_delay_seconds", 15.0)
             if any(
@@ -819,9 +1238,14 @@ class TelethonTelegramAdapter:
                 raise ValueError("inter-message delay bounds are invalid")
             from telegram_client import inter_message_typing_delay
 
-            for index, text in enumerate(messages):
+            started_at = time.perf_counter()
+            first_sent_message_id: int | None = None
+            first_sent_part_index: int | None = None
+            first_send_elapsed_ms: float | None = None
+            for index in range(start_index, len(messages)):
+                text = messages[index]
                 request.raise_if_cancelled()
-                if index and not self._dev_chat:
+                if index > start_index and not self._dev_chat:
                     delay = inter_message_typing_delay(
                         text,
                         minimum_seconds=float(minimum),
@@ -831,17 +1255,54 @@ class TelethonTelegramAdapter:
                         await asyncio.sleep(delay)
                     request.raise_if_cancelled()
                 try:
-                    sent = await self.client.send_message(target, text)
+                    random_id = _part_random_id(
+                        batch_id,
+                        target=target,
+                        part_index=index,
+                        text=text,
+                    )
+                    sent = await self._send_text(
+                        target, text, random_id=random_id
+                    )
                 except Exception as exc:  # report already-sent parts explicitly
                     return {
-                        "status": "partial" if sent_ids else "failed",
+                        "status": "partial" if sent_part_indexes else "failed",
+                        "batch_id": batch_id,
                         "sent_message_ids": sent_ids,
+                        "sent_part_indexes": sent_part_indexes,
+                        "deduplicated_part_indexes": deduplicated_part_indexes,
+                        "next_part_index": index,
+                        "total_parts": len(messages),
+                        "first_sent_message_id": first_sent_message_id,
+                        "first_sent_part_index": first_sent_part_index,
+                        "first_send_elapsed_ms": first_send_elapsed_ms,
                         "error": str(exc),
                     }
                 candidate = getattr(sent, "id", None)
                 if isinstance(candidate, int):
                     sent_ids.append(candidate)
-            return {"status": "sent", "sent_message_ids": sent_ids}
+                sent_part_indexes.append(index)
+                if bool(getattr(sent, "deduplicated", False)):
+                    deduplicated_part_indexes.append(index)
+                if first_send_elapsed_ms is None:
+                    first_sent_part_index = index
+                    first_send_elapsed_ms = round(
+                        (time.perf_counter() - started_at) * 1000.0, 3
+                    )
+                    if isinstance(candidate, int):
+                        first_sent_message_id = candidate
+            return {
+                "status": "sent",
+                "batch_id": batch_id,
+                "sent_message_ids": sent_ids,
+                "sent_part_indexes": sent_part_indexes,
+                "deduplicated_part_indexes": deduplicated_part_indexes,
+                "next_part_index": len(messages),
+                "total_parts": len(messages),
+                "first_sent_message_id": first_sent_message_id,
+                "first_sent_part_index": first_sent_part_index,
+                "first_send_elapsed_ms": first_send_elapsed_ms,
+            }
 
         if action == "send_media":
             caption = arguments.get("caption")
@@ -908,10 +1369,15 @@ class TelethonTelegramAdapter:
                 emoji=str(raw["emoji"]),
             )
             resolved = await self._sticker_skill.resolve_reference(reference)
-            sent = await self.client.send_file(target, resolved.document)
+            sent = await self._send_sticker(
+                target,
+                resolved.document,
+                random_id=_idempotency_random_id(request.idempotency_key),
+            )
             return {
                 "status": "sent",
                 "message_id": getattr(sent, "id", None),
+                "deduplicated": bool(getattr(sent, "deduplicated", False)),
                 "sticker": _sticker_reference_payload(reference),
             }
         session = self._sticker_sessions.setdefault(
@@ -927,10 +1393,15 @@ class TelethonTelegramAdapter:
         sticker_id = arguments.get("sticker_id")
         choice = session.choose(sticker_id)
         if action == "send_sticker":
-            sent = await self.client.send_file(target, choice.document)
+            sent = await self._send_sticker(
+                target,
+                choice.document,
+                random_id=_idempotency_random_id(request.idempotency_key),
+            )
             return {
                 "status": "sent",
                 "message_id": getattr(sent, "id", None),
+                "deduplicated": bool(getattr(sent, "deduplicated", False)),
                 "sticker": _sticker_reference_payload(choice.reference),
             }
         if action == "schedule_sticker":
@@ -944,13 +1415,118 @@ class TelethonTelegramAdapter:
         raise ValueError(f"Unsupported action: {action}")
 
     async def cleanup_turn(self, turn_id: str) -> None:
-        await self._stop_typing(turn_id)
+        # Telegram's action context is cosmetic. A stuck __aexit__ must not
+        # serialize the next chat behind cleanup of the previous turn.
+        await self._stop_typing(turn_id, timeout=SIGNAL_TIMEOUT_SECONDS)
         self._sticker_sessions.pop(turn_id, None)
 
-    async def _stop_typing(self, turn_id: str) -> None:
+    async def _stop_typing(
+        self, turn_id: str, *, timeout: float | None = None
+    ) -> None:
         context = self._typing_contexts.pop(turn_id, None)
         if context is not None:
-            await context.__aexit__(None, None, None)
+            await self._close_typing_context(context, timeout=timeout)
+
+    @staticmethod
+    async def _close_typing_context(
+        context: Any, *, timeout: float | None = SIGNAL_TIMEOUT_SECONDS
+    ) -> None:
+        task = asyncio.create_task(
+            context.__aexit__(None, None, None), name="telegram-stop-typing"
+        )
+        try:
+            if timeout is None:
+                await task
+            else:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except TimeoutError:
+            pass
+        finally:
+            if not task.done():
+                task.add_done_callback(_consume_background_task)
+
+    async def _send_text(
+        self, target: str | int, text: str, *, random_id: int
+    ) -> Any:
+        """Send text with a caller-supplied MTProto deduplication ID."""
+
+        from telethon import functions, types, utils
+        from telethon.errors import RandomIdDuplicateError
+
+        entity = await self.client.get_input_entity(target)
+        parsed_text, formatting_entities = await self.client._parse_message_text(
+            text, ()
+        )
+        request = functions.messages.SendMessageRequest(
+            peer=entity,
+            message=parsed_text,
+            entities=formatting_entities,
+            no_webpage=False,
+            random_id=random_id,
+        )
+        try:
+            sender = getattr(self.client, "_sender", None)
+            if sender is None:
+                result = await self.client(request)
+            else:
+                # TelegramClient._call retries every ServerError five times,
+                # including RANDOM_ID_DUPLICATE.  A direct one-shot future
+                # makes a lost-response retry complete immediately while the
+                # stable random_id still prevents a second message.
+                result = await sender.send(request)
+                session = getattr(self.client, "session", None)
+                process_entities = getattr(session, "process_entities", None)
+                if callable(process_entities):
+                    await utils.maybe_async(process_entities(result))
+        except RandomIdDuplicateError:
+            return _SendReceipt(id=None, deduplicated=True)
+        if isinstance(result, types.UpdateShortSentMessage):
+            return result
+        return self.client._get_response_message(request, result, entity)
+
+    async def _send_sticker(
+        self, target: str | int, document: Any, *, random_id: int
+    ) -> Any:
+        """Send one sticker with a durable caller-supplied MTProto ID.
+
+        ``TelegramClient.send_file`` creates a fresh random ID internally, so a
+        host restart after Telegram accepted the sticker but before the JSON-RPC
+        response arrived could send it twice.  Building ``SendMediaRequest``
+        directly gives retries the same ID and lets Telegram reject the replay.
+        """
+
+        from telethon import functions, utils
+        from telethon.errors import RandomIdDuplicateError
+
+        entity = await self.client.get_input_entity(target)
+        _file_handle, media, _image = await self.client._file_to_media(document)
+        if media is None:
+            raise TypeError("Cannot convert sticker document to Telegram media")
+        telegram_request = functions.messages.SendMediaRequest(
+            peer=entity,
+            media=media,
+            message="",
+            entities=[],
+            random_id=random_id,
+        )
+        try:
+            sender = getattr(self.client, "_sender", None)
+            if sender is None:
+                result = await self.client(telegram_request)
+            else:
+                # Avoid TelegramClient._call's automatic retries of
+                # RANDOM_ID_DUPLICATE; this one-shot path turns the duplicate
+                # into a successful idempotent receipt immediately.
+                result = await sender.send(telegram_request)
+                session = getattr(self.client, "session", None)
+                process_entities = getattr(session, "process_entities", None)
+                if callable(process_entities):
+                    await utils.maybe_async(process_entities(result))
+        except RandomIdDuplicateError:
+            return _SendReceipt(id=None, deduplicated=True)
+        return self.client._get_response_message(
+            telegram_request, result, entity
+        )
 
     async def _notice_from_message(
         self, message: Any, *, event: Any | None = None
@@ -962,8 +1538,10 @@ class TelethonTelegramAdapter:
         sender = await (
             event.get_sender() if event is not None else message.get_sender()
         )
+        notice_id = _notice_id(chat_id, message_id)
+        self._remember_sender(notice_id, sender)
         return TelegramNotice(
-            notice_id=_notice_id(chat_id, message_id),
+            notice_id=notice_id,
             chat_id=chat_id,
             message_id=message_id,
             timestamp=_utc_iso(getattr(message, "date", None)),
@@ -972,9 +1550,10 @@ class TelethonTelegramAdapter:
         )
 
     async def _message_content(
-        self, message: Any, *, turn_dir: Path
+        self, message: Any, *, turn_dir: Path, sender: Any | None = None
     ) -> dict[str, Any]:
-        sender = await message.get_sender()
+        if sender is None:
+            sender = await self._sender_for_message(message)
         result: dict[str, Any] = {
             "message_id": getattr(message, "id", None),
             "timestamp": _utc_iso(getattr(message, "date", None)),
@@ -1042,7 +1621,41 @@ class TelethonTelegramAdapter:
         self._messages[notice_id] = message
         self._messages.move_to_end(notice_id)
         while len(self._messages) > MAX_NOTICE_CACHE:
-            self._messages.popitem(last=False)
+            evicted_notice_id, _ = self._messages.popitem(last=False)
+            senders = getattr(self, "_senders", None)
+            if senders is not None:
+                senders.pop(evicted_notice_id, None)
+
+    def _remember_sender(self, notice_id: str, sender: Any) -> None:
+        if sender is None:
+            return
+        senders = getattr(self, "_senders", None)
+        if senders is None:
+            senders = OrderedDict()
+            self._senders = senders
+        senders[notice_id] = sender
+        senders.move_to_end(notice_id)
+        while len(senders) > MAX_NOTICE_CACHE:
+            senders.popitem(last=False)
+
+    async def _sender_for_message(
+        self, message: Any, *, notice_id: str | None = None
+    ) -> Any:
+        if notice_id is None:
+            chat_id = getattr(message, "chat_id", None)
+            message_id = getattr(message, "id", None)
+            if chat_id is not None and isinstance(message_id, int):
+                notice_id = _notice_id(chat_id, message_id)
+        senders = getattr(self, "_senders", None)
+        if notice_id is not None and senders is not None:
+            sender = senders.get(notice_id)
+            if sender is not None:
+                senders.move_to_end(notice_id)
+                return sender
+        sender = await message.get_sender()
+        if notice_id is not None:
+            self._remember_sender(notice_id, sender)
+        return sender
 
 
 def _notice_id(chat_id: str | int, message_id: int) -> str:
@@ -1057,6 +1670,40 @@ def _parse_notice_id(value: str) -> tuple[int, int]:
         return int(parts[1]), int(parts[2])
     except ValueError as exc:
         raise ValueError("Invalid Telegram notice ID") from exc
+
+
+def _part_random_id(
+    batch_id: str,
+    *,
+    target: str | int,
+    part_index: int,
+    text: str,
+) -> int:
+    """Derive one stable signed 64-bit MTProto ID per outgoing part."""
+
+    material = (
+        f"{batch_id}\x1f{type(target).__name__}:{target}"
+        f"\x1f{part_index}\x1f{text}"
+    ).encode("utf-8")
+    digest = hashlib.blake2b(
+        material, digest_size=8, person=b"milana-tg-send"
+    ).digest()
+    value = int.from_bytes(digest, "little", signed=True)
+    return value or 1
+
+
+def _idempotency_random_id(idempotency_key: str | None) -> int:
+    """Map one durable JSON-RPC action key to one signed MTProto random ID."""
+
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+        raise ValueError("Sticker send requires a non-empty idempotency key")
+    digest = hashlib.blake2b(
+        idempotency_key.encode("utf-8"),
+        digest_size=8,
+        person=b"milana-tg-stkr",
+    ).digest()
+    value = int.from_bytes(digest, "little", signed=True)
+    return value or 1
 
 
 def _sender_payload(sender: Any) -> dict[str, Any]:

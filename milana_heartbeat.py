@@ -44,6 +44,7 @@ class HeartbeatTrigger:
     fired_at: datetime
     payload: Mapping[str, Any] = field(default_factory=dict)
     recovery: RecoveryWindow | None = None
+    logical_id: str | None = None
 
 
 ExecuteHeartbeat = Callable[[HeartbeatTrigger], Awaitable[None] | None]
@@ -286,6 +287,12 @@ class MilanaHeartbeat:
             fired_at=now,
             payload=payload,
             recovery=window,
+            logical_id=(
+                "recovery:"
+                + _aware(window.started_at).astimezone(timezone.utc).isoformat()
+                + ":"
+                + _aware(window.ended_at).astimezone(timezone.utc).isoformat()
+            ),
         )
         callback = self._on_recovery or self.execute
         try:
@@ -332,6 +339,14 @@ class MilanaHeartbeat:
             scheduled_at=job.due_at,
             fired_at=now,
             payload=job.payload,
+            logical_id=(
+                "random-heartbeat:"
+                + str(job.payload["retry_of"])
+                if reason == HeartbeatReason.HEARTBEAT
+                and isinstance(job.payload.get("retry_of"), str)
+                and bool(str(job.payload["retry_of"]).strip())
+                else f"heartbeat-job:{job.id}"
+            ),
         )
         try:
             await _await_if_needed(self.execute(trigger))
@@ -366,6 +381,12 @@ class MilanaHeartbeat:
             reason=HeartbeatReason.HEARTBEAT,
             scheduled_at=state.next_heartbeat_at,
             fired_at=now,
+            logical_id=(
+                "random-heartbeat:"
+                + _aware(state.next_heartbeat_at)
+                .astimezone(timezone.utc)
+                .isoformat()
+            ),
         )
         try:
             await _await_if_needed(self.execute(trigger))

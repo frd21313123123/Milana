@@ -67,7 +67,7 @@ class TwoProcessMilanaTests(unittest.IsolatedAsyncioTestCase):
             "timestamp": NOW.isoformat(),
             "sender": {"id": 88, "display_name": "Лера"},
             "media_type": "text",
-            "text": "привет из дочернего процесса",
+            "text": "привет, пришли стикер из дочернего процесса",
         }
         (runtime / "fake-notice.json").write_text(
             json.dumps(seed, ensure_ascii=False), encoding="utf-8"

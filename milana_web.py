@@ -359,6 +359,33 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _service_status_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return JSON-ready status without presenting missing/disabled SLA as success."""
+
+    payload = _json_value(value)
+    latency = payload.get("telegram_latency")
+    if isinstance(latency, dict):
+        if latency.get("enabled") is not True:
+            latency["slo_met"] = None
+        else:
+            completeness = latency.get("completeness")
+            unknown = latency.get("eligibility_unknown", 0)
+            missing = latency.get("missing_samples", 0)
+            if isinstance(completeness, Mapping):
+                unknown = completeness.get("unknown_eligibility", unknown)
+                missing = completeness.get("missing_samples", missing)
+            if isinstance(unknown, (int, float)) and unknown > 0:
+                latency["slo_met"] = None
+            elif isinstance(missing, (int, float)) and missing > 0:
+                latency["slo_met"] = False
+            elif (
+                not isinstance(latency.get("sample_size"), (int, float))
+                or latency.get("sample_size", 0) <= 0
+            ):
+                latency["slo_met"] = None
+    return payload
+
+
 def _rich_state(state_store: Any | None) -> dict[str, Any] | None:
     if state_store is None:
         return None
@@ -441,7 +468,7 @@ def collect_status(context: WebPanelContext | None = None) -> dict[str, Any]:
             try:
                 supplied = context.status_provider()
                 if isinstance(supplied, Mapping):
-                    result["service"] = _json_value(supplied)
+                    result["service"] = _service_status_payload(supplied)
                     if supplied.get("service") == "running":
                         result["running"] = True
                         result["status_text"] = "ЗАПУЩЕНА"
@@ -937,12 +964,29 @@ INDEX_HTML = """<!DOCTYPE html>
         } else {
           const state = life.state || {};
           const host = (data.service || {}).telegram_host || {};
+          const latency = (data.service || {}).telegram_latency || {};
+          const phases = latency.phases || {};
+          const latencyText = latency.sample_size
+            ? `p50 ${Math.round(latency.p50_ms || 0)}ms  p95 ${Math.round(latency.p95_ms || 0)}ms  p99 ${Math.round(latency.p99_ms || 0)}ms  превышения ${latency.breaches || 0}/${latency.sample_size} (${Math.round((latency.exceed_rate ?? latency.breach_rate ?? 0) * 100)}%)  LLM/ход ${Number((latency.llm_calls || {}).average || 0).toFixed(2)}`
+            : 'нет измерений';
+          const phaseText = latency.sample_size
+            ? `context ${Math.round((phases.context_ms || {}).p95 || 0)}ms  queue ${Math.round((phases.provider_queue_ms || {}).p95 || 0)}ms  model ${Math.round((phases.model_ms || {}).p95 || 0)}ms  send ${Math.round((phases.send_ms || {}).p95 || 0)}ms`
+            : '—';
+          const slaText = latency.enabled !== true
+            ? 'выключен'
+            : !latency.sample_size || latency.slo_met == null
+              ? 'нет оценки'
+              : latency.slo_met
+                ? 'выполнен'
+                : 'не выполнен';
           const lines = [
             `настроение: ${state.mood || '—'}  valence: ${state.valence ?? '—'}  arousal: ${state.arousal ?? '—'}`,
             `потребности: social ${state.social}  rest ${state.rest}  novelty ${state.novelty}  achievement ${state.achievement}`,
             `намерение: ${state.current_intention || '—'}`,
             `heartbeat: ${state.heartbeat_paused ? 'paused' : 'active'}  следующий: ${state.next_heartbeat_at || '—'}`,
             `telegram host: ${host.connected ? 'connected' : 'offline'}  process: ${host.process_running ? 'running' : 'stopped'}`,
+            `telegram latency: ${latencyText}  sla: ${slaText}`,
+            `telegram phases p95: ${phaseText}`,
             `цели: ${(life.goals || []).length}  события: ${(life.events || []).length}  сущности: ${(life.entities || []).length}  отношения: ${(life.relationships || []).length}`,
             `последние skills: ${(life.skill_audit || []).slice(0, 8).map(x => x.skill_id).join(', ') || '—'}`,
             '',

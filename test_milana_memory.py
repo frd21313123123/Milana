@@ -11,6 +11,7 @@ from milana_memory import (
     MAX_DIARY_ENTRY_LENGTH,
     MAX_MESSAGE_LENGTH,
     MilanaMemoryStore,
+    PulseTaskConflictError,
 )
 
 
@@ -29,6 +30,156 @@ def prepare_test_compaction(
 
 
 class MilanaMemoryStoreTests(unittest.TestCase):
+    def test_fast_context_caps_recent_rows_characters_and_summary(self) -> None:
+        store = MilanaMemoryStore()
+        store.set_chat_summary(100, "s" * 2_500)
+        for message_id in range(1, 31):
+            store.add_message(
+                100,
+                "user" if message_id % 2 else "assistant",
+                f"m{message_id:02d}-" + ("x" * 696),
+                telegram_message_id=message_id,
+                sender_name="Анна" if message_id % 2 else None,
+                created_at="2026-07-14T10:00:00+00:00",
+            )
+
+        context = store.summary_context(
+            100,
+            recent_limit=20,
+            max_characters=12_000,
+            summary_max_characters=2_000,
+        )
+
+        summary_payload = json.loads(context[0]["content"].split("\n", 1)[1])
+        suffix = context[1:]
+        self.assertEqual(summary_payload, {"chat_summary": "s" * 2_000})
+        self.assertLessEqual(len(suffix), 20)
+        self.assertLessEqual(sum(len(item["content"]) for item in suffix), 12_000)
+        self.assertIn("m30-", suffix[-1]["content"])
+        self.assertNotIn("m10-", str(suffix))
+        store.close()
+
+    def test_deterministic_delayed_action_ids_validate_full_immutable_payload(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.sqlite3"
+            due_at = datetime(2026, 7, 14, 11, 0, tzinfo=timezone.utc)
+            store = MilanaMemoryStore(path)
+            first_message = store.schedule_pulse_message(
+                100,
+                "первый текст",
+                due_at=due_at,
+                source_message_id=7,
+                task_id="turn-1:action-0",
+            )
+            repeated_message = store.schedule_pulse_message(
+                100,
+                "первый текст",
+                due_at=due_at,
+                source_message_id=7,
+                task_id="turn-1:action-0",
+            )
+            first_sticker = store.schedule_pulse_sticker(
+                100,
+                due_at=due_at,
+                set_id=10,
+                set_access_hash=20,
+                set_short_name="regular",
+                document_id=30,
+                pack_title="Набор",
+                emoji="🙂",
+                source_message_id=8,
+                task_id="turn-1:action-1",
+            )
+            repeated_sticker = store.schedule_pulse_sticker(
+                100,
+                due_at=due_at,
+                set_id=10,
+                set_access_hash=20,
+                set_short_name="regular",
+                document_id=30,
+                pack_title="Набор",
+                emoji="🙂",
+                source_message_id=8,
+                task_id="turn-1:action-1",
+            )
+
+            self.assertEqual(repeated_message, first_message)
+            self.assertEqual(repeated_sticker, first_sticker)
+            self.assertEqual(len(store.get_pulse_tasks()), 2)
+
+            message_collisions = (
+                (101, "первый текст", due_at, 7),
+                (100, "другой текст", due_at, 7),
+                (100, "первый текст", due_at + timedelta(seconds=1), 7),
+                (100, "первый текст", due_at, 9),
+            )
+            for chat_id, message, collision_due_at, source_message_id in message_collisions:
+                with self.subTest(
+                    chat_id=chat_id,
+                    message=message,
+                    collision_due_at=collision_due_at,
+                    source_message_id=source_message_id,
+                ):
+                    with self.assertRaises(PulseTaskConflictError):
+                        store.schedule_pulse_message(
+                            chat_id,
+                            message,
+                            due_at=collision_due_at,
+                            source_message_id=source_message_id,
+                            task_id="turn-1:action-0",
+                        )
+
+            with self.assertRaises(PulseTaskConflictError):
+                store.schedule_pulse_sticker(
+                    100,
+                    due_at=due_at,
+                    set_id=10,
+                    set_access_hash=20,
+                    set_short_name="regular",
+                    document_id=31,
+                    pack_title="Набор",
+                    emoji="🙂",
+                    source_message_id=8,
+                    task_id="turn-1:action-1",
+                )
+            with self.assertRaises(PulseTaskConflictError):
+                store.schedule_pulse_sticker(
+                    100,
+                    due_at=due_at,
+                    set_id=10,
+                    set_access_hash=20,
+                    set_short_name="regular",
+                    document_id=30,
+                    pack_title="Набор",
+                    emoji="🙂",
+                    source_message_id=8,
+                    task_id="turn-1:action-0",
+                )
+            store.close()
+
+            reopened = MilanaMemoryStore(path)
+            try:
+                tasks = reopened.get_pulse_tasks()
+                self.assertEqual([task.id for task in tasks], [
+                    "turn-1:action-0",
+                    "turn-1:action-1",
+                ])
+                self.assertEqual(tasks[0].message, "первый текст")
+                self.assertEqual(tasks[0].source_message_id, 7)
+                self.assertEqual(tasks[1].sticker_document_id, 30)
+                self.assertEqual(
+                    reopened.schedule_pulse_message(
+                        100,
+                        "первый текст",
+                        due_at=due_at,
+                        source_message_id=7,
+                        task_id="turn-1:action-0",
+                    ),
+                    tasks[0],
+                )
+            finally:
+                reopened.close()
+
     def test_legacy_pulse_table_migrates_and_accepts_stickers(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.sqlite3"

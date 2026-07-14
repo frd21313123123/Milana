@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -628,6 +629,110 @@ class AgyModelClientTests(unittest.TestCase):
         process.terminate.assert_called_once_with(force=True)
         process.close.assert_called_once_with(force=True)
 
+    def test_direct_process_cancellation_terminates_and_reaps_cli(self) -> None:
+        client = AgyModelClient(timeout_seconds=10)
+        cancel_event = threading.Event()
+        cancel_event.set()
+        process = MagicMock()
+        process.pid = 123
+        process.poll.return_value = None
+        process.wait.return_value = -15
+        process.communicate.return_value = ("", "")
+
+        with (
+            TemporaryDirectory() as directory,
+            patch("agy_provider.platform.system", return_value="Windows"),
+            patch("agy_provider.subprocess.Popen", return_value=process) as popen,
+            patch(
+                "agy_provider.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as taskkill,
+            patch.object(AgyModelClient, "_terminate_windows_descendants") as sweep,
+        ):
+            with self.assertRaisesRegex(AgyError, "отменён"):
+                client._run_direct(
+                    ["agy"], Path(directory), cancel_event=cancel_event
+                )
+
+        popen.assert_called_once()
+        taskkill.assert_called_once()
+        sweep.assert_called_once_with(123)
+        self.assertEqual(
+            taskkill.call_args.args[0],
+            ["taskkill", "/PID", "123", "/T", "/F"],
+        )
+        process.terminate.assert_not_called()
+        process.wait.assert_called_once_with(timeout=0.75)
+        process.communicate.assert_called_once_with(timeout=0.25)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows process-tree contract")
+    def test_direct_cancellation_kills_spawned_windows_child(self) -> None:
+        client = AgyModelClient(timeout_seconds=30)
+        cancel_event = threading.Event()
+        result: dict[str, BaseException] = {}
+
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            child_ready = workspace / "child.pid"
+            child_survived = workspace / "child-survived.txt"
+            child_code = (
+                "import pathlib,time;"
+                "time.sleep(2);"
+                f"pathlib.Path({str(child_survived)!r}).write_text('alive');"
+                "time.sleep(30)"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time;"
+                f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                f"pathlib.Path({str(child_ready)!r}).write_text(str(p.pid));"
+                "time.sleep(30)"
+            )
+
+            def run() -> None:
+                try:
+                    client._run_direct(
+                        [sys.executable, "-c", parent_code],
+                        workspace,
+                        cancel_event=cancel_event,
+                    )
+                except BaseException as exc:  # test thread hand-off
+                    result["error"] = exc
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            deadline = time.monotonic() + 5
+            while not child_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(child_ready.exists(), "child process did not start")
+            cancel_event.set()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "cancelled process tree was not reaped")
+            self.assertIsInstance(result.get("error"), AgyError)
+            time.sleep(2.2)
+            self.assertFalse(
+                child_survived.exists(),
+                "agy child survived cancellation after its wrapper exited",
+            )
+
+    def test_query_passes_cancellation_to_posix_direct_runner(self) -> None:
+        client = AgyModelClient()
+        cancel_event = threading.Event()
+
+        with (
+            patch("agy_provider.platform.system", return_value="Linux"),
+            patch.object(
+                client,
+                "_run_direct",
+                return_value="answer",
+            ) as direct,
+        ):
+            self.assertEqual(
+                client._query({"input": []}, cancel_event=cancel_event),
+                "answer",
+            )
+
+        self.assertIs(direct.call_args.args[2], cancel_event)
+
     def test_windows_pty_cancellation_terminates_process_without_reading(self) -> None:
         client = AgyModelClient(timeout_seconds=10)
         process, _ = self._alive_process()
@@ -769,7 +874,7 @@ class AgyResponsesTests(unittest.IsolatedAsyncioTestCase):
             [call(0.25), call(0.5)],
         )
 
-    async def test_auth_retry_holds_lock_across_concurrent_requests(self) -> None:
+    async def test_auth_retry_sleep_releases_slot_for_concurrent_request(self) -> None:
         client = AgyModelClient(
             auth_retries=1,
             auth_retry_delay_seconds=0.25,
@@ -813,17 +918,237 @@ class AgyResponsesTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            done, _ = await asyncio.wait({second}, timeout=0.02)
-            self.assertFalse(done)
-            self.assertEqual(call_order, ["first"])
+            second_result = await asyncio.wait_for(second, timeout=1)
+            self.assertEqual(second_result, "answer-second")
+            self.assertEqual(call_order, ["first", "second"])
 
             allow_retry.set()
-            first_result, second_result = await asyncio.gather(first, second)
+            first_result = await asyncio.wait_for(first, timeout=1)
 
         self.assertEqual(first_result, "answer-first")
         self.assertEqual(second_result, "answer-second")
-        self.assertEqual(call_order, ["first", "first", "second"])
+        self.assertEqual(call_order, ["first", "second", "first"])
         self.assertEqual(attempts, {"first": 2, "second": 1})
+
+    async def test_interactive_request_jumps_ahead_of_queued_background(self) -> None:
+        client = AgyModelClient()
+        active_started = asyncio.Event()
+        release_active = asyncio.Event()
+        call_order: list[str] = []
+
+        async def fake_create_once(
+            request: dict[str, Any],
+            **kwargs: Any,
+        ) -> str:
+            del kwargs
+            label = request["input"][0]["content"]
+            call_order.append(label)
+            if label == "active":
+                active_started.set()
+                await release_active.wait()
+            return f"answer-{label}"
+
+        with patch.object(
+            client.responses,
+            "_create_once",
+            new_callable=AsyncMock,
+            side_effect=fake_create_once,
+        ):
+            active = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "active"}]
+                )
+            )
+            await asyncio.wait_for(active_started.wait(), timeout=1)
+            background_one = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "background-one"}],
+                    metadata={"agy_priority": "background"},
+                )
+            )
+            background_two = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "background-two"}],
+                    metadata={"agy_priority": "background"},
+                )
+            )
+            await asyncio.sleep(0)
+            interactive = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "interactive"}],
+                    metadata={"agy_priority": "interactive"},
+                )
+            )
+            await asyncio.sleep(0)
+            release_active.set()
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    active,
+                    background_one,
+                    background_two,
+                    interactive,
+                ),
+                timeout=1,
+            )
+
+        self.assertEqual(
+            results,
+            [
+                "answer-active",
+                "answer-background-one",
+                "answer-background-two",
+                "answer-interactive",
+            ],
+        )
+        self.assertEqual(
+            call_order,
+            ["active", "interactive", "background-one", "background-two"],
+        )
+
+    async def test_interactive_request_preempts_running_background_safely(self) -> None:
+        client = AgyModelClient()
+        loop = asyncio.get_running_loop()
+        background_started = asyncio.Event()
+        attempts = {"background": 0, "interactive": 0}
+        call_order: list[str] = []
+
+        def fake_query(
+            request: dict[str, Any],
+            cancel_event: threading.Event,
+        ) -> str:
+            label = request["input"][0]["content"]
+            attempts[label] += 1
+            call_order.append(f"{label}-{attempts[label]}")
+            if label == "background" and attempts[label] == 1:
+                loop.call_soon_threadsafe(background_started.set)
+                if not cancel_event.wait(timeout=1):
+                    raise AssertionError("background request was not preempted")
+                call_order.append("background-stopped")
+                raise AgyError("background request cancelled cooperatively")
+            return f"answer-{label}"
+
+        client._query = fake_query  # type: ignore[method-assign]
+        background = asyncio.create_task(
+            client.responses.create(
+                input=[{"role": "user", "content": "background"}],
+                metadata={"agy_priority": "background"},
+            )
+        )
+        await asyncio.wait_for(background_started.wait(), timeout=1)
+        interactive = asyncio.create_task(
+            client.responses.create(
+                input=[{"role": "user", "content": "interactive"}],
+                metadata={"agy_priority": "interactive"},
+            )
+        )
+
+        interactive_response = await asyncio.wait_for(interactive, timeout=1)
+        background_response = await asyncio.wait_for(background, timeout=1)
+
+        self.assertEqual(interactive_response.output_text, "answer-interactive")
+        self.assertEqual(background_response.output_text, "answer-background")
+        self.assertEqual(
+            call_order,
+            [
+                "background-1",
+                "background-stopped",
+                "interactive-1",
+                "background-2",
+            ],
+        )
+        self.assertEqual(background_response.agy_model_calls, 2)
+        self.assertEqual(background_response.agy_preemptions, 1)
+        self.assertEqual(interactive_response.agy_timing["priority"], "interactive")
+
+    async def test_cancelling_queued_background_removes_it_from_dispatcher(self) -> None:
+        client = AgyModelClient()
+        active_started = asyncio.Event()
+        release_active = asyncio.Event()
+        call_order: list[str] = []
+
+        async def fake_create_once(
+            request: dict[str, Any],
+            **kwargs: Any,
+        ) -> str:
+            del kwargs
+            label = request["input"][0]["content"]
+            call_order.append(label)
+            if label == "active":
+                active_started.set()
+                await release_active.wait()
+            return f"answer-{label}"
+
+        with patch.object(
+            client.responses,
+            "_create_once",
+            new_callable=AsyncMock,
+            side_effect=fake_create_once,
+        ):
+            active = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "active"}]
+                )
+            )
+            await asyncio.wait_for(active_started.wait(), timeout=1)
+            background = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "background"}],
+                    metadata={"agy_priority": "background"},
+                )
+            )
+            await asyncio.sleep(0)
+            background.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await background
+
+            interactive = asyncio.create_task(
+                client.responses.create(
+                    input=[{"role": "user", "content": "interactive"}],
+                    metadata={"agy_priority": "interactive"},
+                )
+            )
+            release_active.set()
+            active_result, interactive_result = await asyncio.wait_for(
+                asyncio.gather(active, interactive),
+                timeout=1,
+            )
+
+        self.assertEqual(active_result, "answer-active")
+        self.assertEqual(interactive_result, "answer-interactive")
+        self.assertEqual(call_order, ["active", "interactive"])
+
+    async def test_priority_metadata_is_internal_and_response_has_timings(self) -> None:
+        client = AgyModelClient()
+        client._query = MagicMock(return_value="answer")  # type: ignore[method-assign]
+
+        response = await client.responses.create(
+            input=[],
+            metadata={
+                "agy_priority": "interactive",
+                "trace_id": "turn-1",
+            },
+        )
+
+        submitted_request = client._query.call_args.args[0]
+        self.assertEqual(submitted_request["metadata"], {"trace_id": "turn-1"})
+        self.assertNotIn("agy_priority", submitted_request)
+        self.assertEqual(response.agy_timing["priority"], "interactive")
+        self.assertEqual(response.agy_timing["model_calls"], 1)
+        self.assertGreaterEqual(response.agy_timing["queue_wait_ms"], 0)
+        self.assertGreaterEqual(response.agy_timing["model_ms"], 0)
+        self.assertGreaterEqual(response.agy_timing["total_ms"], 0)
+
+    async def test_invalid_priority_is_rejected_before_query(self) -> None:
+        client = AgyModelClient()
+        client._query = MagicMock(return_value="answer")  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(ValueError, "agy_priority"):
+            await client.responses.create(
+                input=[],
+                metadata={"agy_priority": "eventually"},
+            )
+
+        client._query.assert_not_called()
 
     async def test_plain_request_preserves_fenced_json_as_plain_text(self) -> None:
         client = AgyModelClient()

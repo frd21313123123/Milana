@@ -161,6 +161,22 @@ class MessageFlowConfig:
 
 
 @dataclass(frozen=True)
+class TelegramFastPathConfig:
+    """Latency and prompt budgets for trusted incoming Telegram turns."""
+
+    enabled: bool = True
+    dev_chat_only: bool = True
+    target_first_send_seconds: float = 10.0
+    max_output_tokens: int = 500
+    max_reply_messages: int = 1
+    recent_messages: int = 20
+    history_max_characters: int = 12_000
+    summary_max_characters: int = 2_000
+    metrics_window: int = 500
+    cosmetic_timeout_seconds: float = 0.5
+
+
+@dataclass(frozen=True)
 class AIConfig:
     api_key: str
     model: str
@@ -170,6 +186,8 @@ class AIConfig:
     message_flow: MessageFlowConfig = MessageFlowConfig()
     provider: str = OPENAI_LLM_CHOICE
     openai_fallback_model: str = DEFAULT_AI_MODEL
+    # Appended to preserve the positional constructor used by older importers.
+    telegram_fast_path: TelegramFastPathConfig = TelegramFastPathConfig()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -360,6 +378,79 @@ def load_message_flow_config(settings: Mapping[str, Any]) -> MessageFlowConfig:
     )
 
 
+def load_telegram_fast_path_config(
+    settings: Mapping[str, Any],
+) -> TelegramFastPathConfig:
+    raw = settings.get("telegram_fast_path", {})
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"telegram_fast_path в {AI_CONFIG_PATH.name} должен быть JSON-объектом"
+        )
+    allowed = {
+        "enabled",
+        "dev_chat_only",
+        "target_first_send_seconds",
+        "max_output_tokens",
+        "max_reply_messages",
+        "recent_messages",
+        "history_max_characters",
+        "summary_max_characters",
+        "metrics_window",
+        "cosmetic_timeout_seconds",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Неизвестные параметры telegram_fast_path в {AI_CONFIG_PATH.name}: "
+            + ", ".join(unknown)
+        )
+
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled в telegram_fast_path должен быть boolean")
+    dev_chat_only = raw.get("dev_chat_only", True)
+    if not isinstance(dev_chat_only, bool):
+        raise ValueError("dev_chat_only в telegram_fast_path должен быть boolean")
+
+    def bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
+        value = raw.get(key, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not minimum <= value <= maximum
+        ):
+            raise ValueError(
+                f"{key} в telegram_fast_path должен быть целым числом "
+                f"от {minimum} до {maximum}"
+            )
+        return value
+
+    target = ai_nonnegative_number(raw, "target_first_send_seconds", 10.0)
+    cosmetic = ai_nonnegative_number(raw, "cosmetic_timeout_seconds", 0.5)
+    if target <= 0:
+        raise ValueError("target_first_send_seconds должен быть больше нуля")
+    if cosmetic > target:
+        raise ValueError(
+            "cosmetic_timeout_seconds не может превышать target_first_send_seconds"
+        )
+    return TelegramFastPathConfig(
+        enabled=enabled,
+        dev_chat_only=dev_chat_only,
+        target_first_send_seconds=target,
+        max_output_tokens=bounded_int("max_output_tokens", 500, 1, 4_000),
+        max_reply_messages=bounded_int("max_reply_messages", 1, 1, 6),
+        recent_messages=bounded_int("recent_messages", 20, 1, 200),
+        history_max_characters=bounded_int(
+            "history_max_characters", 12_000, 256, 200_000
+        ),
+        summary_max_characters=bounded_int(
+            "summary_max_characters", 2_000, 0, 40_000
+        ),
+        metrics_window=bounded_int("metrics_window", 500, 20, 10_000),
+        cosmetic_timeout_seconds=cosmetic,
+    )
+
+
 def load_ai_config() -> AIConfig:
     env_values = load_env_file(ENV_PATH)
     settings = load_ai_settings()
@@ -391,6 +482,7 @@ def load_ai_config() -> AIConfig:
         settings, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS
     )
     message_flow = load_message_flow_config(settings)
+    telegram_fast_path = load_telegram_fast_path_config(settings)
 
     if provider == OPENAI_LLM_CHOICE and not api_key:
         raise ValueError("Добавьте OPENAI_API_KEY в переменные среды или файл .env")
@@ -403,6 +495,7 @@ def load_ai_config() -> AIConfig:
         temperature=temperature,
         max_output_tokens=max_output_tokens,
         message_flow=message_flow,
+        telegram_fast_path=telegram_fast_path,
         provider=provider,
         openai_fallback_model=openai_model,
     )
@@ -860,39 +953,63 @@ def _render_tgs_sticker_png(sticker_bytes: bytes) -> bytes:
 
 
 def _render_webm_sticker_png(sticker_bytes: bytes) -> bytes:
-    from imageio_ffmpeg import read_frames
+    from imageio_ffmpeg import get_ffmpeg_exe
     from PIL import Image
 
     with TemporaryDirectory(prefix="milana-sticker-") as directory:
         video_path = Path(directory) / "sticker.webm"
         video_path.write_bytes(sticker_bytes)
-        frames = read_frames(
-            str(video_path),
-            pix_fmt="rgba",
-            bits_per_pixel=32,
-            # Нативный декодер VP9 теряет alpha plane WebM-стикеров.
-            input_params=["-c:v", "libvpx-vp9"],
-            # FFmpeg выбирает наиболее характерный кадр из первых 30, а не
-            # слепо берёт потенциально пустой стартовый кадр анимации.
-            output_params=["-vf", "thumbnail=30", "-frames:v", "1"],
-        )
         try:
-            metadata = next(frames)
-            frame = next(frames)
-        finally:
-            frames.close()
+            completed = subprocess.run(
+                [
+                    get_ffmpeg_exe(),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    # Нативный декодер VP9 теряет alpha plane WebM-стикеров.
+                    "-c:v",
+                    "libvpx-vp9",
+                    "-i",
+                    str(video_path),
+                    "-map_metadata",
+                    "-1",
+                    # Берём характерный кадр из первых 30, а не пустой стартовый.
+                    "-vf",
+                    "thumbnail=30",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "png",
+                    "-",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
+                check=False,
+                **hidden_subprocess_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(
+                f"FFmpeg не смог отрендерить WebM-стикер: {exc}"
+            ) from exc
 
-    size = metadata.get("size") if isinstance(metadata, dict) else None
-    if (
-        not isinstance(size, (tuple, list))
-        or len(size) != 2
-        or not all(isinstance(value, int) and value > 0 for value in size)
-    ):
-        raise ValueError("FFmpeg не вернул размер кадра WebM-стикера")
-    width, height = size
-    if len(frame) != width * height * 4:
-        raise ValueError("FFmpeg вернул повреждённый кадр WebM-стикера")
-    image = Image.frombytes("RGBA", (width, height), frame)
+    if completed.returncode != 0:
+        details = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(
+            "FFmpeg не смог отрендерить WebM-стикер"
+            + (f": {details[-500:]}" if details else "")
+        )
+    if not completed.stdout:
+        raise ValueError("FFmpeg не вернул кадр WebM-стикера")
+
+    try:
+        with Image.open(io.BytesIO(completed.stdout)) as decoded:
+            decoded.load()
+            image = decoded.convert("RGBA")
+    except (OSError, ValueError) as exc:
+        raise ValueError("FFmpeg вернул повреждённый PNG-кадр") from exc
     return _pillow_image_png_bytes(image)
 
 
@@ -4206,21 +4323,9 @@ async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     config = load_ai_config()
     routine = load_routine()
     if config.provider == GEMINI_LLM_CHOICE:
-        gemini_client = AgyModelClient(model=config.model)
-        if config.api_key:
-            openai_client = AsyncOpenAI(api_key=config.api_key)
-            model_client: Any = GeminiQuotaFallbackClient(
-                gemini_client,
-                openai_client,
-                openai_model=config.openai_fallback_model,
-            )
-        else:
-            model_client = gemini_client
-            print(
-                "Предупреждение: OPENAI_API_KEY не задан; резервный ответ OpenAI "
-                "при исчерпании лимита Gemini будет недоступен.",
-                file=sys.stderr,
-            )
+        # The runtime contract is provider-stable: a Gemini turn is never
+        # silently regenerated by another provider after quota/auth failures.
+        model_client: Any = AgyModelClient(model=config.model)
     else:
         model_client = AsyncOpenAI(api_key=config.api_key)
     memory = MilanaMemoryStore(MEMORY_PATH)

@@ -6,12 +6,14 @@ import asyncio
 import base64
 import binascii
 import copy
+import heapq
 import json
 import mimetypes
 import os
 import platform
 import re
 import select
+import signal
 import subprocess
 import threading
 import time
@@ -48,6 +50,112 @@ class AgyAuthError(AgyError):
 
 class AgyQuotaError(AgyError):
     """Raised when Gemini cannot answer because its usage quota is exhausted."""
+
+
+_AGY_PRIORITY_INTERACTIVE = 0
+_AGY_PRIORITY_NORMAL = 10
+_AGY_PRIORITY_BACKGROUND = 20
+_AGY_PRIORITY_NAMES = {
+    "interactive": _AGY_PRIORITY_INTERACTIVE,
+    "normal": _AGY_PRIORITY_NORMAL,
+    "background": _AGY_PRIORITY_BACKGROUND,
+}
+
+
+class _AgyPreempted(Exception):
+    """Internal signal used to restart background work after yielding the CLI."""
+
+
+class _PriorityTicket:
+    def __init__(
+        self,
+        *,
+        priority: int,
+        sequence: int,
+        ready: asyncio.Future[None],
+        preemptible: bool,
+    ) -> None:
+        self.priority = priority
+        self.sequence = sequence
+        self.ready = ready
+        self.preemptible = preemptible
+        self.preempt_requested = asyncio.Event()
+        self.granted = False
+        self.cancelled = False
+
+
+class _AgyPriorityDispatcher:
+    """A cancellable FIFO priority gate around the single safe CLI slot."""
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._lock: asyncio.Lock | None = None
+        self._queue: list[tuple[int, int, _PriorityTicket]] = []
+        self._active: _PriorityTicket | None = None
+        self._sequence = 0
+
+    def _lock_for_running_loop(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            if self._active is not None or self._queue:
+                raise RuntimeError("AgyModelClient cannot span active event loops")
+            self._loop = loop
+            self._lock = asyncio.Lock()
+        assert self._lock is not None
+        return self._lock
+
+    async def acquire(self, priority: int) -> _PriorityTicket:
+        lock = self._lock_for_running_loop()
+        loop = asyncio.get_running_loop()
+        self._sequence += 1
+        ticket = _PriorityTicket(
+            priority=priority,
+            sequence=self._sequence,
+            ready=loop.create_future(),
+            preemptible=priority >= _AGY_PRIORITY_BACKGROUND,
+        )
+        async with lock:
+            heapq.heappush(self._queue, (priority, ticket.sequence, ticket))
+            active = self._active
+            if (
+                priority <= _AGY_PRIORITY_INTERACTIVE
+                and active is not None
+                and active.preemptible
+            ):
+                active.preempt_requested.set()
+            self._grant_next_locked()
+        try:
+            await ticket.ready
+        except BaseException:
+            # A task cancelled while queued must not leave an unreachable heap
+            # entry. If cancellation races with a grant, hand the slot onward.
+            async with lock:
+                ticket.cancelled = True
+                if self._active is ticket:
+                    self._active = None
+                    self._grant_next_locked()
+            raise
+        return ticket
+
+    async def release(self, ticket: _PriorityTicket) -> None:
+        lock = self._lock_for_running_loop()
+        async with lock:
+            if self._active is not ticket:
+                return
+            self._active = None
+            self._grant_next_locked()
+
+    def _grant_next_locked(self) -> None:
+        if self._active is not None:
+            return
+        while self._queue:
+            _, _, ticket = heapq.heappop(self._queue)
+            if ticket.cancelled or ticket.ready.cancelled():
+                continue
+            ticket.granted = True
+            self._active = ticket
+            ticket.ready.set_result(None)
+            return
 
 
 def strip_ansi(text: str) -> str:
@@ -195,36 +303,241 @@ class _AgyResponses:
         self._client = client
 
     async def create(self, **request: Any) -> Any:
-        async with self._client._request_lock:
-            for attempt in range(self._client.auth_retries + 1):
-                try:
-                    return await self._create_once(request)
-                except AgyAuthError as exc:
-                    if attempt >= self._client.auth_retries:
-                        raise AgyAuthError(
-                            "agy не смог использовать сохранённый вход после "
-                            f"{attempt + 1} попыток. Закройте старые процессы agy, "
-                            "затем один раз запустите agy в обычном терминале."
-                        ) from exc
-                    await asyncio.sleep(
-                        self._client.auth_retry_delay_seconds * (attempt + 1)
+        request, priority, priority_name = self._extract_priority(request)
+        started_at = time.monotonic()
+        deadline = started_at + self._client.timeout_seconds
+        queue_wait_seconds = 0.0
+        model_seconds = 0.0
+        model_calls = 0
+        preemptions = 0
+
+        for attempt in range(self._client.auth_retries + 1):
+            try:
+                while True:
+                    queued_at = time.monotonic()
+                    ticket = await self._acquire_before_deadline(priority, deadline)
+                    queue_wait_seconds += time.monotonic() - queued_at
+                    model_started_at = time.monotonic()
+                    model_calls += 1
+                    try:
+                        remaining = self._remaining(deadline)
+                        if ticket.preemptible:
+                            operation = self._create_once(
+                                request,
+                                preempt_event=ticket.preempt_requested,
+                            )
+                        else:
+                            operation = self._create_once(request)
+                        try:
+                            response = await asyncio.wait_for(
+                                operation,
+                                timeout=remaining,
+                            )
+                        except TimeoutError as exc:
+                            raise self._overall_timeout_error() from exc
+                    except _AgyPreempted:
+                        preemptions += 1
+                        continue
+                    finally:
+                        model_seconds += time.monotonic() - model_started_at
+                        await self._client._request_dispatcher.release(ticket)
+
+                    return self._attach_timing(
+                        response,
+                        priority=priority_name,
+                        queue_wait_seconds=queue_wait_seconds,
+                        model_seconds=model_seconds,
+                        total_seconds=time.monotonic() - started_at,
+                        model_calls=model_calls,
+                        auth_retries=attempt,
+                        preemptions=preemptions,
                     )
+            except AgyAuthError as exc:
+                if attempt >= self._client.auth_retries:
+                    raise AgyAuthError(
+                        "agy не смог использовать сохранённый вход после "
+                        f"{attempt + 1} попыток. Закройте старые процессы agy, "
+                        "затем один раз запустите agy в обычном терминале."
+                    ) from exc
+                retry_delay = self._client.auth_retry_delay_seconds * (attempt + 1)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.sleep(retry_delay),
+                        timeout=self._remaining(deadline),
+                    )
+                except TimeoutError as timeout_exc:
+                    raise self._overall_timeout_error() from timeout_exc
         raise AssertionError("Недостижимое состояние повторов agy")
 
-    async def _create_once(self, request: dict[str, Any]) -> Any:
+    async def _acquire_before_deadline(
+        self,
+        priority: int,
+        deadline: float,
+    ) -> _PriorityTicket:
+        try:
+            return await asyncio.wait_for(
+                self._client._request_dispatcher.acquire(priority),
+                timeout=self._remaining(deadline),
+            )
+        except TimeoutError as exc:
+            raise self._overall_timeout_error() from exc
+
+    def _remaining(self, deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._overall_timeout_error()
+        return remaining
+
+    def _overall_timeout_error(self) -> AgyError:
+        return AgyError(
+            "Gemini request exceeded the overall "
+            f"{self._client.timeout_seconds}-second timeout"
+        )
+
+    @staticmethod
+    def _extract_priority(
+        request: dict[str, Any],
+    ) -> tuple[dict[str, Any], int, str]:
+        clean_request = dict(request)
+        raw_priority = clean_request.pop("agy_priority", None)
+        legacy_priority = clean_request.pop("_agy_priority", None)
+        if raw_priority is None:
+            raw_priority = legacy_priority
+
+        metadata = clean_request.get("metadata")
+        if isinstance(metadata, dict):
+            clean_metadata = dict(metadata)
+            metadata_priority = clean_metadata.pop("agy_priority", None)
+            milana_priority = clean_metadata.pop("milana_priority", None)
+            if raw_priority is None:
+                raw_priority = (
+                    metadata_priority
+                    if metadata_priority is not None
+                    else milana_priority
+                )
+            if clean_metadata:
+                clean_request["metadata"] = clean_metadata
+            else:
+                clean_request.pop("metadata", None)
+
+        if raw_priority is None:
+            return clean_request, _AGY_PRIORITY_NORMAL, "normal"
+        if isinstance(raw_priority, bool):
+            raise ValueError("agy_priority must be a priority name or integer")
+        if isinstance(raw_priority, int):
+            name = next(
+                (
+                    candidate
+                    for candidate, value in _AGY_PRIORITY_NAMES.items()
+                    if value == raw_priority
+                ),
+                str(raw_priority),
+            )
+            return clean_request, raw_priority, name
+        if isinstance(raw_priority, str):
+            normalized = raw_priority.strip().lower()
+            aliases = {
+                "high": "interactive",
+                "telegram": "interactive",
+                "default": "normal",
+                "low": "background",
+                "heartbeat": "background",
+                "summary": "background",
+            }
+            normalized = aliases.get(normalized, normalized)
+            if normalized in _AGY_PRIORITY_NAMES:
+                return clean_request, _AGY_PRIORITY_NAMES[normalized], normalized
+        raise ValueError(
+            "agy_priority must be interactive, normal, background, or an integer"
+        )
+
+    @staticmethod
+    def _attach_timing(
+        response: Any,
+        *,
+        priority: str,
+        queue_wait_seconds: float,
+        model_seconds: float,
+        total_seconds: float,
+        model_calls: int,
+        auth_retries: int,
+        preemptions: int,
+    ) -> Any:
+        timing = {
+            "priority": priority,
+            "queue_wait_ms": round(queue_wait_seconds * 1000, 3),
+            "model_ms": round(model_seconds * 1000, 3),
+            "total_ms": round(total_seconds * 1000, 3),
+            "model_calls": model_calls,
+            "auth_retries": auth_retries,
+            "preemptions": preemptions,
+        }
+        try:
+            response.agy_timing = timing
+            response.agy_queue_wait_ms = timing["queue_wait_ms"]
+            response.agy_model_ms = timing["model_ms"]
+            response.agy_total_ms = timing["total_ms"]
+            response.agy_model_calls = model_calls
+            response.agy_preemptions = preemptions
+        except (AttributeError, TypeError):
+            # Tests and lightweight callers may replace _create_once with a
+            # scalar result. The Responses-compatible object remains enriched.
+            pass
+        return response
+
+    async def _create_once(
+        self,
+        request: dict[str, Any],
+        *,
+        preempt_event: asyncio.Event | None = None,
+    ) -> Any:
         cancel_event = threading.Event()
         worker = asyncio.create_task(
             asyncio.to_thread(self._client._query, request, cancel_event)
         )
+        preempt_waiter: asyncio.Task[bool] | None = None
         try:
-            raw = await asyncio.shield(worker)
+            if preempt_event is None:
+                raw = await asyncio.shield(worker)
+            else:
+                preempt_waiter = asyncio.create_task(preempt_event.wait())
+                completed, _ = await asyncio.wait(
+                    {worker, preempt_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if worker in completed:
+                    raw = worker.result()
+                else:
+                    cancel_event.set()
+                    try:
+                        # Never open the dispatcher slot until the old CLI has
+                        # actually stopped. This preserves the single-process
+                        # OAuth safety invariant during cooperative preemption.
+                        await asyncio.shield(worker)
+                    except Exception:
+                        pass
+                    # Even a cooperative worker that exits cleanly produced a
+                    # response after yielding its slot; discard it and restart
+                    # the background request from a clean prompt/session.
+                    raise _AgyPreempted
         except asyncio.CancelledError:
             cancel_event.set()
             try:
-                await asyncio.wait_for(asyncio.shield(worker), timeout=3)
+                # The dispatcher owns a single real CLI process, not merely a
+                # Python task.  Do not release that slot until the worker has
+                # reaped the cancelled subprocess.
+                await asyncio.shield(worker)
             except Exception:  # noqa: BLE001 - preserve the caller's cancellation
                 pass
             raise
+        finally:
+            if preempt_waiter is not None:
+                if not preempt_waiter.done():
+                    preempt_waiter.cancel()
+                try:
+                    await preempt_waiter
+                except asyncio.CancelledError:
+                    pass
         format_name = ""
         if "text" in request:
             format_name = str(
@@ -365,7 +678,7 @@ class AgyModelClient:
         self.executable = executable
         self.auth_retries = auth_retries
         self.auth_retry_delay_seconds = float(auth_retry_delay_seconds)
-        self._request_lock = asyncio.Lock()
+        self._request_dispatcher = _AgyPriorityDispatcher()
         self.responses = _AgyResponses(self)
 
     @staticmethod
@@ -430,7 +743,7 @@ class AgyModelClient:
                         stop_on_structured_output=structured,
                     )
                 else:
-                    answer = self._run_direct(command, workspace)
+                    answer = self._run_direct(command, workspace, cancel_event)
                 log_error = self._agy_log_error(workspace / "agy.log")
             except FileNotFoundError as exc:
                 raise AgyError(
@@ -884,32 +1197,220 @@ class AgyModelClient:
         """Backward-compatible wrapper around the generalized media materializer."""
         return self._materialize_media(value, workspace, image_counter)
 
-    def _run_direct(self, command: list[str], workspace: Path) -> str:
-        completed = subprocess.run(
+    def _run_direct(
+        self,
+        command: list[str],
+        workspace: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        popen_kwargs = hidden_subprocess_kwargs()
+        if platform.system() != "Windows":
+            # A separate process group lets cancellation reap helper children
+            # created by the CLI as well as the top-level executable.
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(
             command,
             cwd=workspace,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=self.timeout_seconds + 10,
             stdin=subprocess.DEVNULL,
-            **hidden_subprocess_kwargs(),
+            **popen_kwargs,
         )
-        if completed.returncode != 0:
-            details = self._safe_error_details(completed.stderr or completed.stdout)
+        deadline = time.monotonic() + self.timeout_seconds + 10
+        stdout = ""
+        stderr = ""
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                self._terminate_direct_process(process)
+                raise AgyError("Запрос Gemini отменён")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate_direct_process(process)
+                raise subprocess.TimeoutExpired(command, self.timeout_seconds)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        if process.returncode != 0:
+            details = self._safe_error_details(stderr or stdout)
             error_type = self._error_type(details)
             raise error_type(
-                f"agy завершился с кодом {completed.returncode}: "
+                f"agy завершился с кодом {process.returncode}: "
                 f"{details or 'без текста ошибки'}"
             )
-        return completed.stdout or ""
+        return stdout or ""
+
+    @staticmethod
+    def _terminate_direct_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        windows_tree_killed = False
+        try:
+            if platform.system() == "Windows":
+                # agy.exe is a launcher and can leave the real Gemini/Node child
+                # alive after terminating only its wrapper PID.  /T is the
+                # Windows process-tree primitive; do not release the dispatcher
+                # slot until the whole tree has been asked to exit and reaped.
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2.0,
+                    check=False,
+                    **hidden_subprocess_kwargs(),
+                )
+                windows_tree_killed = completed.returncode == 0
+                # Some taskkill builds can terminate the wrapper yet miss a
+                # just-spawned detached helper.  Sweep the Windows process
+                # snapshot as a second, independent tree-kill mechanism.
+                AgyModelClient._terminate_windows_descendants(process.pid)
+                if not windows_tree_killed:
+                    process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError, subprocess.SubprocessError):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=0.75)
+        except subprocess.TimeoutExpired:
+            try:
+                if platform.system() == "Windows":
+                    # taskkill may report success slightly before Popen observes
+                    # the wrapper exit; killing the handle is a final local
+                    # fallback and does not replace the preceding tree kill.
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=0.75)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            process.communicate(timeout=0.25)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+
+    @staticmethod
+    def _terminate_windows_descendants(root_pid: int) -> None:
+        """Best-effort descendant sweep for launchers that escape taskkill /T."""
+
+        if platform.system() != "Windows":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class ProcessEntry32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateToolhelp32Snapshot.argtypes = [
+                wintypes.DWORD,
+                wintypes.DWORD,
+            ]
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.Process32FirstW.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ProcessEntry32W),
+            ]
+            kernel32.Process32FirstW.restype = wintypes.BOOL
+            kernel32.Process32NextW.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(ProcessEntry32W),
+            ]
+            kernel32.Process32NextW.restype = wintypes.BOOL
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel32.TerminateProcess.restype = wintypes.BOOL
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+            invalid_handle = ctypes.c_void_p(-1).value
+            if snapshot in (None, 0, invalid_handle):
+                return
+            parent_by_pid: dict[int, int] = {}
+            entry = ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            try:
+                available = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+                while available:
+                    parent_by_pid[int(entry.th32ProcessID)] = int(
+                        entry.th32ParentProcessID
+                    )
+                    available = bool(
+                        kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+                    )
+            finally:
+                kernel32.CloseHandle(snapshot)
+
+            depths: dict[int, int] = {}
+            frontier = {int(root_pid)}
+            depth = 1
+            while frontier:
+                next_frontier: set[int] = set()
+                for pid, parent_pid in parent_by_pid.items():
+                    if parent_pid in frontier and pid not in depths and pid != root_pid:
+                        depths[pid] = depth
+                        next_frontier.add(pid)
+                frontier = next_frontier
+                depth += 1
+
+            process_access = 0x0001 | 0x00100000  # TERMINATE | SYNCHRONIZE
+            for pid, _ in sorted(
+                depths.items(), key=lambda item: item[1], reverse=True
+            ):
+                handle = kernel32.OpenProcess(process_access, False, pid)
+                if not handle:
+                    continue
+                try:
+                    kernel32.TerminateProcess(handle, 1)
+                    kernel32.WaitForSingleObject(handle, 500)
+                finally:
+                    kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, TypeError, ValueError):
+            # Cancellation must still fall back to terminating the wrapper.
+            return
 
     @staticmethod
     def _terminate_pty(process: Any) -> None:
         try:
             if process.pty.isalive():
                 process.terminate(force=True)
+                pid = getattr(process, "pid", None)
+                if isinstance(pid, int) and not isinstance(pid, bool):
+                    AgyModelClient._terminate_windows_descendants(pid)
         except (AttributeError, OSError, TypeError):
             pass
 
@@ -1014,7 +1515,7 @@ class AgyModelClient:
         try:
             from winpty import PtyProcess
         except ImportError:
-            return self._run_direct(command, workspace)
+            return self._run_direct(command, workspace, cancel_event)
 
         # Force native ConPTY.  pywinpty's legacy WinPTY fallback creates a
         # regular conhost window for every model round, which visibly flashes

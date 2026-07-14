@@ -31,6 +31,7 @@ from telegram_client import (
     GeminiQuotaFallbackClient,
     GeneratedReply,
     MessageFlowConfig,
+    TelegramFastPathConfig,
     MilanaMessageResponder,
     MilanaPresenceController,
     MilanaInitiativeReflector,
@@ -48,6 +49,7 @@ from telegram_client import (
     load_ai_settings,
     load_llm_choice,
     load_message_flow_config,
+    load_telegram_fast_path_config,
     message_text,
     normalize_target,
     positive_int,
@@ -362,6 +364,25 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertEqual(config.api_key, "")
         self.assertEqual(config.openai_fallback_model, "openai-model-from-config")
 
+    def test_ai_config_preserves_legacy_positional_provider_fields(self) -> None:
+        flow = MessageFlowConfig(input_quiet_seconds=0.25)
+
+        config = AIConfig(
+            "key",
+            "gemini-3.5-flash",
+            "instructions",
+            0.2,
+            500,
+            flow,
+            "gemini",
+            "gpt-fallback",
+        )
+
+        self.assertIs(config.message_flow, flow)
+        self.assertEqual(config.provider, "gemini")
+        self.assertEqual(config.openai_fallback_model, "gpt-fallback")
+        self.assertIsInstance(config.telegram_fast_path, TelegramFastPathConfig)
+
     def test_max_output_tokens_must_be_an_integer(self) -> None:
         with self.assertRaisesRegex(ValueError, "целым числом"):
             ai_positive_int({"max_output_tokens": 1.5}, "max_output_tokens", 1200)
@@ -414,6 +435,48 @@ class SplitTelegramTextTests(unittest.TestCase):
         for settings in invalid_settings:
             with self.subTest(settings=settings), self.assertRaises(ValueError):
                 load_message_flow_config(settings)
+
+    def test_telegram_fast_path_config_defaults_budgets_and_validation(self) -> None:
+        self.assertEqual(
+            load_telegram_fast_path_config({}),
+            TelegramFastPathConfig(),
+        )
+        configured = load_telegram_fast_path_config(
+            {
+                "telegram_fast_path": {
+                    "enabled": False,
+                    "dev_chat_only": False,
+                    "target_first_send_seconds": 8,
+                    "max_output_tokens": 400,
+                    "max_reply_messages": 1,
+                    "recent_messages": 12,
+                    "history_max_characters": 6000,
+                    "summary_max_characters": 1000,
+                    "metrics_window": 200,
+                    "cosmetic_timeout_seconds": 0.25,
+                }
+            }
+        )
+        self.assertFalse(configured.enabled)
+        self.assertFalse(configured.dev_chat_only)
+        self.assertEqual(configured.recent_messages, 12)
+        self.assertEqual(configured.history_max_characters, 6000)
+
+        invalid_values = (
+            [],
+            {"unknown": 1},
+            {"enabled": "yes"},
+            {"dev_chat_only": "yes"},
+            {"target_first_send_seconds": 0},
+            {"max_output_tokens": True},
+            {"recent_messages": 0},
+            {"history_max_characters": 0},
+            {"cosmetic_timeout_seconds": 11},
+        )
+        for value in invalid_values:
+            settings = {"telegram_fast_path": value}
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                load_telegram_fast_path_config(settings)
 
     def test_env_loader_handles_comments_quotes_and_does_not_override_environment(self) -> None:
         with TemporaryDirectory() as directory:
@@ -648,6 +711,37 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual(rendered_frames, [4])
 
+    def test_webm_renderer_uses_managed_subprocess_pipes(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            self.skipTest(f"optional sticker renderer is not installed: {exc}")
+
+        encoded = io.BytesIO()
+        Image.new("RGBA", (2, 2), (255, 0, 0, 0)).save(encoded, format="PNG")
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=encoded.getvalue(),
+            stderr=b"",
+        )
+
+        with (
+            patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="ffmpeg-test"),
+            patch("telegram_client.subprocess.run", return_value=completed) as run,
+        ):
+            png = render_sticker_png(b"webm-data", "video/webm")
+
+        command = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        self.assertEqual(command[0], "ffmpeg-test")
+        self.assertEqual(command[-1], "-")
+        self.assertIn("image2pipe", command)
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertFalse(kwargs["check"])
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+
     def test_webm_renderer_preserves_vp9_alpha(self) -> None:
         try:
             from imageio_ffmpeg import write_frames
@@ -857,7 +951,7 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [call(latest_at), call(manual_at)],
         )
 
-    async def test_gemini_runtime_wraps_agy_with_openai_quota_fallback(self) -> None:
+    async def test_gemini_runtime_uses_agy_without_provider_fallback(self) -> None:
         client = MagicMock()
         client.get_me = AsyncMock(return_value=SimpleNamespace(username="milana", id=1))
         client.run_until_disconnected = AsyncMock()
@@ -873,7 +967,6 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         routine = load_routine()
         agy_client = MagicMock()
-        openai_client = MagicMock()
         memory = MagicMock()
         presence = MagicMock()
         presence.run = AsyncMock()
@@ -885,9 +978,7 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             patch("telegram_client.load_ai_config", return_value=config),
             patch("telegram_client.load_routine", return_value=routine),
             patch("telegram_client.AgyModelClient", return_value=agy_client) as agy_type,
-            patch(
-                "telegram_client.AsyncOpenAI", return_value=openai_client
-            ) as openai_type,
+            patch("telegram_client.AsyncOpenAI") as openai_type,
             patch("telegram_client.MilanaMemoryStore", return_value=memory),
             patch(
                 "telegram_client.MilanaPresenceController", return_value=presence
@@ -900,12 +991,9 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await run_ai_bot(client, dev_chat=True)
 
         agy_type.assert_called_once_with(model="gemini-3.5-flash")
-        openai_type.assert_called_once_with(api_key="test-openai-key")
+        openai_type.assert_not_called()
         model_client = responder_type.call_args.args[1]
-        self.assertIsInstance(model_client, GeminiQuotaFallbackClient)
-        self.assertIs(model_client.gemini_client, agy_client)
-        self.assertIs(model_client.openai_client, openai_client)
-        self.assertEqual(model_client.openai_model, "gpt-fallback")
+        self.assertIs(model_client, agy_client)
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
 

@@ -7,8 +7,10 @@ the service validates the state's revision and commits the complete turn.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Protocol
@@ -53,15 +55,22 @@ class StagedTurn:
     def action_key(self, suffix: str) -> str:
         """Return a retry-stable key for one logical action.
 
-        Regenerating an unread Telegram notice gets a fresh turn ID, but it is
-        still the same input.  Basing the key on its immutable notice IDs lets
-        the host suppress a duplicate whose first response was lost.
+        Regenerating an unread Telegram notice or retrying one persisted
+        heartbeat job gets a fresh turn ID, but it is still the same logical
+        input. Immutable notice IDs take precedence; no-notice turns use the
+        service-provided logical action scope.
         """
 
         metadata = getattr(self.trigger, "metadata", {})
         raw_ids = metadata.get("notice_ids", ()) if isinstance(metadata, Mapping) else ()
         notice_ids = (
-            tuple(item for item in raw_ids if isinstance(item, str) and item)
+            tuple(
+                sorted(
+                    dict.fromkeys(
+                        item for item in raw_ids if isinstance(item, str) and item
+                    )
+                )
+            )
             if isinstance(raw_ids, (list, tuple))
             else ()
         )
@@ -69,20 +78,118 @@ class StagedTurn:
             digest = hashlib.sha256("\x1f".join(notice_ids).encode("utf-8")).hexdigest()[:24]
             scope = f"notices:{digest}"
         else:
-            scope = f"turn:{self.turn_id}"
+            raw_logical_scope = (
+                metadata.get("_logical_action_scope")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            if raw_logical_scope is not None:
+                if (
+                    not isinstance(raw_logical_scope, str)
+                    or not raw_logical_scope.strip()
+                    or len(raw_logical_scope) > 512
+                ):
+                    raise ValueError(
+                        "Logical action scope must be a non-empty bounded string"
+                    )
+                digest = hashlib.sha256(
+                    raw_logical_scope.strip().encode("utf-8")
+                ).hexdigest()[:24]
+                scope = f"logical:{digest}"
+            else:
+                scope = f"turn:{self.turn_id}"
         clean_suffix = str(suffix).strip().replace(" ", "-")
         if not clean_suffix:
             raise ValueError("Action idempotency suffix cannot be empty")
         return f"{scope}:{clean_suffix}"
 
     def add_action(self, kind: str, payload: Mapping[str, Any]) -> StagedAction:
+        semantic = self._semantic_action(kind, payload)
+        canonical = json.dumps(
+            semantic,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+        occurrence = sum(
+            1
+            for existing in self.actions
+            if existing.kind == kind
+            and json.dumps(
+                self._semantic_action(existing.kind, existing.payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            == canonical
+        )
         action = StagedAction(
             kind=kind,
             payload=dict(payload),
-            idempotency_key=self.action_key(f"{len(self.actions)}:{kind}"),
+            idempotency_key=self.action_key(
+                f"action:{kind}:{digest}:{occurrence}"
+            ),
         )
         self.actions.append(action)
         return action
+
+    @staticmethod
+    def _semantic_action(kind: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Keep retry identity independent from capabilities and wall-clock time."""
+
+        target = payload.get("target")
+        target_ref = payload.get("target_ref")
+        if target_ref is None and isinstance(target, Mapping):
+            target_ref = target.get("target_ref")
+        if isinstance(target_ref, (str, int)) and not isinstance(target_ref, bool):
+            target_ref = str(target_ref)
+        else:
+            target_ref = None
+
+        if kind == "write_diary":
+            return {"kind": kind, "entry": payload.get("entry")}
+        if kind == "schedule_wakeup":
+            return {
+                "kind": kind,
+                "delay_seconds": payload.get("delay_seconds"),
+                "reason": payload.get("reason"),
+            }
+        if kind == "schedule_message":
+            return {
+                "kind": kind,
+                "target_ref": target_ref,
+                "delay_seconds": payload.get("delay_seconds"),
+                "message": payload.get("message"),
+            }
+        if kind in {"send_sticker", "schedule_sticker"}:
+            raw_sticker = payload.get("sticker")
+            if isinstance(raw_sticker, Mapping):
+                stable_fields = (
+                    "set_id",
+                    "set_access_hash",
+                    "set_short_name",
+                    "document_id",
+                    "pack_title",
+                    "emoji",
+                    "sticker_id",
+                )
+                sticker: Any = {
+                    field: raw_sticker[field]
+                    for field in stable_fields
+                    if field in raw_sticker
+                }
+            else:
+                sticker = payload.get("sticker_id")
+            identity: dict[str, Any] = {
+                "kind": kind,
+                "target_ref": target_ref,
+                "sticker": sticker,
+            }
+            if kind == "schedule_sticker":
+                identity["delay_seconds"] = payload.get("delay_seconds")
+            return identity
+        raise ValueError(f"Unknown staged action: {kind}")
 
     def register_target(self, token: str, target: Mapping[str, Any]) -> None:
         if not isinstance(token, str) or not token.strip():
@@ -209,7 +316,11 @@ class CoreSkillExecutor:
             due_at = self._now() + timedelta(seconds=delay)
             action = stage.add_action(
                 "schedule_wakeup",
-                {"due_at": due_at.isoformat(), "reason": reason.strip()},
+                {
+                    "due_at": due_at.isoformat(),
+                    "delay_seconds": delay,
+                    "reason": reason.strip(),
+                },
             )
             return ToolResult.success(
                 call,
@@ -239,6 +350,7 @@ class TelegramSkillExecutor:
         self.staging = staging
         self.gateway = gateway
         self.context_enricher = context_enricher
+        self._typing_tasks: set[asyncio.Task[None]] = set()
 
     async def activate(self, _spec: Any, session: SkillSession) -> Mapping[str, Any]:
         stage = self.staging.get(session.turn_id)
@@ -246,11 +358,22 @@ class TelegramSkillExecutor:
         payload = {
             "turn_id": stage.turn_id,
             "trigger": trigger.model_payload(),
+            # Incoming notices already have a durable, bounded local context.
+            # Initiative turns still need host-side history discovery.
+            "include_history": trigger.kind != "telegram_notice",
         }
         metadata = getattr(trigger, "metadata", {})
-        notice_ids = metadata.get("notice_ids", []) if isinstance(metadata, Mapping) else []
-        if notice_ids:
-            payload["notice_ids"] = list(notice_ids)
+        raw_notice_ids = (
+            metadata.get("notice_ids", []) if isinstance(metadata, Mapping) else []
+        )
+        notice_ids = (
+            [item for item in raw_notice_ids if isinstance(item, str) and item]
+            if isinstance(raw_notice_ids, (list, tuple))
+            else []
+        )
+        # The host contract requires an array even for target-ref initiative
+        # turns where there is no incoming notice.
+        payload["notice_ids"] = notice_ids
         target_ref = (
             metadata.get("_telegram_target_ref")
             if isinstance(metadata, Mapping)
@@ -265,19 +388,10 @@ class TelegramSkillExecutor:
         self._register_targets(stage, context)
         target_token = context.get("target_token")
         if isinstance(target_token, str):
-            try:
-                await self.gateway.request(
-                    "telegram.execute",
-                    {
-                        "turn_id": stage.turn_id,
-                        "target_token": target_token,
-                        "action": "typing",
-                        "arguments": {"active": True},
-                    },
-                    timeout=10.0,
-                )
-            except Exception:  # noqa: BLE001 - presence is best-effort
-                pass
+            self._start_typing(stage.turn_id, target_token)
+            # Give the best-effort task one scheduling turn so the typing RPC
+            # starts promptly, without awaiting its network completion.
+            await asyncio.sleep(0)
         if self.context_enricher is not None:
             extra = self.context_enricher(stage, context)
             if inspect.isawaitable(extra):
@@ -289,6 +403,44 @@ class TelegramSkillExecutor:
                     raise ValueError(f"Telegram context enricher repeated field {key!r}")
                 context[str(key)] = value
         return context
+
+    def _start_typing(self, turn_id: str, target_token: str) -> None:
+        task = asyncio.create_task(
+            self._typing_request(turn_id, target_token),
+            name=f"milana-telegram-typing:{turn_id}",
+        )
+        self._typing_tasks.add(task)
+        task.add_done_callback(self._typing_tasks.discard)
+        task.add_done_callback(self._consume_typing_result)
+
+    async def _typing_request(self, turn_id: str, target_token: str) -> None:
+        try:
+            async with asyncio.timeout(0.5):
+                await self.gateway.request(
+                    "telegram.execute",
+                    {
+                        "turn_id": turn_id,
+                        "target_token": target_token,
+                        "action": "typing",
+                        "arguments": {"active": True},
+                    },
+                    timeout=0.5,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Typing is cosmetic.  Timeout, cancellation, or host failure must
+            # never delay or fail response generation.
+            pass
+
+    @staticmethod
+    def _consume_typing_result(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:
+            pass
 
     @staticmethod
     def _register_targets(stage: StagedTurn, context: Mapping[str, Any]) -> None:
@@ -381,6 +533,7 @@ class StickerSkillExecutor:
             "target_token": token,
             "target": dict(target),
             "sticker_id": sticker_id,
+            "sticker": dict(reference),
         }
         if call.name == "schedule_sticker":
             delay = args["delay_seconds"]

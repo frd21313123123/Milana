@@ -45,6 +45,34 @@ class HeartbeatSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(delay, MIN_HEARTBEAT_INTERVAL_SECONDS)
         self.assertLessEqual(delay, MAX_HEARTBEAT_INTERVAL_SECONDS)
 
+    async def test_random_retry_retains_original_logical_identity(self) -> None:
+        triggers = []
+
+        async def fail_once(trigger):
+            triggers.append(trigger)
+            if len(triggers) == 1:
+                raise RuntimeError("first attempt failed")
+
+        scheduled_at = NOW - timedelta(seconds=1)
+        self.store.set_next_heartbeat(scheduled_at, at=NOW)
+        heartbeat = MilanaHeartbeat(
+            self.store,
+            fail_once,
+            now=lambda: self.clock[0],
+            randint=lambda low, high: low,
+        )
+
+        self.assertEqual(await heartbeat.run_once(), 0)
+        self.clock[0] += timedelta(seconds=5)
+        self.assertEqual(await heartbeat.run_once(), 1)
+
+        self.assertEqual(len(triggers), 2)
+        self.assertEqual(triggers[0].logical_id, triggers[1].logical_id)
+        self.assertEqual(
+            triggers[0].logical_id,
+            "random-heartbeat:" + scheduled_at.isoformat(),
+        )
+
     async def test_pause_blocks_reflection_but_not_manual_wake(self) -> None:
         self.store.set_next_heartbeat(NOW - timedelta(seconds=1), at=NOW)
         heartbeat = self.scheduler()
