@@ -1,0 +1,9 @@
+{
+  "id": "telegram.stickers",
+  "version": "1.0.0",
+  "title": "Стикеры Telegram",
+  "summary": "Просматривать установленные наборы и выбирать показанный стикер для отправки сейчас или позже.",
+  "parent": "telegram",
+  "instructions": "instructions.md",
+  "children": []
+}

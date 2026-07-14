@@ -4384,6 +4384,13 @@ def main() -> int:
         sys.stderr.reconfigure(encoding="utf-8")
 
     args = build_parser().parse_args()
+    if args.command == "ai-bot":
+        # CLI compatibility alias: tests and importers may still call run()
+        # directly, while the user-facing command starts the standalone owner.
+        from milana_service import main as milana_service_main
+
+        forwarded = ["--dev-chat"] if args.dev_chat else []
+        return milana_service_main(forwarded)
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:

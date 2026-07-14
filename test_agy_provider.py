@@ -20,6 +20,8 @@ from agy_provider import (
     AgyQuotaError,
     strip_ansi,
 )
+from milana.builtin_skills import SCHEDULE_MESSAGE_TOOL
+from milana.session import WRITE_DIARY_TOOL
 from milana_stickers import OPEN_STICKER_PICKER_TOOL, SEND_STICKER_TOOL
 
 
@@ -548,6 +550,39 @@ class AgyModelClientTests(unittest.TestCase):
         self.assertIn("diary_entries", response_schema["required"])
         self.assertIn("diary_entries", payload["instructions"])
 
+    def test_milana_agent_turn_uses_only_universal_tool_calls(self) -> None:
+        client = AgyModelClient()
+        request = {
+            "instructions": "Системная инструкция",
+            "input": [],
+            "tools": [
+                WRITE_DIARY_TOOL,
+                SCHEDULE_MESSAGE_TOOL,
+                OPEN_STICKER_PICKER_TOOL,
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "milana_agent_turn",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"state_update": {"type": "object"}},
+                        "required": ["state_update"],
+                    },
+                }
+            },
+        }
+
+        with TemporaryDirectory() as directory:
+            payload = client._request_payload(request, Path(directory))
+
+        properties = payload["response_format"]["schema"]["properties"]
+        self.assertIn("tool_calls", properties)
+        self.assertNotIn("diary_entries", properties)
+        self.assertNotIn("scheduled_messages", properties)
+        self.assertNotIn("sticker_actions", properties)
+
     @staticmethod
     def _fake_winpty_module(process: SimpleNamespace) -> tuple[Any, MagicMock]:
         spawn = MagicMock(return_value=process)
@@ -947,6 +982,104 @@ class AgyResponsesTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AgyStickerActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_milana_agent_tool_step_excludes_final_and_legacy_channels(self) -> None:
+        client = AgyModelClient()
+        client._query = MagicMock(  # type: ignore[method-assign]
+            return_value=json.dumps(
+                {
+                    "state_update": {},
+                    "entity_updates": [],
+                    "life_events": [],
+                    "goal_updates": [],
+                    "relationship_updates": [],
+                    "tool_calls": [
+                        {
+                            "name": "write_diary",
+                            "arguments_json": json.dumps(
+                                {"entry": "важная мысль"}, ensure_ascii=False
+                            ),
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        response = await client.responses.create(
+            input=[],
+            tools=[],
+            text={
+                "format": {
+                    "name": "milana_agent_turn",
+                    "schema": {"type": "object", "properties": {}},
+                }
+            },
+        )
+
+        self.assertEqual(response.output_text, "")
+        self.assertEqual(response.agy_tool_calls[0]["name"], "write_diary")
+        self.assertEqual(response.agy_diary_entries, ())
+        self.assertEqual(response.agy_scheduled_messages, ())
+        self.assertEqual(response.agy_sticker_actions, ())
+
+    async def test_generic_tool_calls_are_exposed_and_keep_legacy_bridge(self) -> None:
+        client = AgyModelClient()
+        client._query = MagicMock(  # type: ignore[method-assign]
+            return_value=json.dumps(
+                {
+                    "messages": [],
+                    "reaction": None,
+                    "blacklist_sender": False,
+                    "tool_calls": [
+                        {
+                            "name": "open_skill",
+                            "arguments_json": json.dumps(
+                                {"path": "telegram"}, ensure_ascii=False
+                            ),
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        open_skill = {
+            "type": "function",
+            "name": "open_skill",
+            "description": "Открыть навык",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        }
+        response = await client.responses.create(
+            input=[],
+            tools=[open_skill],
+            text={
+                "format": {
+                    "name": "milana_turn",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"messages": {"type": "array"}},
+                        "required": ["messages"],
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(
+            response.agy_tool_calls,
+            (
+                {
+                    "name": "open_skill",
+                    "arguments_json": '{"path": "telegram"}',
+                },
+            ),
+        )
+        self.assertNotIn("tool_calls", response.output_text)
+
     async def test_sticker_actions_are_extracted_from_structured_result(self) -> None:
         client = AgyModelClient()
         client._query = MagicMock(  # type: ignore[method-assign]

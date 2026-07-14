@@ -1,0 +1,11 @@
+{
+  "id": "telegram",
+  "version": "1.0.0",
+  "title": "Telegram",
+  "summary": "Читать переписки, отвечать, ставить реакции и планировать сообщения в Telegram.",
+  "parent": null,
+  "instructions": "instructions.md",
+  "children": [
+    "telegram.stickers"
+  ]
+}

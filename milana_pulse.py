@@ -79,7 +79,7 @@ def validate_scheduled_message(delay_seconds: Any, message: Any) -> StagedSchedu
     return StagedScheduledMessage(delay_seconds, clean_message)
 
 
-class MilanaPulse:
+class DelayedActionDispatcher:
     """Wake near the next due action and retry temporary delivery failures."""
 
     def __init__(
@@ -117,12 +117,23 @@ class MilanaPulse:
                 # The lease lets another process recover the task after a crash/restart.
                 raise
             except Exception as exc:  # noqa: BLE001 - each task owns its retry state
-                retry_delay = min(5 * (2 ** max(0, task.attempts - 1)), 300)
+                retry_delay = min(
+                    5 * (2 ** min(max(0, task.attempts - 1), 6)),
+                    300,
+                )
+                # A promised send must wait for Telegram to reconnect.  Keep
+                # malformed/non-retryable actions bounded, but do not turn a
+                # prolonged transport outage into a permanently failed promise.
+                retry_limit = (
+                    2_147_483_647
+                    if isinstance(exc, (ConnectionError, TimeoutError, OSError))
+                    else self.max_attempts
+                )
                 self.memory.retry_pulse_task(
                     task.id,
                     error=f"{type(exc).__name__}: {exc}",
                     retry_at=self._now() + timedelta(seconds=retry_delay),
-                    max_attempts=self.max_attempts,
+                    max_attempts=retry_limit,
                 )
             else:
                 self.memory.complete_pulse_task(task.id, completed_at=self._now())
@@ -145,3 +156,8 @@ class MilanaPulse:
                 await asyncio.wait_for(self._changed.wait(), timeout=timeout)
             except TimeoutError:
                 pass
+
+
+# Backward-compatible public name.  The old "pulse" is a durable delayed-action
+# dispatcher; Milana's autonomous heartbeat lives in ``milana_heartbeat.py``.
+MilanaPulse = DelayedActionDispatcher

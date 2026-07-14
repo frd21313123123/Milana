@@ -16,15 +16,16 @@ import sys
 import threading
 import time
 import webbrowser
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 # --- пути (как в bot_control.bat) ---
 BASE_DIR = Path(__file__).resolve().parent
 PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
-SCRIPT = BASE_DIR / "telegram_client.py"
+SCRIPT = BASE_DIR / "milana_service.py"
 SCHEDULE_SCRIPT = BASE_DIR / "milana_schedule.py"
 PID_FILE = BASE_DIR / "bot.pid"
 MODE_FILE = BASE_DIR / "bot.mode"
@@ -36,6 +37,27 @@ BAT_FILE = BASE_DIR / "bot_control.bat"
 PS = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
 
 PORT = 8765
+
+StatusProvider = Callable[[], Mapping[str, Any]]
+ActionCallback = Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class WebPanelContext:
+    """Dependencies owned by the process embedding the local panel.
+
+    ``state_store`` is intentionally read-only from this module's point of
+    view.  State-changing requests are routed through callbacks supplied by
+    ``MilanaService``, so a standalone panel can never become a second SQLite
+    writer.
+    """
+
+    state_store: Any | None = None
+    callbacks: Mapping[str, ActionCallback] | None = None
+    status_provider: StatusProvider | None = None
+
+    def callback(self, name: str) -> ActionCallback | None:
+        return (self.callbacks or {}).get(name)
 
 # --- утилиты ---
 def _read_text(path: Path) -> str | None:
@@ -93,6 +115,8 @@ def is_pid_running(pid: int) -> bool:
 
 
 def find_bot_pids() -> list[int]:
+    """Return MilanaService PIDs (the Telegram host is reported separately)."""
+
     pids: list[int] = []
 
     # 1. Сохранённый PID
@@ -107,8 +131,8 @@ def find_bot_pids() -> list[int]:
         ps_query = (
             "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; "
             "foreach ($p in $processes) { "
-            "if ($p.CommandLine -and $p.CommandLine -match '(?i)telegram_client\\.py' "
-            "-and $p.CommandLine -match '(?i)ai-bot') { $p.ProcessId } }"
+            "if ($p.CommandLine -and $p.CommandLine -match '(?i)milana_service\\.py') "
+            "{ $p.ProcessId } }"
         )
         raw = _run_ps(ps_query)
         for tok in raw.split():
@@ -119,6 +143,26 @@ def find_bot_pids() -> list[int]:
                     pids.append(pid)
 
     return pids
+
+
+def find_telegram_host_pids() -> list[int]:
+    """Discover dependent Telegram skill-host processes for diagnostics."""
+
+    ps_query = (
+        "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; "
+        "foreach ($p in $processes) { if ($p.CommandLine -and "
+        "($p.CommandLine -match '(?i)telegram_skill_host\\.py' -or "
+        "$p.CommandLine -match '(?i)telegram_host\\.py' -or "
+        "($p.CommandLine -match '(?i)telegram_client\\.py' -and "
+        "$p.CommandLine -match '(?i)skill-host'))) { $p.ProcessId } }"
+    )
+    result: list[int] = []
+    for token in _run_ps(ps_query).split():
+        if token.isdigit():
+            pid = int(token)
+            if pid not in result and is_pid_running(pid):
+                result.append(pid)
+    return result
 
 
 def get_llm_choice() -> str:
@@ -290,7 +334,41 @@ def do_set_model(choice: str) -> dict[str, Any]:
 
 
 # --- сбор полного статуса ---
-def collect_status() -> dict[str, Any]:
+def _json_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if is_dataclass(value):
+        return _json_value(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _rich_state(state_store: Any | None) -> dict[str, Any] | None:
+    if state_store is None:
+        return None
+    state = state_store.get_agent_state()
+    return {
+        "state": _json_value(state),
+        "needs": state.needs,
+        "goals": _json_value(state_store.list_goals(statuses=None, limit=100)),
+        "events": _json_value(
+            state_store.list_life_events(include_archived=True, limit=100)
+        ),
+        "entities": _json_value(
+            state_store.list_entities(include_archived=True, limit=100)
+        ),
+        "relationships": _json_value(state_store.list_relationships(limit=100)),
+        "heartbeat_jobs": _json_value(
+            state_store.list_heartbeat_jobs(limit=50)
+        ),
+        "skill_audit": _json_value(state_store.list_skill_audit(limit=50)),
+    }
+
+
+def collect_status(context: WebPanelContext | None = None) -> dict[str, Any]:
     pids = find_bot_pids()
     running = bool(pids)
     mode = resolve_mode(pids) if running else "OFF"
@@ -313,7 +391,7 @@ def collect_status() -> dict[str, Any]:
 
     status_text = "ЗАПУЩЕНА" if running else "НЕ ЗАПУЩЕНА"
 
-    return {
+    result = {
         "running": running,
         "status_text": status_text,
         "pids": pids,
@@ -327,7 +405,21 @@ def collect_status() -> dict[str, Any]:
             "errors": err_tail,
         },
         "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "telegram_host_pids": find_telegram_host_pids(),
     }
+    if context is not None:
+        try:
+            result["life"] = _rich_state(context.state_store)
+        except Exception as exc:  # panel diagnostics must not take down status
+            result["life_error"] = f"{type(exc).__name__}: {exc}"
+        if context.status_provider is not None:
+            try:
+                supplied = context.status_provider()
+                if isinstance(supplied, Mapping):
+                    result["service"] = _json_value(supplied)
+            except Exception as exc:
+                result["service_error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 def collect_logs() -> dict[str, Any]:
@@ -537,6 +629,20 @@ INDEX_HTML = """<!DOCTYPE html>
           Загрузка...
         </div>
       </div>
+    </div>
+
+    <!-- Logs -->
+    <div class="mb-6">
+      <div class="flex items-center justify-between mb-2 px-1">
+        <div class="section-title">Жизнь, heartbeat и навыки</div>
+        <div class="flex gap-2">
+          <button onclick="performAction('/api/heartbeat/pause')" class="text-xs px-3 py-1 bg-slate-800 rounded-xl">Пауза</button>
+          <button onclick="performAction('/api/heartbeat/resume')" class="text-xs px-3 py-1 bg-slate-800 rounded-xl">Продолжить</button>
+          <button onclick="performAction('/api/heartbeat/wake')" class="text-xs px-3 py-1 bg-violet-700 rounded-xl">Разбудить</button>
+        </div>
+      </div>
+      <pre id="life-state" class="log-pre bg-slate-900 border border-slate-800 text-slate-300 p-4 rounded-2xl max-h-80 overflow-auto">Загрузка...</pre>
+      <div id="life-archive-actions" class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2"></div>
     </div>
 
     <!-- Logs -->
@@ -772,6 +878,49 @@ INDEX_HTML = """<!DOCTYPE html>
       if (schedTime) schedTime.textContent = sched.day ? `${sched.day} • ${sched.time || ''}` : '';
       
       renderMetrics(sched.metrics);
+
+      const lifeEl = document.getElementById('life-state');
+      if (lifeEl) {
+        const life = data.life;
+        if (!life) {
+          lifeEl.textContent = data.life_error || 'Rich state доступен внутри MilanaService';
+        } else {
+          const state = life.state || {};
+          const host = (data.service || {}).telegram_host || {};
+          const lines = [
+            `настроение: ${state.mood || '—'}  valence: ${state.valence ?? '—'}  arousal: ${state.arousal ?? '—'}`,
+            `потребности: social ${state.social}  rest ${state.rest}  novelty ${state.novelty}  achievement ${state.achievement}`,
+            `намерение: ${state.current_intention || '—'}`,
+            `heartbeat: ${state.heartbeat_paused ? 'paused' : 'active'}  следующий: ${state.next_heartbeat_at || '—'}`,
+            `telegram host: ${host.connected ? 'connected' : 'offline'}  process: ${host.process_running ? 'running' : 'stopped'}`,
+            `цели: ${(life.goals || []).length}  события: ${(life.events || []).length}  сущности: ${(life.entities || []).length}  отношения: ${(life.relationships || []).length}`,
+            `последние skills: ${(life.skill_audit || []).slice(0, 8).map(x => x.skill_id).join(', ') || '—'}`,
+            '',
+            'активные цели:',
+            ...(life.goals || []).filter(x => x.status === 'active').slice(0, 20).map(x => `• ${x.title} (${x.progress}%) [${x.id}]`),
+            '',
+            'последние события:',
+            ...(life.events || []).slice(0, 12).map(x => `• ${x.title} [${x.status}]`),
+          ];
+          lifeEl.textContent = lines.join('\n');
+        }
+      }
+      const archiveEl = document.getElementById('life-archive-actions');
+      if (archiveEl) {
+        archiveEl.innerHTML = '';
+        const life = data.life || {};
+        const entries = [
+          ...(life.goals || []).filter(x => x.status === 'active').slice(0, 6).map(x => ({kind: 'goal', id: x.id, title: x.title})),
+          ...(life.events || []).filter(x => x.status === 'active').slice(0, 6).map(x => ({kind: 'event', id: x.id, title: x.title})),
+        ];
+        entries.forEach(item => {
+          const button = document.createElement('button');
+          button.className = 'text-left text-xs px-3 py-2 bg-slate-950 border border-slate-800 hover:border-slate-600 rounded-xl';
+          button.textContent = `архивировать ${item.kind === 'goal' ? 'цель' : 'событие'}: ${item.title}`;
+          button.onclick = () => performAction(item.kind === 'goal' ? '/api/goals/archive' : '/api/events/archive', {id: item.id});
+          archiveEl.appendChild(button);
+        });
+      }
       
       // server time
       if (data.timestamp) {
@@ -911,6 +1060,8 @@ INDEX_HTML = """<!DOCTYPE html>
 
 
 class MilanaHandler(BaseHTTPRequestHandler):
+    panel_context = WebPanelContext()
+
     def _send_headers(self, code: int = 200, content_type: str = "application/json"):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
@@ -943,7 +1094,7 @@ class MilanaHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/status":
-            data = collect_status()
+            data = collect_status(self.panel_context)
             self.send_json(data)
             return
 
@@ -991,16 +1142,109 @@ class MilanaHandler(BaseHTTPRequestHandler):
             self.send_json(result)
             return
 
+        callback_routes = {
+            "/api/heartbeat/pause": ("pause_heartbeat", None),
+            "/api/heartbeat/resume": ("resume_heartbeat", None),
+            "/api/heartbeat/wake": ("wake_now", None),
+            "/api/goals/archive": ("archive_goal", "id"),
+            "/api/events/archive": ("archive_event", "id"),
+        }
+        route = callback_routes.get(path)
+        if route is not None:
+            callback_name, argument_name = route
+            callback = self.panel_context.callback(callback_name)
+            if callback is None:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "message": "Действие доступно только во встроенной панели MilanaService",
+                    },
+                    409,
+                )
+                return
+            try:
+                result = (
+                    callback()
+                    if argument_name is None
+                    else callback(body.get(argument_name))
+                )
+                self.send_json(
+                    {
+                        "ok": True,
+                        "message": "Действие выполнено",
+                        "result": _json_value(result),
+                    }
+                )
+            except Exception as exc:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "message": f"{type(exc).__name__}: {exc}",
+                    },
+                    400,
+                )
+            return
+
         self.send_json({"ok": False, "message": "Unknown action"}, 404)
 
 
+@dataclass
+class WebPanelServer:
+    httpd: ThreadingHTTPServer
+    thread: threading.Thread
+    url: str
+
+    def stop(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        if self.thread is not threading.current_thread():
+            self.thread.join(timeout=5)
+
+
+def create_web_server(
+    *,
+    port: int = PORT,
+    state_store: Any | None = None,
+    callbacks: Mapping[str, ActionCallback] | None = None,
+    status_provider: StatusProvider | None = None,
+) -> ThreadingHTTPServer:
+    context = WebPanelContext(state_store, callbacks, status_provider)
+    handler = type(
+        "BoundMilanaHandler",
+        (MilanaHandler,),
+        {"panel_context": context},
+    )
+    return ThreadingHTTPServer(("127.0.0.1", port), handler)
+
+
+def start_web_server(
+    *,
+    port: int = PORT,
+    state_store: Any | None = None,
+    callbacks: Mapping[str, ActionCallback] | None = None,
+    status_provider: StatusProvider | None = None,
+) -> WebPanelServer:
+    httpd = create_web_server(
+        port=port,
+        state_store=state_store,
+        callbacks=callbacks,
+        status_provider=status_provider,
+    )
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+    thread = threading.Thread(
+        target=httpd.serve_forever,
+        name="milana-web-panel",
+        daemon=True,
+    )
+    thread.start()
+    return WebPanelServer(httpd, thread, url)
+
+
 def run_server(port: int = PORT, open_browser: bool = True):
-    server_address = ("127.0.0.1", port)
-    httpd = None
     url = f"http://127.0.0.1:{port}/"
 
     try:
-        httpd = HTTPServer(server_address, MilanaHandler)
+        panel = start_web_server(port=port)
     except OSError as e:
         print(f"Не удалось запустить сервер на порту {port}: {e}")
         print(f"Возможно, панель уже запущена. Открываю браузер: {url}")
@@ -1033,12 +1277,12 @@ def run_server(port: int = PORT, open_browser: bool = True):
         threading.Thread(target=_open, daemon=True).start()
 
     try:
-        httpd.serve_forever()
+        while panel.thread.is_alive():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nОстановка сервера...")
     finally:
-        if httpd:
-            httpd.server_close()
+        panel.stop()
 
 
 if __name__ == "__main__":

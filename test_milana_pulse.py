@@ -76,6 +76,38 @@ class PulseRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed.status, "completed")
         self.assertEqual(completed.attempts, 2)
 
+    async def test_transport_outage_does_not_exhaust_promised_delivery(self) -> None:
+        now = datetime(2026, 7, 13, 18, 0, tzinfo=timezone.utc)
+        memory = MilanaMemoryStore()
+        memory.schedule_pulse_message(100, "дождусь связи", due_at=now)
+        pulse = MilanaPulse(
+            memory,
+            AsyncMock(side_effect=ConnectionError("host offline")),
+            now=lambda: now,
+            max_attempts=1,
+        )
+
+        await pulse.run_once()
+
+        task = memory.get_pulse_tasks()[0]
+        self.assertEqual(task.status, "pending")
+        self.assertEqual(task.attempts, 1)
+
+    async def test_non_transport_failure_still_respects_attempt_limit(self) -> None:
+        now = datetime(2026, 7, 13, 18, 0, tzinfo=timezone.utc)
+        memory = MilanaMemoryStore()
+        memory.schedule_pulse_message(100, "некорректная задача", due_at=now)
+        pulse = MilanaPulse(
+            memory,
+            AsyncMock(side_effect=ValueError("bad action")),
+            now=lambda: now,
+            max_attempts=1,
+        )
+
+        await pulse.run_once()
+
+        self.assertEqual(memory.get_pulse_tasks()[0].status, "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -86,6 +86,7 @@ def _structured_result(
     tuple[str, ...],
     tuple[dict[str, Any], ...],
     tuple[dict[str, Any], ...],
+    tuple[dict[str, str], ...],
 ]:
     """Return the Telegram envelope plus side effects produced by Gemini."""
     cleaned = text.strip()
@@ -95,10 +96,39 @@ def _structured_result(
             (),
             (),
             (),
+            (),
         )
 
     payload = _find_structured_payload(cleaned)
     if payload is not None:
+        raw_tool_calls = payload.pop("tool_calls", [])
+        generic_tool_calls: tuple[dict[str, str], ...] = ()
+        if isinstance(raw_tool_calls, list):
+            normalized_calls: list[dict[str, str]] = []
+            for item in raw_tool_calls:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                arguments_json = item.get("arguments_json")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                if isinstance(arguments_json, dict):
+                    arguments_json = json.dumps(arguments_json, ensure_ascii=False)
+                if not isinstance(arguments_json, str):
+                    continue
+                try:
+                    arguments = json.loads(arguments_json)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(arguments, dict):
+                    continue
+                normalized_calls.append(
+                    {
+                        "name": name.strip(),
+                        "arguments_json": json.dumps(arguments, ensure_ascii=False),
+                    }
+                )
+            generic_tool_calls = tuple(normalized_calls)
         raw_entries = payload.pop("diary_entries", [])
         diary_entries = (
             tuple(item.strip() for item in raw_entries if item.strip())
@@ -144,13 +174,14 @@ def _structured_result(
             diary_entries,
             scheduled_messages,
             sticker_actions,
+            generic_tool_calls,
         )
 
     if telegram_envelope:
         cleaned = json.dumps(
             {"messages": [cleaned], "reaction": None}, ensure_ascii=False
         )
-    return cleaned, (), (), ()
+    return cleaned, (), (), (), ()
 
 
 class _AgyResponses:
@@ -188,6 +219,7 @@ class _AgyResponses:
             except Exception:  # noqa: BLE001 - preserve the caller's cancellation
                 pass
             raise
+        format_name = ""
         if "text" in request:
             format_name = str(
                 ((request.get("text") or {}).get("format") or {}).get("name", "")
@@ -200,7 +232,13 @@ class _AgyResponses:
                 if isinstance(response_schema, dict)
                 else {}
             )
-            output_text, diary_entries, scheduled_messages, sticker_actions = (
+            (
+                output_text,
+                diary_entries,
+                scheduled_messages,
+                sticker_actions,
+                tool_calls,
+            ) = (
                 _structured_result(
                     raw,
                     telegram_envelope=(
@@ -225,7 +263,53 @@ class _AgyResponses:
             diary_entries = ()
             scheduled_messages = ()
             sticker_actions = ()
-        if not output_text:
+            tool_calls = ()
+        if tool_calls and format_name != "milana_agent_turn":
+            legacy_diary = list(diary_entries)
+            legacy_scheduled = list(scheduled_messages)
+            legacy_stickers = list(sticker_actions)
+            for call in tool_calls:
+                try:
+                    arguments = json.loads(call["arguments_json"])
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+                name = call.get("name")
+                if name == "write_diary" and isinstance(arguments.get("content"), str):
+                    content = arguments["content"].strip()
+                    if content and content not in legacy_diary:
+                        legacy_diary.append(content)
+                elif name == "schedule_message":
+                    delay = arguments.get("delay_seconds")
+                    message = arguments.get("message")
+                    candidate = {"delay_seconds": delay, "message": message}
+                    if (
+                        isinstance(delay, int)
+                        and not isinstance(delay, bool)
+                        and isinstance(message, str)
+                        and candidate not in legacy_scheduled
+                    ):
+                        legacy_scheduled.append(candidate)
+                elif name in {
+                    "open_sticker_picker",
+                    "send_sticker",
+                    "schedule_sticker",
+                }:
+                    candidate = {"name": name, "arguments": arguments}
+                    if candidate not in legacy_stickers:
+                        legacy_stickers.append(candidate)
+            diary_entries = tuple(legacy_diary)
+            scheduled_messages = tuple(legacy_scheduled)
+            sticker_actions = tuple(legacy_stickers)
+        elif tool_calls:
+            # The standalone agent consumes one provider-neutral step at a
+            # time.  Tool calls are that step; final/state fields in the same
+            # AGY JSON are placeholders required by the output schema and must
+            # not be interpreted as a simultaneous final result.
+            output_text = ""
+            diary_entries = ()
+            scheduled_messages = ()
+            sticker_actions = ()
+        if not output_text and not tool_calls:
             raise AgyError("agy вернул пустой ответ")
         return SimpleNamespace(
             output_text=output_text,
@@ -235,6 +319,7 @@ class _AgyResponses:
             agy_diary_entries=diary_entries,
             agy_scheduled_messages=scheduled_messages,
             agy_sticker_actions=sticker_actions,
+            agy_tool_calls=tool_calls,
         )
 
 
@@ -480,7 +565,32 @@ class AgyModelClient:
         if "text" in request:
             response_format = copy.deepcopy(request["text"].get("format"))
             tools = request.get("tools", [])
-            if self._has_diary_tool(tools):
+            format_name = (
+                response_format.get("name")
+                if isinstance(response_format, dict)
+                else None
+            )
+            # MilanaService uses the provider-neutral tool loop exclusively.
+            # Older direct Telegram callers keep their extracted arrays as a
+            # compatibility bridge until that entrypoint is removed.
+            legacy_tool_arrays = format_name != "milana_agent_turn"
+            tool_catalog = self._tool_catalog(tools)
+            if tool_catalog:
+                self._add_tool_calls_output(
+                    response_format,
+                    [item["name"] for item in tool_catalog],
+                )
+                payload["instructions"] = (
+                    f"{payload['instructions']}\n\n"
+                    "Инструменты этого запроса вызывай универсально через массив tool_calls "
+                    "итогового JSON. Каждый элемент содержит точное поле name и строку "
+                    "arguments_json с одним JSON-объектом аргументов. Если нужен инструмент, "
+                    "не выполняй его мысленно и не подменяй результат: верни вызов, дождись "
+                    "служебного результата в следующем ходе и только затем продолжай. Если "
+                    "инструменты не нужны, верни пустой массив. Доступный каталог:\n"
+                    + json.dumps(tool_catalog, ensure_ascii=False, separators=(",", ":"))
+                )
+            if legacy_tool_arrays and self._has_diary_tool(tools):
                 self._add_diary_output(response_format)
                 payload["instructions"] = (
                     f"{payload['instructions']}\n\n"
@@ -488,7 +598,7 @@ class AgyModelClient:
                     "добавь новые записи в массив diary_entries итогового JSON. Если "
                     "записывать нечего, верни пустой массив."
                 )
-            if self._has_schedule_tool(tools):
+            if legacy_tool_arrays and self._has_schedule_tool(tools):
                 self._add_schedule_output(response_format)
                 payload["instructions"] = (
                     f"{payload['instructions']}\n\n"
@@ -497,7 +607,7 @@ class AgyModelClient:
                     "в формате {delay_seconds, message}. Если ставить задачу не нужно, верни "
                     "пустой массив."
                 )
-            if self._has_sticker_tools(tools):
+            if legacy_tool_arrays and self._has_sticker_tools(tools):
                 self._add_sticker_output(response_format)
                 payload["instructions"] = (
                     f"{payload['instructions']}\n\n"
@@ -509,6 +619,57 @@ class AgyModelClient:
                 )
             payload["response_format"] = response_format
         return payload
+
+    @staticmethod
+    def _tool_catalog(tools: Any) -> list[dict[str, Any]]:
+        if not isinstance(tools, list):
+            return []
+        catalog: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name")
+            if tool.get("type") != "function" or not isinstance(name, str):
+                continue
+            item: dict[str, Any] = {"name": name}
+            description = tool.get("description")
+            parameters = tool.get("parameters")
+            if isinstance(description, str) and description.strip():
+                item["description"] = description.strip()
+            if isinstance(parameters, dict):
+                item["parameters"] = parameters
+            catalog.append(item)
+        return catalog
+
+    @staticmethod
+    def _add_tool_calls_output(response_format: Any, names: list[str]) -> None:
+        if not isinstance(response_format, dict):
+            return
+        schema = response_format.get("schema")
+        if not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        required = schema.get("required")
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return
+        unique_names = list(dict.fromkeys(name for name in names if name))
+        if not unique_names:
+            return
+        properties["tool_calls"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": unique_names},
+                    "arguments_json": {"type": "string"},
+                },
+                "required": ["name", "arguments_json"],
+                "additionalProperties": False,
+            },
+            "maxItems": 8,
+        }
+        if "tool_calls" not in required:
+            required.append("tool_calls")
 
     @staticmethod
     def _has_diary_tool(tools: Any) -> bool:

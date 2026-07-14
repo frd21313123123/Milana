@@ -4,7 +4,7 @@ chcp 65001 >nul
 
 set "ROOT=%~dp0"
 set "PYTHON=%ROOT%.venv\Scripts\python.exe"
-set "SCRIPT=%ROOT%telegram_client.py"
+set "SCRIPT=%ROOT%milana_service.py"
 set "SCHEDULE_SCRIPT=%ROOT%milana_schedule.py"
 set "PID_FILE=%ROOT%bot.pid"
 set "MODE_FILE=%ROOT%bot.mode"
@@ -111,7 +111,7 @@ if defined BOT_PIDS (
 if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
 if exist "%MODE_FILE%" del /q "%MODE_FILE%" >nul 2>&1
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $pathValue = [Environment]::GetEnvironmentVariable('Path'); [Environment]::SetEnvironmentVariable('PATH', $null); [Environment]::SetEnvironmentVariable('Path', $pathValue); $p = Start-Process -FilePath '%PYTHON%' -ArgumentList '-u', '%SCRIPT%', 'ai-bot'%DEV_CHAT_ARG% -WorkingDirectory '%ROOT%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id; Set-Content -NoNewline -Encoding ascii -Path '%MODE_FILE%' -Value ($p.Id.ToString() + ' %START_MODE_KEY%')"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $pathValue = [Environment]::GetEnvironmentVariable('Path'); [Environment]::SetEnvironmentVariable('PATH', $null); [Environment]::SetEnvironmentVariable('Path', $pathValue); $p = Start-Process -FilePath '%PYTHON%' -ArgumentList '-u', '%SCRIPT%'%DEV_CHAT_ARG% -WorkingDirectory '%ROOT%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id; Set-Content -NoNewline -Encoding ascii -Path '%MODE_FILE%' -Value ($p.Id.ToString() + ' %START_MODE_KEY%')"
 if errorlevel 1 (
     echo Failed to start the bot. Check PowerShell availability.
     call :cleanup_failed_start
@@ -333,7 +333,7 @@ exit /b 0
 echo ---------------- CURRENT DETAILED STATE ----------------
 if /I "%BOT_MODE%"=="DEV" (
     echo DEV CHAT: ACTIVE
-    echo Replies are generated immediately. Schedule, sleep and online simulation are bypassed.
+    echo Replies are generated immediately. Artificial response/presence delays are disabled; reflective heartbeat starts paused.
     exit /b 0
 )
 if /I "%BOT_MODE%"=="MIXED" echo WARNING: normal and DEV bot processes are running together.
@@ -381,32 +381,16 @@ if not exist "%ERR_LOG%" if not exist "%OUT_LOG%" echo No logs yet.
 goto action_done
 
 :open_web
-set "WEB_SCRIPT=%ROOT%milana_web.py"
-if not exist "%PYTHON%" (
-    echo Web UI unavailable: Python environment not found: %PYTHON%
-    goto action_done
-)
-if not exist "%WEB_SCRIPT%" (
-    echo Web UI script not found: %WEB_SCRIPT%
+call :find_bot_pids
+if not defined BOT_PIDS (
+    echo MilanaService is not running. Start it first with: bot_control.bat start
     goto action_done
 )
 
-echo Starting local web control panel for Milana...
-echo.
-
-rem Start the server in a minimized console window.
-rem --no-browser tells Python NOT to open a browser itself (prevents two tabs).
-start "Milana Web UI" /min "%PYTHON%" "%WEB_SCRIPT%" --no-browser
-
-rem Give the HTTP server a bit of time to start listening (usually under 1 second).
-timeout /t 3 /nobreak >nul 2>&1
-
-rem Open browser - only once, after the wait.
+rem The web panel is embedded in MilanaService. This command only opens it.
 start "" "http://127.0.0.1:8765/"
 
 echo Opened: http://127.0.0.1:8765/
-echo If the page shows a connection error, wait 1-2 seconds and press F5 to refresh.
-echo (To stop the panel: restore the minimized "Milana Web UI" window and press Ctrl+C there)
 goto action_done
 
 :read_pid
@@ -445,7 +429,7 @@ if exist "%PID_FILE%" (
 
 rem Fall back to discovery for bots started outside this controller.
 if not defined FOUND_PIDS (
-for /f "delims=" %%P in ('%PS% -NoProfile -Command "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; foreach ($process in $processes) { if ($process.CommandLine -and $process.CommandLine -match '(?i)telegram_client\.py' -and $process.CommandLine -match '(?i)ai-bot') { $process.ProcessId } }"') do (
+for /f "delims=" %%P in ('%PS% -NoProfile -Command "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; foreach ($process in $processes) { if ($process.CommandLine -and $process.CommandLine -match '(?i)milana_service\.py') { $process.ProcessId } }"') do (
     set "FOUND_PIDS=!FOUND_PIDS! %%P"
 )
 )
