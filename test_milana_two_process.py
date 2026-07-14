@@ -87,22 +87,17 @@ class TwoProcessMilanaTests(unittest.IsolatedAsyncioTestCase):
         database = root / "milana.sqlite3"
         memory = MilanaMemoryStore(database)
         state = MilanaStateStore(database)
-        final = empty_turn_payload(telegram=True)
-        final["telegram"] = {
-            "target_token": "fake-target-token",
-            "messages": ["привет"],
-            "reaction": None,
-            "blacklist_sender": False,
+        final = {
+            "telegram": {
+                "target_token": "fake-target-token",
+                "messages": ["привет"],
+                "reaction": None,
+                "blacklist_sender": False,
+            }
         }
         model = SimpleNamespace(
             responses=_Responses(
                 [
-                    _call("open_skill", {"skill_id": "telegram"}, "tg"),
-                    _call(
-                        "open_skill",
-                        {"skill_id": "telegram.stickers"},
-                        "stickers",
-                    ),
                     _call("open_sticker_picker", {"pack_id": None}, "index"),
                     _call("open_sticker_picker", {"pack_id": "P001"}, "pack"),
                     _call("send_sticker", {"sticker_id": "P001:S001"}, "send"),

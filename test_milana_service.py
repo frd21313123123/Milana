@@ -14,7 +14,7 @@ from milana_memory import MilanaMemoryStore
 from milana_schedule import load_routine
 from milana_service import MilanaService, TurnPreemptedError, build_heartbeat_changes
 from milana_state import MilanaStateStore, StateConflictError, TelegramTurnMetric
-from telegram_client import AIConfig, MessageFlowConfig
+from telegram_client import AIConfig, MessageFlowConfig, TelegramFastPathConfig
 
 
 NOW = datetime(2026, 7, 14, 10, 0, tzinfo=timezone.utc)
@@ -127,6 +127,17 @@ def _final(payload):
     return SimpleNamespace(output=[], output_text=json.dumps(payload, ensure_ascii=False))
 
 
+def _direct_telegram_payload(*messages, token="token-for-turn"):
+    return {
+        "telegram": {
+            "target_token": token,
+            "messages": list(messages),
+            "reaction": None,
+            "blacklist_sender": False,
+        }
+    }
+
+
 def _production_telegram_trigger(message_id=9):
     notice_id = f"tg:77:{message_id}"
     notice = {
@@ -164,7 +175,14 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.memory.close()
         self.tmp.cleanup()
 
-    def service(self, responses=(), *, model=None):
+    def service(
+        self,
+        responses=(),
+        *,
+        model=None,
+        dev_mode=True,
+        fast_max_reply_messages=1,
+    ):
         config = AIConfig(
             api_key="test",
             model="fake",
@@ -178,6 +196,10 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 inter_message_min_delay_seconds=0,
                 inter_message_max_delay_seconds=0,
             ),
+            telegram_fast_path=TelegramFastPathConfig(
+                dev_chat_only=False,
+                max_reply_messages=fast_max_reply_messages,
+            ),
         )
         return MilanaService(
             config=config,
@@ -187,9 +209,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             routine=load_routine(),
             rpc_server=SimpleNamespace(),
             supervisor=self.supervisor,
-            # The production rollout is dev-chat-only. Service tests emulate
-            # that chat so ordinary Telegram notices exercise the fast path.
-            dev_mode=True,
+            dev_mode=dev_mode,
             now=lambda: NOW,
         )
 
@@ -205,8 +225,6 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_production_ordinary_text_notice_stays_one_call_fast_path(self):
         self.supervisor.open_text = "Как у тебя дела?"
         fast_final = {
-            "memory_note": None,
-            "relationship_delta": None,
             "telegram": {
                 "target_token": "token-for-turn",
                 "messages": ["всё хорошо"],
@@ -214,12 +232,19 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 "blacklist_sender": False,
             },
         }
-        service = self.service([_final(fast_final)])
+        service = self.service([_final(fast_final)], dev_mode=False)
 
         result = await service._execute_turn(_production_telegram_trigger())
 
+        self.assertTrue(service.telegram_fast_path_enabled)
         self.assertEqual(len(service.model_client.responses.requests), 1)
-        self.assertEqual(service.model_client.responses.requests[0]["tools"], [])
+        request = service.model_client.responses.requests[0]
+        self.assertEqual(request["tools"], [])
+        self.assertEqual(
+            set(request["text"]["format"]["schema"]["properties"]),
+            {"telegram"},
+        )
+        self.assertNotIn("Доступные корневые навыки", request["instructions"])
         self.assertNotIn("requires_tools", result.trigger.metadata)
 
     def test_status_is_not_green_when_fast_window_contains_missing_first_sends(self):
@@ -276,29 +301,21 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.supervisor.open_text = "Милана, пришли мне стикер, пожалуйста"
         service = self.service(
             [
-                _call(
-                    "open_skill",
-                    {"skill_id": "telegram.stickers"},
-                    "open-stickers",
-                ),
                 _call("open_sticker_picker", {"pack_id": None}, "picker"),
                 _call("send_sticker", {"sticker_id": "P001:S001"}, "send"),
-                _final(empty_turn_payload(telegram=True)),
+                _final(_direct_telegram_payload()),
             ]
         )
 
         result = await service._execute_turn(_production_telegram_trigger())
 
         requests = service.model_client.responses.requests
-        self.assertEqual(len(requests), 4)
-        self.assertTrue(requests[0]["tools"])
-        self.assertIn(
-            "schedule_message", {tool["name"] for tool in requests[0]["tools"]}
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(
+            {tool["name"] for tool in requests[0]["tools"]},
+            {"open_sticker_picker", "send_sticker", "schedule_sticker"},
         )
-        self.assertIn(
-            "open_sticker_picker",
-            {tool["name"] for tool in requests[1]["tools"]},
-        )
+        self.assertNotIn("state_update", requests[0]["text"]["format"]["schema"]["properties"])
         executed = [
             call[1].get("action")
             for call in self.supervisor.calls
@@ -306,32 +323,27 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("open_sticker_picker", executed)
         self.assertIn("send_sticker", executed)
-        self.assertTrue(result.trigger.metadata["requires_tools"])
+        self.assertTrue(result.trigger.metadata["_telegram_sticker_tools"])
 
-    async def test_production_textual_reminder_command_uses_schedule_tool(self):
+    async def test_production_textual_reminder_command_stays_direct(self):
         self.supervisor.open_text = "Remind me in an hour to drink water"
-        service = self.service(
-            [
-                _call(
-                    "schedule_message",
-                    {"delay_seconds": 3600, "message": "Drink water"},
-                    "reminder",
-                ),
-                _final(empty_turn_payload(telegram=True)),
-            ]
-        )
+        final = {
+            "telegram": {
+                "target_token": "token-for-turn",
+                "messages": ["я не могу поставить напоминание из этого ответа"],
+                "reaction": None,
+                "blacklist_sender": False,
+            },
+        }
+        service = self.service([_final(final)])
 
         result = await service._execute_turn(_production_telegram_trigger())
 
         requests = service.model_client.responses.requests
-        self.assertEqual(len(requests), 2)
-        self.assertIn(
-            "schedule_message", {tool["name"] for tool in requests[0]["tools"]}
-        )
-        self.assertEqual(
-            [action.kind for action in result.staged_actions], ["schedule_message"]
-        )
-        self.assertTrue(result.trigger.metadata["requires_tools"])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["tools"], [])
+        self.assertEqual(result.staged_actions, ())
+        self.assertNotIn("_telegram_sticker_tools", result.trigger.metadata)
 
     async def test_revision_conflict_keeps_every_staged_write_inert(self):
         service = self.service()
@@ -578,13 +590,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(worker, return_exceptions=True)
 
     async def test_notice_opens_telegram_then_commits_reply_and_read(self):
-        final = empty_turn_payload(telegram=True)
-        final["telegram"] = {
-            "target_token": "token-for-turn",
-            "messages": ["приветик"],
-            "reaction": None,
-            "blacklist_sender": False,
-        }
+        final = _direct_telegram_payload("приветик")
         service = self.service(
             [
                 _final(final),
@@ -625,7 +631,8 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history[0].content, "привет")
         self.assertEqual(history[1].content, "приветик")
         audit = self.state.list_skill_audit(turn_id=trigger.id)
-        self.assertEqual([item.skill_id for item in audit], ["telegram"])
+        # Direct application routing is infrastructure, not a model skill call.
+        self.assertEqual(audit, [])
         self.assertEqual(self.state.list_pending_telegram_notices(), [])
         self.assertEqual(
             self.state.record_telegram_notice(notice_payload, received_at=NOW),
@@ -660,13 +667,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                     return {"status": "acknowledged", "through_message_id": 9}
                 return await super().request(method, params, **options)
 
-        final = empty_turn_payload(telegram=True)
-        final["telegram"] = {
-            "target_token": "token-for-turn",
-            "messages": ["один настоящий ответ"],
-            "reaction": None,
-            "blacklist_sender": False,
-        }
+        final = _direct_telegram_payload("один настоящий ответ")
         notice_payload = {
             "source": "telegram",
             "notice_id": "tg:77:9",
@@ -732,7 +733,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         service = self.service(
             [
-                _final(empty_turn_payload(telegram=True)),
+                _final(_direct_telegram_payload()),
             ]
         )
         trigger = TurnTrigger(
@@ -747,13 +748,9 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         first_input = service.model_client.responses.requests[0]["input"]
         self.assertIn("я давно люблю зелёный чай", str(first_input))
 
-    async def test_skill_audit_records_trusted_parent_then_child_activation(self):
-        service = self.service(
-            [
-                _call("open_skill", {"skill_id": "telegram.stickers"}, "child"),
-                _final(empty_turn_payload(telegram=True)),
-            ]
-        )
+    async def test_direct_sticker_route_does_not_record_model_skill_activation(self):
+        self.supervisor.open_text = "пришли стикер"
+        service = self.service([_final(_direct_telegram_payload())])
         trigger = TurnTrigger(
             kind="telegram_notice",
             occurred_at=NOW,
@@ -762,20 +759,12 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 "chat_id": 77,
                 "notice_ids": ["tg:77:9"],
                 "notices": [],
-                "requires_tools": True,
             },
         )
 
         await service._execute_turn(trigger)
 
-        rows = list(reversed(self.state.list_skill_audit(turn_id=trigger.id)))
-        self.assertEqual(
-            [(row.skill_id, row.action, row.success) for row in rows],
-            [
-                ("telegram", "activate", True),
-                ("telegram.stickers", "activate", True),
-            ],
-        )
+        self.assertEqual(self.state.list_skill_audit(turn_id=trigger.id), [])
 
     async def test_heartbeat_updates_life_without_opening_telegram(self):
         payload = empty_turn_payload()
@@ -868,13 +857,10 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_telegram_then_stickers_picker_then_send(self):
-        final = empty_turn_payload(telegram=True)
+        final = _direct_telegram_payload()
+        self.supervisor.open_text = "пришли мне стикер"
         service = self.service(
             [
-                _call("open_skill", {"skill_id": "telegram"}, "tg"),
-                _call(
-                    "open_skill", {"skill_id": "telegram.stickers"}, "stickers"
-                ),
                 _call("open_sticker_picker", {"pack_id": None}, "packs"),
                 _call("open_sticker_picker", {"pack_id": "P001"}, "picker"),
                 _call("send_sticker", {"sticker_id": "P001:S001"}, "send"),
@@ -1043,7 +1029,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_deliberate_no_reply_still_records_and_acknowledges_notice(self):
         service = self.service(
             [
-                _final(empty_turn_payload(telegram=True)),
+                _final(_direct_telegram_payload()),
             ]
         )
         trigger = TurnTrigger(
@@ -1176,16 +1162,10 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                     }
                 return await super().request(method, params, **options)
 
-        first = empty_turn_payload(telegram=True)
-        first["telegram"] = {
-            "target_token": "token-for-turn",
-            "messages": ["первая часть", "вторая часть"],
-            "reaction": None,
-            "blacklist_sender": False,
-        }
+        first = _direct_telegram_payload("первая часть", "вторая часть")
         self.supervisor = PartialThenResumeSupervisor()
         initial_model = _Model([_final(first)])
-        service = self.service(model=initial_model)
+        service = self.service(model=initial_model, fast_max_reply_messages=2)
 
         def trigger():
             return TurnTrigger(
@@ -1195,7 +1175,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 metadata={
                     "chat_id": 77,
                     "notice_ids": ["tg:77:9"],
-                    # Multi-part replies are outside the ordinary-text fast path.
+                    # Use two configured semantic parts to exercise durable resume.
                     "notices": [{"media_type": "sticker"}],
                 },
             )
@@ -1216,7 +1196,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         offline_model.responses.create = AsyncMock(
             side_effect=RuntimeError("provider offline")
         )
-        service = self.service(model=offline_model)
+        service = self.service(model=offline_model, fast_max_reply_messages=2)
         await service._execute_turn(trigger())
         offline_model.responses.create.assert_not_awaited()
         self.assertEqual(len(initial_model.responses.requests), 1)
@@ -1282,20 +1262,8 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                     }
                 return await super().request(method, params, **options)
 
-        original = empty_turn_payload(telegram=True)
-        original["telegram"] = {
-            "target_token": "token-for-turn",
-            "messages": ["единственный настоящий ответ"],
-            "reaction": None,
-            "blacklist_sender": False,
-        }
-        regenerated = empty_turn_payload(telegram=True)
-        regenerated["telegram"] = {
-            "target_token": "token-for-turn",
-            "messages": ["новый текст после таймаута"],
-            "reaction": None,
-            "blacklist_sender": False,
-        }
+        original = _direct_telegram_payload("единственный настоящий ответ")
+        regenerated = _direct_telegram_payload("новый текст после таймаута")
         self.supervisor = LostResponseSupervisor()
         service = self.service([_final(original), _final(regenerated)])
 
@@ -1592,8 +1560,6 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 await self.release.wait()
                 return _final(
                     {
-                        "memory_note": None,
-                        "relationship_delta": None,
                         "telegram": {
                             "target_token": "token-for-turn",
                             "messages": ["один готовый ответ"],

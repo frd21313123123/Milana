@@ -165,7 +165,7 @@ class TelegramFastPathConfig:
     """Latency and prompt budgets for trusted incoming Telegram turns."""
 
     enabled: bool = True
-    dev_chat_only: bool = True
+    dev_chat_only: bool = False
     target_first_send_seconds: float = 10.0
     max_output_tokens: int = 500
     max_reply_messages: int = 1
@@ -408,7 +408,7 @@ def load_telegram_fast_path_config(
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError("enabled в telegram_fast_path должен быть boolean")
-    dev_chat_only = raw.get("dev_chat_only", True)
+    dev_chat_only = raw.get("dev_chat_only", False)
     if not isinstance(dev_chat_only, bool):
         raise ValueError("dev_chat_only в telegram_fast_path должен быть boolean")
 

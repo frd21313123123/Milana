@@ -61,12 +61,8 @@ def _telegram_final(
     message="ответ",
     *,
     token="turn-only-token",
-    memory_note=None,
-    relationship_delta=None,
 ):
     return {
-        "memory_note": memory_note,
-        "relationship_delta": relationship_delta,
         "telegram": {
             "target_token": token,
             "messages": [message],
@@ -215,17 +211,7 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
 
         agent, model, *_ = self._agent(
             [
-                _final(
-                    _telegram_final(
-                        "привет в ответ",
-                        memory_note="любит короткие ответы",
-                        relationship_delta={
-                            "closeness": 2,
-                            "reciprocity": 1,
-                            "tension": -1,
-                        },
-                    )
-                )
+                _final(_telegram_final("привет в ответ"))
             ],
             on_activate=activate,
             telegram_fast_enabled=True,
@@ -249,11 +235,11 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             set(first["text"]["format"]["schema"]["properties"]),
-            {"memory_note", "relationship_delta", "telegram"},
+            {"telegram"},
         )
         self.assertEqual(
             set(first["text"]["format"]["schema"]["required"]),
-            {"memory_note", "relationship_delta", "telegram"},
+            {"telegram"},
         )
         self.assertEqual(
             first["text"]["format"]["schema"]["properties"]["telegram"]
@@ -263,31 +249,23 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["max_output_tokens"], 500)
         self.assertEqual(first["metadata"], {"agy_priority": "interactive"})
         self.assertIn("Привет", json.dumps(first["input"], ensure_ascii=False))
-        self.assertIn("Навык telegram уже активирован", first["instructions"])
+        self.assertIn("уже находишься в Telegram", first["instructions"])
+        self.assertIn("Не вызывай никаких инструментов", first["instructions"])
         self.assertNotIn("Чтобы использовать внешний навык", first["instructions"])
         self.assertNotIn("Доступные закрытые навыки", first["instructions"])
-        self.assertEqual([item.name for item in result.tool_results], ["open_skill"])
+        self.assertEqual(result.tool_results, ())
         self.assertEqual(result.model_rounds, 1)
         self.assertIsNotNone(result.model_elapsed_ms)
         self.assertIn("state_update", result.payload)
-        self.assertEqual(result.payload["memory_note"], "любит короткие ответы")
-        relationship = json.loads(
-            result.payload["relationship_updates"][0]["arguments_json"]
-        )
-        self.assertEqual(
-            relationship,
-            {
-                "entity_id": "telegram:10",
-                "closeness": 2,
-                "reciprocity": 1,
-                "tension": -1,
-            },
-        )
+        self.assertEqual(result.payload["relationship_updates"], [])
+        self.assertNotIn("memory_note", result.payload)
 
-    def test_materialized_tool_intent_classifier_is_conservative_and_bilingual(self):
-        requiring_tools = (
+    def test_materialized_sticker_classifier_is_conservative_and_bilingual(self):
+        sticker_requests = (
             "Пришли мне стикер, пожалуйста",
             "Please send me a sticker",
+        )
+        ordinary = (
             "Напомни мне через час проверить духовку",
             "Could you remind me tomorrow?",
             "Разбуди меня в 7 утра",
@@ -296,8 +274,6 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
             "Text me later",
             "Запланируй сообщение на завтра",
             "Schedule this message for tomorrow",
-        )
-        ordinary = (
             "Вчера она отправила стикер и поставила напоминание.",
             "I was reminded of a sticker from yesterday.",
             "Как вообще устроены напоминания?",
@@ -305,22 +281,22 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
             "Просто поболтаем",
         )
 
-        for text in requiring_tools:
+        for text in sticker_requests:
             with self.subTest(text=text):
                 self.assertTrue(
-                    MilanaAgent._materialized_telegram_requires_tools(
+                    MilanaAgent._materialized_telegram_requests_sticker(
                         {"context": {"messages": [{"text": text}]}}
                     )
                 )
         for text in ordinary:
             with self.subTest(text=text):
                 self.assertFalse(
-                    MilanaAgent._materialized_telegram_requires_tools(
+                    MilanaAgent._materialized_telegram_requests_sticker(
                         {"context": {"messages": [{"text": text}]}}
                     )
                 )
         self.assertFalse(
-            MilanaAgent._materialized_telegram_requires_tools(
+            MilanaAgent._materialized_telegram_requests_sticker(
                 {
                     "context": {
                         "messages": [{"text": "обычный текущий текст"}],
@@ -330,7 +306,7 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_materialized_sticker_command_uses_full_tool_loop(self):
+    async def test_materialized_sticker_command_gets_only_sticker_tools(self):
         async def activate(_spec, _session):
             return {
                 "target_token": "turn-only-token",
@@ -340,17 +316,12 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
         agent, model, _, _, stickers = self._agent(
             [
                 _function_call(
-                    "open_skill",
-                    {"skill_id": "telegram.stickers"},
-                    "open-stickers",
-                ),
-                _function_call(
                     "open_sticker_picker", {"pack_id": None}, "picker"
                 ),
                 _function_call(
                     "send_sticker", {"sticker_id": "P001:S001"}, "send"
                 ),
-                _final(empty_turn_payload(telegram=True)),
+                _final({"telegram": None}),
             ],
             on_activate=activate,
             telegram_fast_enabled=True,
@@ -365,20 +336,98 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(len(model.responses.requests), 4)
-        self.assertIn("schedule_message", _tool_names(model.responses.requests[0]))
-        self.assertIn(
-            "open_sticker_picker", _tool_names(model.responses.requests[1])
-        )
-        self.assertIn("send_sticker", _tool_names(model.responses.requests[2]))
-        self.assertIn(
+        self.assertEqual(len(model.responses.requests), 3)
+        for request in model.responses.requests[:2]:
+            self.assertEqual(
+                _tool_names(request),
+                {"open_sticker_picker", "send_sticker", "schedule_sticker"},
+            )
+        self.assertNotIn(
             "state_update",
             model.responses.requests[0]["text"]["format"]["schema"]["properties"],
         )
+        self.assertIn("Правила единственного", str(model.responses.requests[0]["input"]))
+        self.assertNotIn("open_skill", _tool_names(model.responses.requests[0]))
+        self.assertNotIn("schedule_message", _tool_names(model.responses.requests[0]))
         self.assertEqual(stickers.calls[-1][1], "send_sticker")
-        self.assertTrue(result.trigger.metadata["requires_tools"])
+        self.assertTrue(result.trigger.metadata["_telegram_sticker_tools"])
+        self.assertEqual(result.active_skills, ("telegram", "telegram.stickers"))
 
-    async def test_materialized_reminder_command_exposes_schedule_tool(self):
+    async def test_sticker_route_rejects_hallucinated_non_sticker_tool(self):
+        async def activate(_spec, _session):
+            return {
+                "target_token": "turn-only-token",
+                "messages": [{"message_id": 7, "text": "пришли стикер"}],
+            }
+
+        agent, model, core, telegram, stickers = self._agent(
+            [
+                _function_call(
+                    "write_diary", {"entry": "нельзя выполнять"}, "forbidden"
+                ),
+                _final(_telegram_final("лучше отвечу текстом")),
+            ],
+            on_activate=activate,
+            telegram_fast_enabled=True,
+        )
+
+        result = await agent.run_turn(
+            TurnTrigger(
+                kind="telegram_notice",
+                occurred_at=datetime.now(timezone.utc),
+                metadata=_production_notice_metadata(),
+            )
+        )
+
+        self.assertEqual(core.calls, [])
+        self.assertEqual(telegram.calls, [])
+        self.assertEqual(stickers.calls, [])
+        self.assertEqual(len(result.tool_results), 1)
+        self.assertFalse(result.tool_results[0].ok)
+        self.assertNotIn("write_diary", _tool_names(model.responses.requests[0]))
+
+    async def test_media_notice_is_direct_without_tools_and_outside_text_sla(self):
+        async def activate(_spec, _session):
+            return {
+                "target_token": "turn-only-token",
+                "messages": [
+                    {
+                        "message_id": 7,
+                        "text": "что на фото?",
+                        "media_type": "photo",
+                        "media_path": "runtime/photo.png",
+                    }
+                ],
+            }
+
+        metadata = _production_notice_metadata()
+        metadata["notices"][0]["media_type"] = "photo"
+        trigger = TurnTrigger(
+            kind="telegram_notice",
+            occurred_at=datetime.now(timezone.utc),
+            metadata=metadata,
+        )
+        agent, model, *_ = self._agent(
+            [_final(_telegram_final("вижу фото"))],
+            on_activate=activate,
+            tool_result_content=lambda _result: [
+                {"type": "input_image", "image_url": "data:image/png;base64,eA=="}
+            ],
+            telegram_fast_enabled=True,
+        )
+
+        await agent.run_turn(trigger)
+
+        self.assertEqual(len(model.responses.requests), 1)
+        self.assertEqual(model.responses.requests[0]["tools"], [])
+        self.assertNotIn(
+            "state_update",
+            model.responses.requests[0]["text"]["format"]["schema"]["properties"],
+        )
+        self.assertTrue(agent._is_direct_telegram_trigger(trigger))
+        self.assertFalse(agent._is_fast_telegram_trigger(trigger))
+
+    async def test_materialized_reminder_command_is_direct_without_tools(self):
         async def activate(_spec, _session):
             return {
                 "target_token": "turn-only-token",
@@ -389,12 +438,7 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
 
         agent, model, _, telegram, _ = self._agent(
             [
-                _function_call(
-                    "schedule_message",
-                    {"delay_seconds": 3600, "message": "Time to stretch"},
-                    "reminder",
-                ),
-                _final(empty_turn_payload(telegram=True)),
+                _final(_telegram_final("i can't set that from this chat")),
             ],
             on_activate=activate,
             telegram_fast_enabled=True,
@@ -409,10 +453,10 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(len(model.responses.requests), 2)
-        self.assertIn("schedule_message", _tool_names(model.responses.requests[0]))
-        self.assertEqual(telegram.calls[-1][1], "schedule_message")
-        self.assertTrue(result.trigger.metadata["requires_tools"])
+        self.assertEqual(len(model.responses.requests), 1)
+        self.assertEqual(model.responses.requests[0]["tools"], [])
+        self.assertEqual(telegram.calls, [])
+        self.assertNotIn("_telegram_sticker_tools", result.trigger.metadata)
 
     async def test_notice_activation_failure_stops_before_model_call(self):
         async def deny(_spec, _session):
@@ -510,7 +554,7 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
         # channel action never reaches the Telegram executor.
         self.assertEqual(telegram.calls, [])
 
-    async def test_fast_path_accepts_full_legacy_payload_during_rollout(self):
+    async def test_direct_route_rejects_full_legacy_world_payload(self):
         legacy = empty_turn_payload(telegram=True)
         legacy["telegram"] = {
             "target_token": "turn-only-token",
@@ -522,26 +566,29 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
             [_final(legacy)], telegram_fast_enabled=True
         )
 
-        result = await agent.run_turn(
-            TurnTrigger(
-                kind="telegram_notice",
-                occurred_at=datetime.now(timezone.utc),
-                metadata={"chat_id": 77},
+        with self.assertRaisesRegex(ValueError, "Final payload fields"):
+            await agent.run_turn(
+                TurnTrigger(
+                    kind="telegram_notice",
+                    occurred_at=datetime.now(timezone.utc),
+                    metadata={"chat_id": 77},
+                )
             )
-        )
 
         self.assertEqual(len(model.responses.requests), 1)
-        self.assertEqual(result.payload, legacy)
 
-    async def test_fast_relationship_delta_is_strictly_bounded(self):
-        invalid = _telegram_final(
-            relationship_delta={"closeness": 6, "reciprocity": 0, "tension": 0}
-        )
+    async def test_direct_route_rejects_legacy_world_fields(self):
+        invalid = _telegram_final()
+        invalid["relationship_delta"] = {
+            "closeness": 1,
+            "reciprocity": 0,
+            "tension": 0,
+        }
         agent, model, *_ = self._agent(
             [_final(invalid)], telegram_fast_enabled=True
         )
 
-        with self.assertRaisesRegex(ValueError, "relationship_delta.closeness"):
+        with self.assertRaisesRegex(ValueError, "Final payload fields"):
             await agent.run_turn(
                 TurnTrigger(
                     kind="telegram_notice",

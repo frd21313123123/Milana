@@ -20,8 +20,6 @@ class _FakeResponses:
     async def create(self, **request):
         self.requests.append(request)
         payload = {
-            "memory_note": None,
-            "relationship_delta": None,
             "telegram": {
                 "target_token": "benchmark-target-token",
                 "messages": ["короткий ответ"],

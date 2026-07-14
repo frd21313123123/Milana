@@ -2040,7 +2040,7 @@ class MilanaService:
         return None
 
     async def _state_context(self, trigger: TurnTrigger) -> Mapping[str, Any]:
-        if self.agent._is_fast_telegram_trigger(trigger):
+        if self.agent._is_compact_telegram_trigger(trigger):
             state = self.state.get_agent_state()
             chat_id = trigger.metadata.get("chat_id")
             relationship = None
@@ -2073,8 +2073,8 @@ class MilanaService:
                 "memory_notes": diary,
                 "turn_policy": {
                     "one_telegram_message": True,
-                    "relationship_delta_limit": 5,
-                    "memory_note_max_characters": 500,
+                    "application_reply_only": True,
+                    "model_tools": "none_except_explicit_sticker_request",
                 },
             }
         world = self.state.load_world_context()
