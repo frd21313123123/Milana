@@ -117,7 +117,9 @@ class AgyModelClientTests(unittest.TestCase):
 
         command = client._command("короткий prompt", workspace)
 
-        self.assertEqual(command[:3], ["agy", "--model", "gemini-3.5-flash"])
+        self.assertEqual(
+            command[:3], ["agy", "--model", "Gemini 3.5 Flash (Medium)"]
+        )
         self.assertIn("--sandbox", command)
         self.assertIn("--dangerously-skip-permissions", command)
         self.assertEqual(command[-2:], ["-p", "короткий prompt"])

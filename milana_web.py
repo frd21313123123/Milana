@@ -33,6 +33,7 @@ LLM_FILE = BASE_DIR / "llm.choice"
 OUT_LOG = BASE_DIR / "bot-output.log"
 ERR_LOG = BASE_DIR / "bot-error.log"
 BAT_FILE = BASE_DIR / "bot_control.bat"
+PANEL_FILE = BASE_DIR / "milana_panel.html"
 
 PS = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
 
@@ -350,6 +351,7 @@ def _rich_state(state_store: Any | None) -> dict[str, Any] | None:
     if state_store is None:
         return None
     state = state_store.get_agent_state()
+    entities = state_store.list_entities(include_archived=True, limit=100)
     return {
         "state": _json_value(state),
         "needs": state.needs,
@@ -357,10 +359,17 @@ def _rich_state(state_store: Any | None) -> dict[str, Any] | None:
         "events": _json_value(
             state_store.list_life_events(include_archived=True, limit=100)
         ),
-        "entities": _json_value(
-            state_store.list_entities(include_archived=True, limit=100)
-        ),
+        "entities": [
+            {
+                **_json_value(entity),
+                "facts": _json_value(
+                    state_store.get_facts(entity.id, include_history=False)
+                ),
+            }
+            for entity in entities
+        ],
         "relationships": _json_value(state_store.list_relationships(limit=100)),
+        "summaries": _json_value(state_store.list_world_summaries(limit=12)),
         "heartbeat_jobs": _json_value(
             state_store.list_heartbeat_jobs(limit=50)
         ),
@@ -374,7 +383,11 @@ def collect_status(context: WebPanelContext | None = None) -> dict[str, Any]:
     mode = resolve_mode(pids) if running else "OFF"
     llm = get_llm_choice()
 
-    llm_label = "Gemini 3.5 Flash" if llm == "gemini" else "OpenAI (ai_config.json)"
+    llm_label = (
+        "Gemini 3.5 Flash (Medium)"
+        if llm == "gemini"
+        else "OpenAI (ai_config.json)"
+    )
 
     processes: list[dict[str, Any]] = []
     for pid in pids:
@@ -417,6 +430,12 @@ def collect_status(context: WebPanelContext | None = None) -> dict[str, Any]:
                 supplied = context.status_provider()
                 if isinstance(supplied, Mapping):
                     result["service"] = _json_value(supplied)
+                    if supplied.get("service") == "running":
+                        result["running"] = True
+                        result["status_text"] = "ЗАПУЩЕНА"
+                        result["mode"] = (
+                            "DEV" if supplied.get("dev_mode") else "NORMAL"
+                        )
             except Exception as exc:
                 result["service_error"] = f"{type(exc).__name__}: {exc}"
     return result
@@ -428,6 +447,25 @@ def collect_logs() -> dict[str, Any]:
         "errors": _tail(ERR_LOG, 30),
         "timestamp": datetime.now().strftime("%H:%M:%S"),
     }
+
+
+def get_index_html() -> str:
+    """Load the dependency-free panel so a missing CDN cannot blank the UI."""
+
+    try:
+        return PANEL_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return INDEX_HTML
+
+
+def _defer_process_action(action: Callable[[], Any], delay: float = 0.35) -> None:
+    """Run a lifecycle action after its HTTP response has reached the browser."""
+
+    def run() -> None:
+        time.sleep(delay)
+        action()
+
+    threading.Thread(target=run, name="milana-web-lifecycle", daemon=True).start()
 
 
 # --- HTTP обработчик ---
@@ -1062,11 +1100,23 @@ INDEX_HTML = """<!DOCTYPE html>
 class MilanaHandler(BaseHTTPRequestHandler):
     panel_context = WebPanelContext()
 
+    def log_message(self, format: str, *args: Any) -> None:
+        """`pythonw.exe` has no stderr; access logging must not break replies."""
+
+        if sys.stderr is None:
+            return
+        try:
+            super().log_message(format, *args)
+        except (AttributeError, OSError):
+            pass
+
     def _send_headers(self, code: int = 200, content_type: str = "application/json"):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:")
         self.end_headers()
 
     def send_json(self, payload: dict[str, Any], code: int = 200):
@@ -1080,7 +1130,6 @@ class MilanaHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
@@ -1090,7 +1139,7 @@ class MilanaHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
 
         if path in ("/", "/index.html", "/ui"):
-            self.send_html(INDEX_HTML)
+            self.send_html(get_index_html())
             return
 
         if path == "/api/status":
@@ -1107,12 +1156,23 @@ class MilanaHandler(BaseHTTPRequestHandler):
 
     # --- POST ---
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.send_json({"ok": False, "message": "Некорректный Content-Length"}, 400)
+            return
+        if length < 0 or length > 64 * 1024:
+            self.send_json({"ok": False, "message": "Слишком большой запрос"}, 413)
+            return
         raw = self.rfile.read(length) if length else b"{}"
         try:
             body = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
-            body = {}
+            self.send_json({"ok": False, "message": "Некорректный JSON"}, 400)
+            return
+        if not isinstance(body, dict):
+            self.send_json({"ok": False, "message": "Тело запроса должно быть объектом"}, 400)
+            return
 
         path = self.path.split("?")[0]
 
@@ -1124,15 +1184,13 @@ class MilanaHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/stop":
-            result = do_stop()
-            result["action"] = "stop"
-            self.send_json(result)
+            _defer_process_action(do_stop)
+            self.send_json({"ok": True, "action": "stop", "message": "Остановка запущена"}, 202)
             return
 
         if path == "/api/restart":
-            result = do_restart()
-            result["action"] = "restart"
-            self.send_json(result)
+            _defer_process_action(do_restart)
+            self.send_json({"ok": True, "action": "restart", "message": "Перезапуск запущен"}, 202)
             return
 
         if path == "/api/model":
@@ -1143,15 +1201,26 @@ class MilanaHandler(BaseHTTPRequestHandler):
             return
 
         callback_routes = {
-            "/api/heartbeat/pause": ("pause_heartbeat", None),
-            "/api/heartbeat/resume": ("resume_heartbeat", None),
-            "/api/heartbeat/wake": ("wake_now", None),
-            "/api/goals/archive": ("archive_goal", "id"),
-            "/api/events/archive": ("archive_event", "id"),
+            "/api/heartbeat/pause": ("pause_heartbeat", False),
+            "/api/heartbeat/resume": ("resume_heartbeat", False),
+            "/api/heartbeat/wake": ("wake_now", False),
+            "/api/heartbeat/jobs/cancel": ("cancel_heartbeat_job", True),
+            "/api/state/update": ("update_state", True),
+            "/api/goals/create": ("create_goal", True),
+            "/api/goals/update": ("update_goal", True),
+            "/api/goals/complete": ("complete_goal", True),
+            "/api/goals/archive": ("archive_goal", True),
+            "/api/events/create": ("create_event", True),
+            "/api/events/archive": ("archive_event", True),
+            "/api/entities/create": ("create_entity", True),
+            "/api/entities/fact": ("set_entity_fact", True),
+            "/api/entities/archive": ("archive_entity", True),
+            "/api/relationships/update": ("update_relationship", True),
+            "/api/telegram/restart": ("restart_telegram_host", False),
         }
         route = callback_routes.get(path)
         if route is not None:
-            callback_name, argument_name = route
+            callback_name, pass_body = route
             callback = self.panel_context.callback(callback_name)
             if callback is None:
                 self.send_json(
@@ -1163,11 +1232,7 @@ class MilanaHandler(BaseHTTPRequestHandler):
                 )
                 return
             try:
-                result = (
-                    callback()
-                    if argument_name is None
-                    else callback(body.get(argument_name))
-                )
+                result = callback(body) if pass_body else callback()
                 self.send_json(
                     {
                         "ok": True,

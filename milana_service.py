@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import os
 import random
 import sys
 from dataclasses import asdict, is_dataclass, replace
@@ -76,6 +77,8 @@ RUNTIME_DIR = BASE_DIR / "data" / "runtime"
 TOKEN_FILE = RUNTIME_DIR / "telegram-host.token"
 HOST_MEDIA_DIR = RUNTIME_DIR / "telegram-media"
 DEFAULT_WEB_PORT = 8765
+PID_FILE = BASE_DIR / "bot.pid"
+MODE_FILE = BASE_DIR / "bot.mode"
 MAX_TELEGRAM_NOTICES_PER_TURN = 100
 _WORKER_STOP = object()
 
@@ -1551,6 +1554,114 @@ class MilanaService:
             loop.call_soon_threadsafe(callback)
             return {"queued": True}
 
+        def require_id(body: Mapping[str, Any], label: str) -> str:
+            value = body.get("id")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Нужен ID: {label}")
+            return value.strip()
+
+        def update_state(body: Mapping[str, Any]) -> Any:
+            state = self.state.get_agent_state()
+            needs = body.get("needs", {})
+            if needs is not None and not isinstance(needs, Mapping):
+                raise TypeError("needs должен быть объектом")
+            deltas: dict[str, int] = {}
+            for name in ("social", "rest", "novelty", "achievement"):
+                if name not in (needs or {}):
+                    continue
+                target = needs[name]
+                if isinstance(target, bool) or not isinstance(target, int):
+                    raise TypeError(f"needs.{name} должен быть целым числом")
+                deltas[name] = target - state.needs[name]
+            if deltas:
+                state = self.state.apply_need_deltas(
+                    deltas, expected_revision=state.revision
+                )
+            return self.state.update_agent_state(
+                mood=body.get("mood"),
+                valence=body.get("valence"),
+                arousal=body.get("arousal"),
+                current_intention=body.get("current_intention"),
+                clear_intention=bool(body.get("clear_intention", False)),
+                expected_revision=state.revision,
+            )
+
+        def create_goal(body: Mapping[str, Any]) -> Any:
+            return self.state.create_goal(
+                body.get("title"),
+                description=body.get("description", ""),
+                horizon=body.get("horizon", "short"),
+                progress=body.get("progress", 0),
+            )
+
+        def update_goal(body: Mapping[str, Any]) -> Any:
+            return self.state.update_goal(
+                require_id(body, "цели"),
+                title=body.get("title"),
+                description=body.get("description", ""),
+                horizon=body.get("horizon"),
+                progress=body.get("progress"),
+            )
+
+        def create_event(body: Mapping[str, Any]) -> Any:
+            entity_ids = body.get("entity_ids", [])
+            if not isinstance(entity_ids, list):
+                raise TypeError("entity_ids должен быть массивом")
+            return self.state.add_life_event(
+                body.get("title"),
+                body.get("description", ""),
+                kind=body.get("kind", "life"),
+                importance=body.get("importance", 50),
+                entity_ids=entity_ids,
+            )
+
+        def create_entity(body: Mapping[str, Any]) -> Any:
+            facts = body.get("facts", {})
+            if not isinstance(facts, Mapping):
+                raise TypeError("facts должен быть объектом")
+            return self.state.create_entity(
+                body.get("kind", "person"),
+                body.get("name"),
+                description=body.get("description", ""),
+                is_real=bool(body.get("is_real", False)),
+                entity_id=body.get("id"),
+                facts=tuple(
+                    FactSeed(str(key), value, False, "web-panel")
+                    for key, value in facts.items()
+                ),
+            )
+
+        def set_entity_fact(body: Mapping[str, Any]) -> Any:
+            entity_id = require_id(body, "сущности")
+            key = body.get("key")
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("Нужен ключ факта")
+            return self.state.set_fact(
+                entity_id, key, body.get("value"), source="web-panel"
+            )
+
+        def update_relationship(body: Mapping[str, Any]) -> Any:
+            entity_id = require_id(body, "сущности")
+            current = self.state.get_relationship(entity_id)
+            return self.state.upsert_relationship(
+                entity_id,
+                closeness=body.get(
+                    "closeness", current.closeness if current else 50
+                ),
+                reciprocity=body.get(
+                    "reciprocity", current.reciprocity if current else 50
+                ),
+                tension=body.get("tension", current.tension if current else 0),
+                awaiting_reply=body.get(
+                    "awaiting_reply", current.awaiting_reply if current else False
+                ),
+                blocked=body.get("blocked", current.blocked if current else False),
+            )
+
+        async def restart_telegram_host() -> None:
+            await self.supervisor.stop()
+            await self.supervisor.start()
+
         self._web_panel = start_web_server(
             port=port,
             state_store=self.state,
@@ -1560,8 +1671,31 @@ class MilanaService:
                 "wake_now": lambda: on_loop(
                     lambda: self.heartbeat.wake(HeartbeatReason.MANUAL_WAKE)
                 ),
-                "archive_goal": self.state.archive_goal,
-                "archive_event": self.state.archive_life_event,
+                "cancel_heartbeat_job": lambda body: self.state.cancel_heartbeat_job(
+                    require_id(body, "heartbeat-задачи")
+                ),
+                "update_state": update_state,
+                "create_goal": create_goal,
+                "update_goal": update_goal,
+                "complete_goal": lambda body: self.state.complete_goal(
+                    require_id(body, "цели")
+                ),
+                "archive_goal": lambda body: self.state.archive_goal(
+                    require_id(body, "цели")
+                ),
+                "create_event": create_event,
+                "archive_event": lambda body: self.state.archive_life_event(
+                    require_id(body, "события")
+                ),
+                "create_entity": create_entity,
+                "set_entity_fact": set_entity_fact,
+                "archive_entity": lambda body: self.state.archive_entity(
+                    require_id(body, "сущности")
+                ),
+                "update_relationship": update_relationship,
+                "restart_telegram_host": lambda: on_loop(
+                    lambda: asyncio.create_task(restart_telegram_host())
+                ),
             },
             status_provider=self.status,
         )
@@ -1591,12 +1725,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _main_async(args: argparse.Namespace) -> None:
-    service = await MilanaService.create_default(dev_mode=args.dev_chat)
-    print(
-        "MilanaService запущен: Telegram является дочерним навыком, "
-        f"режим={'DEV' if args.dev_chat else 'обычный'}, модель={service.config.model}."
+    pid = os.getpid()
+    PID_FILE.write_text(str(pid), encoding="ascii")
+    MODE_FILE.write_text(
+        f"{pid} {'DEV' if args.dev_chat else 'NORMAL'}", encoding="ascii"
     )
-    await service.run_forever(web_port=None if args.no_web else args.web_port)
+    try:
+        service = await MilanaService.create_default(dev_mode=args.dev_chat)
+        print(
+            "MilanaService запущен: Telegram является дочерним навыком, "
+            f"режим={'DEV' if args.dev_chat else 'обычный'}, модель={service.config.model}."
+        )
+        await service.run_forever(web_port=None if args.no_web else args.web_port)
+    finally:
+        try:
+            if PID_FILE.read_text(encoding="ascii").strip() == str(pid):
+                PID_FILE.unlink(missing_ok=True)
+                MODE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:

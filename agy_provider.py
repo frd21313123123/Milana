@@ -30,6 +30,10 @@ DATA_URL_RE = re.compile(
 READ_ONLY_SENTINEL = "[[READ_ONLY]]"
 WINDOWS_INLINE_COMMAND_MAX_UNITS = 24_000
 POSIX_INLINE_COMMAND_MAX_BYTES = 64 * 1024
+AGY_MODEL_ALIASES = {
+    # Current Antigravity CLI versions accept the displayed preset name.
+    "gemini-3.5-flash": "Gemini 3.5 Flash (Medium)",
+}
 
 
 class AgyError(RuntimeError):
@@ -384,7 +388,9 @@ class AgyModelClient:
         cancel_event: threading.Event | None = None,
     ) -> str:
         log_error: str | None = None
-        with TemporaryDirectory(prefix="milana-agy-") as raw_workspace:
+        with TemporaryDirectory(
+            prefix="milana-agy-", ignore_cleanup_errors=True
+        ) as raw_workspace:
             workspace = Path(raw_workspace)
             payload = self._request_payload(request, workspace)
             structured = "text" in request
@@ -472,7 +478,7 @@ class AgyModelClient:
         command = [
             self.executable,
             "--model",
-            self.model,
+            AGY_MODEL_ALIASES.get(self.model, self.model),
             "--print-timeout",
             f"{self.timeout_seconds}s",
             "--log-file",

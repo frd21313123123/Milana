@@ -4,6 +4,7 @@ chcp 65001 >nul
 
 set "ROOT=%~dp0"
 set "PYTHON=%ROOT%.venv\Scripts\python.exe"
+set "PYTHONW=%ROOT%.venv\Scripts\pythonw.exe"
 set "SCRIPT=%ROOT%milana_service.py"
 set "SCHEDULE_SCRIPT=%ROOT%milana_schedule.py"
 set "PID_FILE=%ROOT%bot.pid"
@@ -79,7 +80,7 @@ set "START_MODE=normal (schedule enabled)"
 goto start_common
 
 :start_dev
-set "DEV_CHAT_ARG=, '--dev-chat'"
+set "DEV_CHAT_ARG=--dev-chat"
 set "START_MODE_KEY=DEV"
 set "START_MODE=DEV chat (immediate replies)"
 goto start_common
@@ -89,7 +90,7 @@ call :load_llm_choice
 if /I "%LLM_CHOICE%"=="gemini" (
     where agy >nul 2>&1
     if errorlevel 1 (
-        echo Cannot start with Gemini 3.5 Flash: the "agy" command was not found in PATH.
+        echo Cannot start with Gemini 3.5 Flash Medium: the "agy" command was not found in PATH.
         echo Install and configure agy, or switch back with: bot_control.bat model openai
         goto action_done
     )
@@ -98,6 +99,7 @@ if not exist "%PYTHON%" (
     echo Python environment not found: %PYTHON%
     goto action_done
 )
+if not exist "%PYTHONW%" set "PYTHONW=%PYTHON%"
 if not exist "%SCRIPT%" (
     echo Bot script not found: %SCRIPT%
     goto action_done
@@ -111,11 +113,21 @@ if defined BOT_PIDS (
 if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
 if exist "%MODE_FILE%" del /q "%MODE_FILE%" >nul 2>&1
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $pathValue = [Environment]::GetEnvironmentVariable('Path'); [Environment]::SetEnvironmentVariable('PATH', $null); [Environment]::SetEnvironmentVariable('Path', $pathValue); $p = Start-Process -FilePath '%PYTHON%' -ArgumentList '-u', '%SCRIPT%'%DEV_CHAT_ARG% -WorkingDirectory '%ROOT%' -WindowStyle Hidden -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -PassThru; Set-Content -NoNewline -Encoding ascii -Path '%PID_FILE%' -Value $p.Id; Set-Content -NoNewline -Encoding ascii -Path '%MODE_FILE%' -Value ($p.Id.ToString() + ' %START_MODE_KEY%')"
+if defined DEV_CHAT_ARG (
+    start "" "%PYTHONW%" -u "%SCRIPT%" --dev-chat 1>"%OUT_LOG%" 2>"%ERR_LOG%"
+) else (
+    start "" "%PYTHONW%" -u "%SCRIPT%" 1>"%OUT_LOG%" 2>"%ERR_LOG%"
+)
 if errorlevel 1 (
-    echo Failed to start the bot. Check PowerShell availability.
+    echo Failed to start the bot.
     call :cleanup_failed_start
     goto action_done
+)
+
+rem MilanaService records the PID of the real interpreter itself. This avoids
+rem saving the short-lived venv launcher PID on Windows.
+for /L %%N in (1,1,20) do (
+    if not exist "%PID_FILE%" "%PS%" -NoProfile -Command "Start-Sleep -Milliseconds 250"
 )
 
 call :read_pid
@@ -163,7 +175,7 @@ echo.
 call :show_llm_choice
 echo.
 echo 1. OpenAI (model configured in ai_config.json)
-echo 2. Gemini 3.5 Flash (gemini-3.5-flash)
+echo 2. Gemini 3.5 Flash Medium (Gemini 3.5 Flash ^(Medium^))
 echo 0. Back
 echo.
 set "MODEL_CHOICE="
@@ -204,7 +216,13 @@ if /I "%BOT_MODE%"=="UNKNOWN" (
 set "RESTART_PIDS=%BOT_PIDS%"
 set "RESTART_MODE=%BOT_MODE%"
 for %%P in (%RESTART_PIDS%) do (
-    taskkill /PID %%P /T /F >nul 2>&1
+    rem Do not use /T here: when restart is requested by the embedded web
+    rem panel this controller is itself a child of MilanaService. Killing the
+    rem whole tree would kill the controller before it can start the new copy.
+    taskkill /PID %%P /F >nul 2>&1
+)
+for /f "delims=" %%H in ('%PS% -NoProfile -Command "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; foreach ($process in $processes) { if ($process.CommandLine -and $process.CommandLine -match '(?i)telegram_skill_host\.py') { $process.ProcessId } }"') do (
+    taskkill /PID %%H /F >nul 2>&1
 )
 if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
 if exist "%MODE_FILE%" del /q "%MODE_FILE%" >nul 2>&1
@@ -272,7 +290,7 @@ exit /b 0
 :show_llm_choice
 call :load_llm_choice
 if /I "%LLM_CHOICE%"=="gemini" (
-    echo Configured LLM: Gemini 3.5 Flash - gemini-3.5-flash
+    echo Configured LLM: Gemini 3.5 Flash Medium
 ) else (
     echo Configured LLM: OpenAI - model configured in ai_config.json
 )
@@ -383,8 +401,13 @@ goto action_done
 :open_web
 call :find_bot_pids
 if not defined BOT_PIDS (
-    echo MilanaService is not running. Start it first with: bot_control.bat start
-    goto action_done
+    echo MilanaService is not running. Starting it now...
+    call "%~f0" start
+    call :find_bot_pids
+    if not defined BOT_PIDS (
+        echo Could not start MilanaService. Check bot-error.log.
+        goto action_done
+    )
 )
 
 rem The web panel is embedded in MilanaService. This command only opens it.
