@@ -12,6 +12,22 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.actions = []
         self.service_status = {
             "telegram_host": {"connected": True, "process_running": True},
+            "pending_replies": [
+                {
+                    "chat_id": "77",
+                    "status": "waiting",
+                    "message_count": 2,
+                    "respond_at": "2026-07-15T16:30:00+05:00",
+                    "detail": "ответ через 1–4 мин",
+                }
+            ],
+            "next_reply": {
+                "chat_id": "77",
+                "status": "waiting",
+                "message_count": 2,
+                "respond_at": "2026-07-15T16:30:00+05:00",
+                "detail": "ответ через 1–4 мин",
+            },
             "telegram_latency": {
                 "enabled": False,
                 "sample_size": 0,
@@ -46,7 +62,14 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.assertIn("life", payload)
         self.assertEqual(payload["life"]["needs"]["social"], 50)
         self.assertTrue(payload["service"]["telegram_host"]["connected"])
+        self.assertEqual(payload["service"]["next_reply"]["chat_id"], "77")
+        self.assertEqual(
+            payload["service"]["pending_replies"][0]["message_count"], 2
+        )
         self.assertIsNone(payload["service"]["telegram_latency"]["slo_met"])
+        self.assertTrue(payload["schedule"]["available"])
+        self.assertIn("activities", payload["schedule"])
+        self.assertIn("response_policy", payload["schedule"])
 
     def test_status_preserves_full_active_latency_distribution(self):
         self.service_status["telegram_latency"] = {
@@ -146,6 +169,10 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.assertIn("/api/relationships/update", html)
         self.assertIn('id="telegram-latency"', html)
         self.assertIn('id="telegram-phases"', html)
+        self.assertIn('id="next-reply"', html)
+        self.assertIn('id="schedule-list"', html)
+        self.assertIn("pending_replies", html)
+        self.assertIn("replyEta", html)
         self.assertIn("l.enabled===true", html)
         self.assertIn("fast path выключен", html)
         self.assertIn("provider_queue_ms", html)

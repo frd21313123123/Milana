@@ -17,6 +17,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -413,6 +414,8 @@ class MilanaService:
         self._notice_buffers: dict[str, list[dict[str, Any]]] = {}
         self._notice_first_at: dict[str, float] = {}
         self._notice_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reply_estimates: dict[str, dict[str, Any]] = {}
+        self._reply_estimates_lock = threading.Lock()
         self._seen_notices: set[str] = set()
         self._night_thresholds: dict[str, int] = {}
         self._worker_queues: dict[str, asyncio.Queue[TurnTrigger]] = {}
@@ -437,6 +440,75 @@ class MilanaService:
         self._presence_lock = asyncio.Lock()
         self._presence_online = False
         self._attention_until: datetime | None = None
+
+    def _set_reply_estimate(
+        self,
+        chat_key: str,
+        *,
+        status: str,
+        notice_ids: Sequence[str] | None = None,
+        message_count: int | None = None,
+        respond_at: datetime | None = None,
+        received_at: datetime | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Publish reply progress for the web panel without exposing content."""
+
+        with self._reply_estimates_lock:
+            current = dict(self._reply_estimates.get(chat_key, {}))
+            current.update(
+                {
+                    "chat_id": chat_key,
+                    "status": status,
+                    "updated_at": self._now().isoformat(),
+                }
+            )
+            if notice_ids is not None:
+                current["notice_ids"] = list(notice_ids)
+            if message_count is not None:
+                current["message_count"] = message_count
+            if respond_at is not None:
+                current["respond_at"] = respond_at.isoformat()
+            elif status == "collecting":
+                current["respond_at"] = None
+            if received_at is not None:
+                current["received_at"] = received_at.isoformat()
+            if detail is not None:
+                current["detail"] = detail
+            self._reply_estimates[chat_key] = current
+
+    def _complete_reply_estimate(
+        self, chat_key: str, notice_ids: Sequence[str]
+    ) -> None:
+        """Remove only the estimate owned by the completed logical reply."""
+
+        completed = set(notice_ids)
+        with self._reply_estimates_lock:
+            current = self._reply_estimates.get(chat_key)
+            if current is None:
+                return
+            tracked = {
+                item
+                for item in current.get("notice_ids", ())
+                if isinstance(item, str)
+            }
+            if not tracked or tracked.issubset(completed):
+                self._reply_estimates.pop(chat_key, None)
+
+    def _reply_estimates_status(self) -> list[dict[str, Any]]:
+        with self._reply_estimates_lock:
+            estimates = [
+                {key: value for key, value in item.items() if key != "notice_ids"}
+                for item in self._reply_estimates.values()
+            ]
+        return sorted(
+            estimates,
+            key=lambda item: (
+                item.get("respond_at") is None,
+                item.get("respond_at") or item.get("received_at") or "",
+                item.get("chat_id") or "",
+            ),
+        )
 
     @classmethod
     async def create_default(
@@ -751,6 +823,19 @@ class MilanaService:
             summary_task.cancel()
         self._notice_buffers.setdefault(chat_key, []).append(dict(params))
         self._merge_queued_notices(chat_key)
+        buffered_notices = self._notice_buffers.get(chat_key, [])
+        self._set_reply_estimate(
+            chat_key,
+            status="collecting",
+            notice_ids=[
+                item["notice_id"]
+                for item in buffered_notices
+                if isinstance(item.get("notice_id"), str)
+            ],
+            message_count=len(buffered_notices),
+            received_at=self.last_telegram_notice_at,
+            detail="Милана ждёт окончания серии сообщений",
+        )
         loop = asyncio.get_running_loop()
         self._notice_first_at.setdefault(chat_key, loop.time())
         previous = self._notice_tasks.get(chat_key)
@@ -843,6 +928,13 @@ class MilanaService:
             notices = list(self._notice_buffers.get(chat_key, []))
             if not notices:
                 return
+            notice_ids = [
+                item["notice_id"]
+                for item in notices
+                if isinstance(item.get("notice_id"), str)
+            ]
+            respond_at = self._now()
+            detail = "Ответ поставлен в очередь"
             if not self.dev_mode:
                 received = self._now()
                 active_conversation = self._chat_recently_active(
@@ -859,9 +951,31 @@ class MilanaService:
                         received,
                         last_attentive_at=self.memory.get_last_attentive_at(),
                     )
+                    respond_at = plan.respond_at
+                    detail = plan.policy.label
                     delay = max(0.0, (plan.respond_at - received).total_seconds())
+                    self._set_reply_estimate(
+                        chat_key,
+                        status="waiting",
+                        notice_ids=notice_ids,
+                        message_count=len(notices),
+                        respond_at=respond_at,
+                        detail=detail,
+                    )
                     if delay:
                         await asyncio.sleep(delay)
+                else:
+                    detail = "Диалог уже активен — ответ без паузы расписания"
+            else:
+                detail = "DEV-режим — ответ без паузы расписания"
+            self._set_reply_estimate(
+                chat_key,
+                status="queued",
+                notice_ids=notice_ids,
+                message_count=len(notices),
+                respond_at=respond_at,
+                detail=detail,
+            )
             notices = self._notice_buffers.pop(chat_key, [])
             self._notice_first_at.pop(chat_key, None)
             self._notice_tasks.pop(chat_key, None)
@@ -998,11 +1112,22 @@ class MilanaService:
             notice_ids = named_materialization_failures
         attempts = self.state.telegram_notice_attempt_count(notice_ids)
         delay_seconds = (5, 30, 300)[min(attempts, 2)]
+        retry_at = self._now() + timedelta(seconds=delay_seconds)
         self.state.fail_telegram_notices(
             notice_ids,
             error_text,
-            retry_at=self._now() + timedelta(seconds=delay_seconds),
+            retry_at=retry_at,
         )
+        chat_id = trigger.metadata.get("chat_id")
+        if isinstance(chat_id, (str, int)) and not isinstance(chat_id, bool):
+            self._set_reply_estimate(
+                str(chat_id),
+                status="retrying",
+                notice_ids=notice_ids,
+                message_count=len(notice_ids),
+                respond_at=retry_at,
+                detail="Ошибка отправки; сервис повторит попытку",
+            )
         for notice_id in notice_ids:
             self._seen_notices.discard(notice_id)
 
@@ -1032,8 +1157,22 @@ class MilanaService:
             self._active_turn_tasks[key] = task
             self._active_triggers[key] = trigger
             self._turn_phases[key] = "generation"
+            if trigger.kind == "telegram_notice":
+                notice_ids = self._trigger_notice_ids(trigger)
+                self._set_reply_estimate(
+                    key,
+                    status="generating",
+                    notice_ids=notice_ids,
+                    message_count=len(notice_ids),
+                    respond_at=self._now(),
+                    detail="Милана формирует ответ",
+                )
             try:
                 result = await task
+                if trigger.kind == "telegram_notice":
+                    self._complete_reply_estimate(
+                        key, self._trigger_notice_ids(trigger)
+                    )
                 if isinstance(completion, asyncio.Future) and not completion.done():
                     completion.set_result(result)
             except asyncio.CancelledError:
@@ -1117,6 +1256,16 @@ class MilanaService:
             turn_key = self._turn_key(trigger)
             if self._active_triggers.get(turn_key) is trigger:
                 self._turn_phases[turn_key] = "commit"
+                if trigger.kind == "telegram_notice":
+                    notice_ids = self._trigger_notice_ids(trigger)
+                    self._set_reply_estimate(
+                        turn_key,
+                        status="sending",
+                        notice_ids=notice_ids,
+                        message_count=len(notice_ids),
+                        respond_at=self._now(),
+                        detail="Ответ готов и отправляется в Telegram",
+                    )
             result = await self._commit_turn(result, stage)
             if trigger.kind == "telegram_notice":
                 raw_notice_ids = trigger.metadata.get("notice_ids", ())
@@ -2150,6 +2299,7 @@ class MilanaService:
                 },
             }
         world = self.state.load_world_context()
+        pending_replies = self._reply_estimates_status()
         return {
             "world": _json_ready(world),
             "schedule": self._schedule_context(trigger.occurred_at),
@@ -2756,6 +2906,8 @@ class MilanaService:
             "turn_queue_size": self._turn_queue.qsize(),
             "worker_queue_size": sum(queue.qsize() for queue in self._worker_queues.values()),
             "active_chats": [key for key in self._active_turn_tasks if key != "__life__"],
+            "pending_replies": pending_replies,
+            "next_reply": pending_replies[0] if pending_replies else None,
             "last_turn_at": self.last_turn_at.isoformat() if self.last_turn_at else None,
             "last_turn_error": self.last_turn_error,
             "telegram_notices": {

@@ -267,20 +267,44 @@ def get_schedule_state() -> dict[str, Any]:
         sys.path.insert(0, str(BASE_DIR))
         from milana_schedule import (
             DAY_NAMES,
+            format_activity_range,
             format_current_status,
+            format_response_policy,
             load_routine,
         )
 
         routine = load_routine()
         text = format_current_status(routine)
         state = routine.state_at()
+        current = state.current
+        activities = []
+        for activity in routine.days[state.day_key]:
+            activities.append(
+                {
+                    "title": activity.title,
+                    "kind": activity.kind,
+                    "range": format_activity_range(activity),
+                    "current": activity is current,
+                    "response": format_response_policy(
+                        routine._response_policy_for_activity(activity)
+                    ),
+                }
+            )
 
         return {
             "available": True,
             "text": text,
-            "current": _activity_label(state.current) if state.current else "Свободное время",
+            "current": _activity_label(current) if current else "Свободное время",
+            "current_range": format_activity_range(current) if current else None,
+            "response_policy": format_response_policy(
+                routine._response_policy_for_activity(current)
+            ),
+            "next": _activity_label(state.next_activity),
+            "next_at": state.next_at.isoformat() if state.next_at else None,
             "day": DAY_NAMES.get(state.day_key, state.day_key),
             "time": state.now.strftime("%H:%M"),
+            "timezone": routine.timezone_name,
+            "activities": activities,
             "metrics": {
                 "energy": state.metrics.energy,
                 "stress": state.metrics.stress,
