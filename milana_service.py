@@ -2299,7 +2299,6 @@ class MilanaService:
                 },
             }
         world = self.state.load_world_context()
-        pending_replies = self._reply_estimates_status()
         return {
             "world": _json_ready(world),
             "schedule": self._schedule_context(trigger.occurred_at),
@@ -2898,6 +2897,7 @@ class MilanaService:
             )
         latency["slo_evaluable"] = slo_evaluable
         latency["slo_met"] = slo_met
+        pending_replies = self._reply_estimates_status()
         return {
             "service": "running",
             "dev_mode": self.dev_mode,

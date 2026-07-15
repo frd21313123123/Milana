@@ -222,6 +222,27 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             build_heartbeat_changes(payload, self.state.get_agent_state())
 
+    def test_status_exposes_pending_reply_without_notice_ids(self):
+        service = self.service()
+        respond_at = NOW + timedelta(minutes=3)
+        service._set_reply_estimate(
+            "77",
+            status="waiting",
+            notice_ids=("tg:77:9",),
+            message_count=1,
+            received_at=NOW,
+            respond_at=respond_at,
+            detail="ответ через 1–4 мин",
+        )
+
+        status = service.status()
+
+        self.assertEqual(status["next_reply"]["chat_id"], "77")
+        self.assertEqual(status["next_reply"]["respond_at"], respond_at.isoformat())
+        self.assertNotIn("notice_ids", status["next_reply"])
+        service._complete_reply_estimate("77", ("tg:77:9",))
+        self.assertEqual(service.status()["pending_replies"], [])
+
     async def test_chat_context_weakens_needs_and_hides_stale_intention(self):
         state = self.state.apply_need_deltas(
             {"social": -15, "rest": 15},
