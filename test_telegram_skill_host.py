@@ -7,7 +7,13 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from milana_ipc import INVALID_PARAMS, JsonRpcError, MediaPathError, RequestContext
+from milana_ipc import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    JsonRpcError,
+    MediaPathError,
+    RequestContext,
+)
 from telegram_skill_host import (
     TelegramNotice,
     TelegramSkillHost,
@@ -188,6 +194,22 @@ class TelegramSkillHostTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(missing.exception.code, INVALID_PARAMS)
         self.assertIn("tg:10:7", str(missing.exception))
+
+    async def test_open_reports_unexpected_materialization_error(self):
+        async def broken_materialize(*_args, **_kwargs):
+            raise RuntimeError("Telegram connection is unavailable")
+
+        self.adapter.materialize = broken_materialize
+
+        with self.assertRaises(JsonRpcError) as failed:
+            await self.host._handle_open(
+                {"turn_id": "broken", "notice_ids": ["tg:10:7"]},
+                _request("telegram.open"),
+            )
+
+        self.assertEqual(failed.exception.code, INTERNAL_ERROR)
+        self.assertIn("RuntimeError", str(failed.exception))
+        self.assertIn("connection is unavailable", str(failed.exception))
 
     async def test_typing_signal_is_turn_scoped_but_needs_no_idempotency_key(self):
         opened = await self.host._handle_open(
@@ -729,6 +751,27 @@ class TelegramSkillHostTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelethonBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconnects_a_disconnected_telethon_client_before_rpc(self):
+        class Client:
+            def __init__(self):
+                self.connected = False
+                self.connect_calls = 0
+
+            def is_connected(self):
+                return self.connected
+
+            async def connect(self):
+                self.connect_calls += 1
+                self.connected = True
+
+        adapter = object.__new__(TelethonTelegramAdapter)
+        adapter.client = Client()
+
+        await adapter._ensure_connected()
+
+        self.assertTrue(adapter.client.connected)
+        self.assertEqual(adapter.client.connect_calls, 1)
+
     async def test_materialize_without_history_uses_cached_message_and_sender(self):
         sender = SimpleNamespace(
             id=20,

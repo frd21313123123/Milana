@@ -771,7 +771,7 @@ class SplitTelegramTextTests(unittest.TestCase):
 
 
 class GeminiQuotaFallbackClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_each_call_retries_gemini_and_falls_back_to_openai_on_quota(self) -> None:
+    async def test_each_call_retries_gemini_and_falls_back_to_openai(self) -> None:
         gemini = MagicMock()
         gemini.responses.create = AsyncMock(
             side_effect=AgyQuotaError("quota exceeded")
@@ -814,21 +814,22 @@ class GeminiQuotaFallbackClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("audio_url", str(fallback_request["input"]))
         self.assertEqual(log.call_count, 2)
 
-    async def test_non_quota_agy_error_does_not_use_fallback(self) -> None:
+    async def test_non_quota_agy_error_also_uses_fallback(self) -> None:
         gemini = MagicMock()
         gemini.responses.create = AsyncMock(side_effect=AgyError("auth or network"))
         openai = MagicMock()
-        openai.responses.create = AsyncMock()
+        expected = structured_response("Резервный ответ")
+        openai.responses.create = AsyncMock(return_value=expected)
         client = GeminiQuotaFallbackClient(
             gemini,
             openai,
             openai_model="gpt-fallback",
         )
 
-        with self.assertRaises(AgyError):
-            await client.responses.create(model="gemini-3.5-flash", input=[])
+        result = await client.responses.create(model="gemini-3.5-flash", input=[])
 
-        openai.responses.create.assert_not_awaited()
+        self.assertIs(result, expected)
+        openai.responses.create.assert_awaited_once()
 
 
 class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -951,7 +952,7 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [call(latest_at), call(manual_at)],
         )
 
-    async def test_gemini_runtime_uses_agy_without_provider_fallback(self) -> None:
+    async def test_gemini_runtime_falls_back_to_openai_when_configured(self) -> None:
         client = MagicMock()
         client.get_me = AsyncMock(return_value=SimpleNamespace(username="milana", id=1))
         client.run_until_disconnected = AsyncMock()
@@ -991,9 +992,10 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await run_ai_bot(client, dev_chat=True)
 
         agy_type.assert_called_once_with(model="gemini-3.5-flash")
-        openai_type.assert_not_called()
+        openai_type.assert_called_once_with(api_key="test-openai-key")
         model_client = responder_type.call_args.args[1]
-        self.assertIs(model_client, agy_client)
+        self.assertIsInstance(model_client, GeminiQuotaFallbackClient)
+        self.assertIs(model_client.gemini_client, agy_client)
         responder.shutdown.assert_awaited_once()
         memory.close.assert_called_once()
 

@@ -826,9 +826,6 @@ class MilanaStateStore:
                 if row is not None and row["status"] == "handled":
                     self._connection.commit()
                     return "handled"
-                if row is not None and int(row["attempts"] or 0) >= 3:
-                    self._connection.commit()
-                    return "dead"
                 if row is not None and row["next_attempt_at"] is not None:
                     retry_at = _parse_timestamp(str(row["next_attempt_at"]))
                     if retry_at is not None and retry_at > (received_at or _now()):
@@ -860,18 +857,27 @@ class MilanaStateStore:
                 self._connection.rollback()
                 raise
 
-    def list_pending_telegram_notices(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+    def list_pending_telegram_notices(
+        self, *, limit: int = 1000, include_deferred: bool = False
+    ) -> list[dict[str, Any]]:
         limit = _integer(limit, "Лимит Telegram notices", 1, 10_000)
+        if not isinstance(include_deferred, bool):
+            raise TypeError("include_deferred должен быть bool")
+        retry_filter = "" if include_deferred else """
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+        """
+        parameters: tuple[Any, ...] = (
+            (limit,) if include_deferred else (_timestamp(_now()), limit)
+        )
         with self._lock:
             rows = self._connection.execute(
-                """
+                f"""
                 SELECT payload_json FROM telegram_notice_journal
                 WHERE status = 'pending'
-                  AND attempts < 3
-                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                {retry_filter}
                 ORDER BY received_at ASC LIMIT ?
                 """,
-                (_timestamp(_now()), limit),
+                parameters,
             ).fetchall()
         notices: list[dict[str, Any]] = []
         for row in rows:

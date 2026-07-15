@@ -203,7 +203,7 @@ class StateMigrationTests(unittest.TestCase):
             self.assertEqual(reopened.list_pending_telegram_ack_intents(), [])
             reopened.close()
 
-    def test_notice_attempts_survive_reopen_and_poison_notice_stops(self) -> None:
+    def test_notice_attempts_survive_reopen_and_remain_recoverable(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "milana.sqlite3"
             payload = {
@@ -248,12 +248,36 @@ class StateMigrationTests(unittest.TestCase):
                 self.assertEqual(
                     poisoned.telegram_notice_attempt_count(["tg:10:poison"]), 3
                 )
-                self.assertEqual(poisoned.list_pending_telegram_notices(), [])
+                self.assertEqual(poisoned.list_pending_telegram_notices(), [payload])
                 self.assertEqual(
-                    poisoned.record_telegram_notice(payload, received_at=NOW), "dead"
+                    poisoned.record_telegram_notice(payload, received_at=NOW), "pending"
                 )
             finally:
                 poisoned.close()
+
+    def test_pending_notice_can_be_restored_before_its_retry_deadline(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = MilanaStateStore(Path(directory) / "milana.sqlite3")
+            payload = {
+                "source": "telegram",
+                "notice_id": "tg:10:7",
+                "chat_id": 10,
+                "message_id": 7,
+            }
+            try:
+                store.record_telegram_notice(payload, received_at=NOW)
+                store.fail_telegram_notices(
+                    [payload["notice_id"]],
+                    "temporary outage",
+                    retry_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                )
+
+                self.assertEqual(store.list_pending_telegram_notices(), [])
+                self.assertEqual(
+                    store.list_pending_telegram_notices(include_deferred=True), [payload]
+                )
+            finally:
+                store.close()
 
     def test_outbox_partial_progress_resumes_after_reopen(self) -> None:
         with TemporaryDirectory() as directory:

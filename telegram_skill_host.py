@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 from milana_ipc import (
+    INTERNAL_ERROR,
     INVALID_PARAMS,
     ConnectionClosedError,
     JsonRpcError,
@@ -553,6 +554,16 @@ class TelegramSkillHost:
             raise
         except ValueError as exc:
             raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
+        except Exception as exc:
+            # Materialization failures otherwise become an unhelpful generic
+            # JSON-RPC error.  The service needs the exception text to defer
+            # only the affected notice and leave the rest of the chat queue
+            # available for processing.
+            raise JsonRpcError(
+                INTERNAL_ERROR,
+                "Telegram materialization failed: "
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
         if "_target" not in result:
             raise JsonRpcError(INVALID_PARAMS, "Adapter did not resolve a Telegram target")
         try:
@@ -892,6 +903,7 @@ class TelethonTelegramAdapter:
     async def start(self, on_notice: NoticeCallback) -> None:
         self._notice_callback = on_notice
         await self.client.start()
+        await self._ensure_connected()
 
         async def incoming(event: Any) -> None:
             notice = await self._notice_from_message(event.message, event=event)
@@ -922,7 +934,31 @@ class TelethonTelegramAdapter:
 
         await self.client(functions.account.UpdateStatusRequest(offline=not online))
 
+    async def _ensure_connected(self) -> None:
+        """Reconnect the persistent Telethon session before an RPC operation.
+
+        The skill host can stay alive while Telegram briefly drops its MTProto
+        transport.  ``TelegramClient.start()`` authenticates at launch, but it
+        does not guarantee that a later materialization or send still has an
+        active transport.  Reconnect on demand so a queued notice reaches the
+        model instead of failing before the provider fallback can run.
+
+        Tiny protocol-test doubles do not model a network connection, so they
+        intentionally bypass this production-only guard.
+        """
+
+        is_connected = getattr(self.client, "is_connected", None)
+        if not callable(is_connected) or is_connected():
+            return
+        connect = getattr(self.client, "connect", None)
+        if not callable(connect):
+            raise ConnectionError("Telegram client cannot reconnect")
+        await connect()
+        if not is_connected():
+            raise ConnectionError("Telegram reconnect did not establish a session")
+
     async def backfill(self, limit: int) -> Sequence[TelegramNotice]:
+        await self._ensure_connected()
         notices: list[TelegramNotice] = []
         async for dialog in self.client.iter_dialogs():
             unread = int(getattr(dialog, "unread_count", 0) or 0)
@@ -985,6 +1021,7 @@ class TelethonTelegramAdapter:
             or through_message_id <= 0
         ):
             raise ValueError("through_message_id must be a positive integer")
+        await self._ensure_connected()
 
         matched_dialog: Any | None = None
         async for dialog in self.client.iter_dialogs():
@@ -1039,6 +1076,7 @@ class TelethonTelegramAdapter:
 
         target = notice.chat_id
         through_message_id = notice.message_id
+        await self._ensure_connected()
         matched_dialog: Any | None = None
         async for dialog in self.client.iter_dialogs():
             if str(getattr(dialog, "id", "")) == str(target):
@@ -1088,6 +1126,7 @@ class TelethonTelegramAdapter:
         target_ref: str | int | None = None,
         include_history: bool = True,
     ) -> Mapping[str, Any]:
+        await self._ensure_connected()
         selected: list[tuple[str, Any]] = []
         target: str | int | None = target_ref
         for notice_id in notice_ids:
@@ -1162,6 +1201,7 @@ class TelethonTelegramAdapter:
         turn_dir: Path,
         request: RequestContext,
     ) -> Mapping[str, Any]:
+        await self._ensure_connected()
         target = arguments["_target"]
         if action == "typing":
             active = arguments.get("active")

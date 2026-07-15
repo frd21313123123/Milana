@@ -452,6 +452,32 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trigger.metadata["notices"], [payload])
         service._turn_queue.task_done()
 
+    async def test_deferred_notice_is_restored_immediately_after_restart(self):
+        service = self.service()
+        service.dev_mode = True
+        payload = {
+            "source": "telegram",
+            "notice_id": "tg:77:13",
+            "chat_id": 77,
+            "message_id": 13,
+            "timestamp": NOW.isoformat(),
+            "sender": {"id": 88, "display_name": "Лера"},
+            "media_type": "text",
+        }
+        self.state.record_telegram_notice(payload, received_at=NOW)
+        self.state.fail_telegram_notices(
+            [payload["notice_id"]],
+            "Telegram was disconnected",
+            retry_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+
+        await service._restore_pending_telegram_notices()
+        trigger = await asyncio.wait_for(service._turn_queue.get(), timeout=1)
+
+        self.assertEqual(trigger.metadata["notice_ids"], ["tg:77:13"])
+        self.assertEqual(trigger.metadata["notices"], [payload])
+        service._turn_queue.task_done()
+
     async def test_new_notice_does_not_cancel_commit_phase(self):
         service = self.service()
         release = asyncio.Event()

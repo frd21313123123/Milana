@@ -73,6 +73,7 @@ from telegram_client import (
     GEMINI_LLM_CHOICE,
     MEMORY_PATH,
     AIConfig,
+    GeminiQuotaFallbackClient,
     load_ai_config,
 )
 
@@ -85,7 +86,6 @@ DEFAULT_WEB_PORT = 8765
 PID_FILE = BASE_DIR / "bot.pid"
 MODE_FILE = BASE_DIR / "bot.mode"
 MAX_TELEGRAM_NOTICES_PER_TURN = 100
-MAX_TELEGRAM_GENERATION_ATTEMPTS = 3
 WORKER_IDLE_SECONDS = 600.0
 SUMMARY_TRIGGER_USER_MESSAGES = 100
 SUMMARY_RETAIN_USER_MESSAGES = 40
@@ -435,10 +435,16 @@ class MilanaService:
         )
         config = load_ai_config()
         if config.provider == GEMINI_LLM_CHOICE:
-            # The standalone owner follows the configured provider strictly.
-            # A slow/erroring Gemini turn is observed as such; it must never
-            # switch providers behind the user's back.
-            model_client: Any = AgyModelClient(model=config.model)
+            gemini_client = AgyModelClient(model=config.model)
+            model_client: Any = (
+                GeminiQuotaFallbackClient(
+                    gemini_client,
+                    AsyncOpenAI(api_key=config.api_key),
+                    openai_model=config.openai_fallback_model,
+                )
+                if config.api_key
+                else gemini_client
+            )
         else:
             model_client = AsyncOpenAI(api_key=config.api_key)
         memory = MilanaMemoryStore(MEMORY_PATH)
@@ -495,9 +501,15 @@ class MilanaService:
             self._start_web_panel(web_port)
 
     async def _restore_pending_telegram_notices(self) -> None:
-        for payload in self.state.list_pending_telegram_notices():
+        # A process restart is an external recovery boundary: Telegram or a
+        # provider may be reachable again even if the previous process set a
+        # long retry delay. Restore every durable notice once, while ordinary
+        # live duplicates still honour their per-notice backoff.
+        for payload in self.state.list_pending_telegram_notices(include_deferred=True):
             try:
-                await self._rpc_telegram_notice(payload, None)  # type: ignore[arg-type]
+                await self._rpc_telegram_notice(
+                    payload, None, force_recovery=True  # type: ignore[arg-type]
+                )
             except Exception as exc:  # noqa: BLE001 - retain it for the next restart
                 self.last_turn_error = (
                     f"Telegram notice restore failed: {type(exc).__name__}: {exc}"
@@ -656,7 +668,11 @@ class MilanaService:
         self.memory.close()
 
     async def _rpc_telegram_notice(
-        self, params: Any, _request: RequestContext
+        self,
+        params: Any,
+        _request: RequestContext | None,
+        *,
+        force_recovery: bool = False,
     ) -> Mapping[str, Any]:
         if not isinstance(params, Mapping):
             raise TypeError("telegram.notice params must be an object")
@@ -683,16 +699,20 @@ class MilanaService:
         self.last_telegram_notice_at = self._now()
         self.last_telegram_notice_id = notice_id
         self.telegram_notice_count += 1
-        journal_status = self.state.record_telegram_notice(
-            dict(params), received_at=self.last_telegram_notice_at
+        journal_status = (
+            "pending"
+            if force_recovery
+            else self.state.record_telegram_notice(
+                dict(params), received_at=self.last_telegram_notice_at
+            )
         )
-        if journal_status in {"handled", "dead", "deferred"}:
+        if journal_status in {"handled", "deferred"}:
             return {
                 "accepted": True,
                 "duplicate": True,
                 "journal_status": journal_status,
-                "terminal": journal_status in {"handled", "dead"},
-                "safe_to_ack": journal_status in {"handled", "dead"},
+                "terminal": journal_status == "handled",
+                "safe_to_ack": journal_status == "handled",
             }
         if notice_id in self._seen_notices:
             return {
