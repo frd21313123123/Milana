@@ -24,9 +24,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from openai import AsyncOpenAI
-
-from agy_provider import AgyModelClient
 from milana import (
     MilanaAgent,
     TurnResult,
@@ -71,10 +68,9 @@ from milana_state import (
     TelegramTurnMetric,
 )
 from telegram_client import (
-    GEMINI_LLM_CHOICE,
     MEMORY_PATH,
     AIConfig,
-    GeminiQuotaFallbackClient,
+    create_model_client,
     load_ai_config,
 )
 
@@ -116,6 +112,43 @@ class _TelegramTurnTiming:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _current_process_start_ticks() -> int | None:
+    """Return the Windows process creation FILETIME used to reject PID reuse."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        get_process_times.restype = wintypes.BOOL
+        if not get_process_times(
+            kernel32.GetCurrentProcess(),
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 def _json_ready(value: Any) -> Any:
@@ -528,19 +561,7 @@ class MilanaService:
             dev_mode=dev_mode,
         )
         config = load_ai_config()
-        if config.provider == GEMINI_LLM_CHOICE:
-            gemini_client = AgyModelClient(model=config.model)
-            model_client: Any = (
-                GeminiQuotaFallbackClient(
-                    gemini_client,
-                    AsyncOpenAI(api_key=config.api_key),
-                    openai_model=config.openai_fallback_model,
-                )
-                if config.api_key
-                else gemini_client
-            )
-        else:
-            model_client = AsyncOpenAI(api_key=config.api_key)
+        model_client = create_model_client(config)
         memory = MilanaMemoryStore(MEMORY_PATH)
         state = MilanaStateStore(MEMORY_PATH)
         service = cls(
@@ -999,12 +1020,25 @@ class MilanaService:
             current_owner: str | None = None
             for notice in notices:
                 notice_id = notice.get("notice_id")
-                owner = (
-                    self.state.find_telegram_outbox_for_notice_ids([notice_id])
+                side_effect_owner = (
+                    self.state.find_telegram_notice_action_owner([notice_id])
                     if isinstance(notice_id, str)
                     else None
                 )
-                owner_key = owner.action_key if owner is not None else None
+                outbox_owner = (
+                    self.state.find_telegram_outbox_for_notice_ids([notice_id])
+                    if isinstance(notice_id, str) and side_effect_owner is None
+                    else None
+                )
+                owner_key = (
+                    side_effect_owner
+                    if side_effect_owner is not None
+                    else (
+                        outbox_owner.action_key
+                        if outbox_owner is not None
+                        else None
+                    )
+                )
                 if current_batch and owner_key != current_owner:
                     logical_batches.append(current_batch)
                     current_batch = []
@@ -1610,6 +1644,14 @@ class MilanaService:
                 record_heartbeat=True,
             )
             self._maybe_create_weekly_summary(self._now())
+        if telegram_turn and any(
+            action.kind == "send_sticker" for action in stage.actions
+        ):
+            notice_ids = self._trigger_notice_ids(result.trigger)
+            if notice_ids:
+                self.state.prepare_telegram_notice_action_owner(
+                    stage.action_key("side-effects"), notice_ids
+                )
         outbound_sent = False
         for action in stage.actions:
             outbound_sent = (
@@ -2938,7 +2980,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _main_async(args: argparse.Namespace) -> None:
     pid = os.getpid()
-    PID_FILE.write_text(str(pid), encoding="ascii")
+    process_start_ticks = _current_process_start_ticks()
+    pid_identity = (
+        f"{pid} {process_start_ticks}"
+        if process_start_ticks is not None
+        else str(pid)
+    )
+    PID_FILE.write_text(pid_identity, encoding="ascii")
     MODE_FILE.write_text(
         f"{pid} {'DEV' if args.dev_chat else 'NORMAL'}", encoding="ascii"
     )
@@ -2951,7 +2999,7 @@ async def _main_async(args: argparse.Namespace) -> None:
         await service.run_forever(web_port=None if args.no_web else args.web_port)
     finally:
         try:
-            if PID_FILE.read_text(encoding="ascii").strip() == str(pid):
+            if PID_FILE.read_text(encoding="ascii").strip() == pid_identity:
                 PID_FILE.unlink(missing_ok=True)
                 MODE_FILE.unlink(missing_ok=True)
         except OSError:

@@ -993,6 +993,9 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             [item.role for item in self.memory.get_chat_history(77)],
             ["user"],
         )
+        self.assertIsNotNone(
+            self.state.find_telegram_notice_action_owner(["tg:77:9"])
+        )
 
     async def test_sticker_only_initiative_waits_for_reply(self):
         self.state.create_entity(
@@ -1610,6 +1613,33 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             77,
             [old_notice["notice_id"]],
             ["уже подготовленный ответ"],
+        )
+        service._notice_buffers["77"] = [old_notice, fresh_notice]
+        service._notice_first_at["77"] = loop.time()
+
+        await service._flush_notices("77")
+
+        turns = [service._turn_queue.get_nowait() for _ in range(2)]
+        self.assertEqual(
+            [turn.metadata["notice_ids"] for turn in turns],
+            [["tg:77:9"], ["tg:77:10"]],
+        )
+
+    async def test_sticker_side_effect_notice_is_not_merged_with_fresh_notice(self):
+        service = self.service()
+        loop = asyncio.get_running_loop()
+        old_notice = {
+            "source": "telegram",
+            "notice_id": "tg:77:9",
+            "chat_id": 77,
+            "message_id": 9,
+            "timestamp": NOW.isoformat(),
+            "sender": {"id": 88, "display_name": "Лера"},
+            "media_type": "text",
+        }
+        fresh_notice = {**old_notice, "notice_id": "tg:77:10", "message_id": 10}
+        self.state.prepare_telegram_notice_action_owner(
+            "sticker-for-old-notice", [old_notice["notice_id"]]
         )
         service._notice_buffers["77"] = [old_notice, fresh_notice]
         service._notice_first_at["77"] = loop.time()

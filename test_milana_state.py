@@ -69,6 +69,7 @@ class StateMigrationTests(unittest.TestCase):
                     "telegram_notice_journal",
                     "telegram_outbox",
                     "telegram_outbox_notice_owners",
+                    "telegram_notice_action_owners",
                     "telegram_ack_intents",
                     "telegram_turn_metrics",
                     "state_change_ledger",
@@ -496,6 +497,32 @@ class StateMigrationTests(unittest.TestCase):
         )
         self.assertEqual(completed.status, "sent")
         self.assertIsNone(store.find_pending_telegram_outbox_for_target(77))
+        store.close()
+
+    def test_notice_side_effect_owner_is_retry_stable_and_rejects_rebatching(self) -> None:
+        store = MilanaStateStore()
+        owner = store.prepare_telegram_notice_action_owner(
+            "side-effect-a", ["notice-a", "notice-b"]
+        )
+
+        self.assertEqual(owner, "side-effect-a")
+        self.assertEqual(
+            store.find_telegram_notice_action_owner(["notice-a"]),
+            "side-effect-a",
+        )
+        self.assertEqual(
+            store.prepare_telegram_notice_action_owner(
+                "side-effect-a", ["notice-a", "notice-b"]
+            ),
+            "side-effect-a",
+        )
+        with self.assertRaisesRegex(StateConflictError, "side-effect-a"):
+            store.prepare_telegram_notice_action_owner(
+                "side-effect-b", ["notice-b", "notice-c"]
+            )
+        self.assertIsNone(
+            store.find_telegram_notice_action_owner(["notice-c"])
+        )
         store.close()
 
     def test_multiple_pending_initiatives_for_target_are_rejected(self) -> None:

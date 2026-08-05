@@ -40,6 +40,7 @@ from telegram_client import (
     ai_string,
     build_parser,
     convert_gif_to_mp4,
+    create_model_client,
     display_name,
     deliver_pulse_task,
     image_mime_type_from_bytes,
@@ -336,6 +337,13 @@ class SplitTelegramTextTests(unittest.TestCase):
 
             self.assertEqual(load_llm_choice(path), "gemini")
 
+    def test_load_llm_choice_reads_lm_studio(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "llm.choice"
+            path.write_text("LMSTUDIO\n", encoding="utf-8")
+
+            self.assertEqual(load_llm_choice(path), "lmstudio")
+
     def test_load_llm_choice_rejects_unknown_provider(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "llm.choice"
@@ -363,6 +371,53 @@ class SplitTelegramTextTests(unittest.TestCase):
         self.assertEqual(config.model, "gemini-3.5-flash")
         self.assertEqual(config.api_key, "")
         self.assertEqual(config.openai_fallback_model, "openai-model-from-config")
+
+    def test_load_ai_config_for_lm_studio_uses_local_settings_without_openai_key(self) -> None:
+        settings = {
+            "model": "openai-model-from-config",
+            "lm_studio": {
+                "base_url": "http://localhost:9999/v1/",
+                "model": "local-milana",
+            },
+            "system_prompt": "Тестовая инструкция",
+            "temperature": 0.2,
+            "max_output_tokens": 321,
+        }
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("telegram_client.load_env_file", return_value={}),
+            patch("telegram_client.load_ai_settings", return_value=settings),
+            patch("telegram_client.load_llm_choice", return_value="lmstudio"),
+        ):
+            config = load_ai_config()
+
+        self.assertEqual(config.provider, "lmstudio")
+        self.assertEqual(config.model, "local-milana")
+        self.assertEqual(config.api_key, "")
+        self.assertEqual(config.lm_studio_base_url, "http://localhost:9999/v1")
+        self.assertEqual(config.lm_studio_api_key, "lm-studio")
+
+    def test_create_model_client_points_openai_sdk_at_lm_studio(self) -> None:
+        config = AIConfig(
+            api_key="",
+            model="local-milana",
+            instructions="Тестовая инструкция",
+            temperature=0.2,
+            max_output_tokens=100,
+            provider="lmstudio",
+            lm_studio_base_url="http://127.0.0.1:1234/v1",
+            lm_studio_api_key="local-token",
+        )
+        expected = MagicMock()
+
+        with patch("telegram_client.AsyncOpenAI", return_value=expected) as client_type:
+            result = create_model_client(config)
+
+        self.assertIs(result, expected)
+        client_type.assert_called_once_with(
+            api_key="local-token",
+            base_url="http://127.0.0.1:1234/v1",
+        )
 
     def test_ai_config_preserves_legacy_positional_provider_fields(self) -> None:
         flow = MessageFlowConfig(input_quiet_seconds=0.25)

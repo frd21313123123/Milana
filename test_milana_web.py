@@ -1,9 +1,11 @@
 import json
 import unittest
 import urllib.request
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from milana_state import MilanaStateStore
-from milana_web import start_web_server
+from milana_web import _read_pid_identity, start_web_server
 
 
 class EmbeddedWebPanelTests(unittest.TestCase):
@@ -176,8 +178,18 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.assertIn("l.enabled===true", html)
         self.assertIn("fast path выключен", html)
         self.assertIn("provider_queue_ms", html)
+        self.assertIn('id="btn-lmstudio"', html)
+        self.assertIn('{"choice":"lmstudio"}', html)
         self.assertNotIn("cdn.tailwindcss.com", html)
         self.assertNotIn("fonts.googleapis.com", html)
+
+    def test_pid_identity_parser_preserves_process_start_fingerprint(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "bot.pid"
+            path.write_text("1234 987654321\n", encoding="ascii")
+            self.assertEqual(_read_pid_identity(path), (1234, 987654321))
+            path.write_text("1234 invalid\n", encoding="ascii")
+            self.assertIsNone(_read_pid_identity(path))
 
 
 if __name__ == "__main__":

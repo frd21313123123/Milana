@@ -265,7 +265,7 @@ Telegram-чата сохраняются отдельные история и к
 ### Выбор LLM
 
 Модель, которая пишет ответы, выбирается в `bot_control.bat`: откройте BAT-файл
-и используйте пункт **3. Choose LLM model**. Доступны два варианта:
+и используйте пункт **3. Choose LLM model**. Доступны три варианта:
 
 - OpenAI — модель из поля `model` в `ai_config.json`;
 - Gemini 3.5 Flash Medium — внутренний идентификатор `gemini-3.5-flash`,
@@ -273,7 +273,10 @@ Telegram-чата сохраняются отдельные история и к
   в Antigravity CLI `agy`;
   если Gemini не может ответить (например, из-за лимита, авторизации, сети или
   региона), бот генерирует текущий ответ моделью OpenAI из `ai_config.json`,
-  а следующий вызов снова сначала отправляет в Gemini.
+  а следующий вызов снова сначала отправляет в Gemini;
+- LM Studio — локальная модель через OpenAI-совместимый Responses API. По
+  умолчанию Милана подключается только к `http://127.0.0.1:1234/v1`, поэтому
+  промпт и переписка не покидают компьютер.
 
 Выбор сохраняется локально в `llm.choice` и применяется при следующем запуске
 бота. Если бот уже работает, после смены модели выберите **Restart bot**.
@@ -282,8 +285,26 @@ Telegram-чата сохраняются отдельные история и к
 ```powershell
 .\bot_control.bat model openai
 .\bot_control.bat model gemini
+.\bot_control.bat model lmstudio
 .\bot_control.bat restart
 ```
+
+Для локального режима откройте вкладку **Developer** в LM Studio, запустите
+сервер и загрузите модель с идентификатором `milana`. Через CLI это можно сделать
+так (без имени модели `lms load` предложит выбрать её интерактивно):
+
+```powershell
+lms server start
+lms load --identifier milana
+.\bot_control.bat model lmstudio
+.\bot_control.bat restart
+```
+
+LM Studio должен поддерживать endpoint `/v1/responses`; выбирайте instruct-модель
+с поддержкой tool use, иначе локальная модель может ненадёжно вызывать навыки
+Миланы. Адрес и идентификатор настраиваются в блоке `lm_studio` файла
+`ai_config.json`. Если в LM Studio включена авторизация, токен задаётся только в
+локальном `.env`: `LM_STUDIO_API_KEY=...`.
 
 Для Gemini установите зависимости из `requirements.txt`, убедитесь, что команда
 `agy` доступна в `PATH`, затем один раз запустите `agy` в обычном терминале и
@@ -320,6 +341,10 @@ OPENAI_API_KEY=
 ```json
 {
   "model": "gpt-5.6-terra",
+  "lm_studio": {
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model": "milana"
+  },
   "system_prompt": "Ты — Милана. Отвечай дружелюбно и кратко.",
   "temperature": 0.7,
   "max_output_tokens": 1200,
@@ -345,6 +370,8 @@ OPENAI_API_KEY=
 - `model` — идентификатор основной модели OpenAI и резервной модели при
   исчерпании лимита Gemini; для обычных запросов Gemini автоматически
   используется `gemini-3.5-flash` (preset CLI `Gemini 3.5 Flash (Medium)`);
+- `lm_studio.base_url` — локальный OpenAI-совместимый адрес LM Studio;
+- `lm_studio.model` — идентификатор загруженной в LM Studio модели;
 - `system_prompt` — системный промпт; он может быть многострочным;
 - `temperature` — вариативность ответов, от `0` до `2`; если выбранная модель
   не поддерживает параметр, клиент автоматически повторяет запрос без него;
@@ -521,6 +548,7 @@ OPENAI_API_KEY=
 .\bot_control.bat model
 .\bot_control.bat model openai
 .\bot_control.bat model gemini
+.\bot_control.bat model lmstudio
 .\bot_control.bat stop
 .\bot_control.bat status
 .\bot_control.bat logs
@@ -541,7 +569,7 @@ pause/resume/wake heartbeat, отмена heartbeat-задач, редактир
 `start` запускает обычный режим с расписанием, а `dev`, `start-dev` и
 `start dev` запускают DEV-общение с немедленными ответами. Эти два варианта
 доступны отдельными пунктами и в интерактивном меню. Пункт выбора LLM и команда
-`model` переключают OpenAI/Gemini; работающий процесс подхватит выбор после
+`model` переключают OpenAI/Gemini/LM Studio; работающий процесс подхватит выбор после
 `restart`.
 
 Запуск выполняется скрыто. Идентификатор процесса сохраняется в `bot.pid`,

@@ -122,24 +122,79 @@ def is_pid_running(pid: int) -> bool:
     return res.returncode == 0
 
 
+def _read_pid_identity(path: Path = PID_FILE) -> tuple[int, int | None] | None:
+    raw = _read_first_line(path)
+    if not raw:
+        return None
+    parts = raw.split()
+    if not parts or not parts[0].isdigit():
+        return None
+    start_ticks: int | None = None
+    if len(parts) >= 2:
+        if not parts[1].isdigit():
+            return None
+        start_ticks = int(parts[1])
+    return int(parts[0]), start_ticks
+
+
+def is_milana_service_pid(pid: int, start_ticks: int | None = None) -> bool:
+    """Verify a saved PID belongs to the same MilanaService process instance."""
+
+    if not pid:
+        return False
+    if start_ticks is not None:
+        identity_check = (
+            "$actual = $p.StartTime.ToUniversalTime().ToFileTimeUtc(); "
+            f"if ($actual -eq {start_ticks}) {{ exit 0 }}; exit 1"
+        )
+    else:
+        script = str(SCRIPT.resolve()).replace("'", "''")
+        identity_check = (
+            "$w = Get-CimInstance Win32_Process -Filter "
+            f"'ProcessId = {pid}' -ErrorAction SilentlyContinue; "
+            f"$expected = '{script}'; "
+            "if ($w.CommandLine -and "
+            "$w.CommandLine.IndexOf($expected, "
+            "[StringComparison]::OrdinalIgnoreCase) -ge 0) { exit 0 }; exit 1"
+        )
+    cmd = (
+        f"$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; "
+        "if (-not $p -or $p.ProcessName -notmatch '^pythonw?$') { exit 1 }; "
+        + identity_check
+    )
+    try:
+        result = subprocess.run(
+            [PS, "-NoProfile", "-Command", cmd],
+            capture_output=True,
+            timeout=6.0,
+            **hidden_subprocess_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def find_bot_pids() -> list[int]:
     """Return MilanaService PIDs (the Telegram host is reported separately)."""
 
     pids: list[int] = []
 
     # 1. Сохранённый PID
-    saved = _read_first_line(PID_FILE)
-    if saved and saved.isdigit():
-        pid = int(saved)
-        if is_pid_running(pid):
+    saved = _read_pid_identity()
+    if saved is not None:
+        pid, start_ticks = saved
+        if is_milana_service_pid(pid, start_ticks):
             pids.append(pid)
 
     # 2. Поиск по командной строке (как в bat)
     if not pids:
+        script = str(SCRIPT.resolve()).replace("'", "''")
         ps_query = (
             "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; "
+            f"$expected = '{script}'; "
             "foreach ($p in $processes) { "
-            "if ($p.CommandLine -and $p.CommandLine -match '(?i)milana_service\\.py') "
+            "if ($p.CommandLine -and $p.CommandLine.IndexOf($expected, "
+            "[StringComparison]::OrdinalIgnoreCase) -ge 0) "
             "{ $p.ProcessId } }"
         )
         raw = _run_ps(ps_query)
@@ -175,8 +230,8 @@ def find_telegram_host_pids() -> list[int]:
 
 def get_llm_choice() -> str:
     val = _read_first_line(LLM_FILE)
-    if val and val.lower() == "gemini":
-        return "gemini"
+    if val and val.lower() in {"gemini", "lmstudio"}:
+        return val.lower()
     return "openai"
 
 
@@ -366,7 +421,8 @@ def do_restart() -> dict[str, Any]:
 
 
 def do_set_model(choice: str) -> dict[str, Any]:
-    ch = "gemini" if choice.lower() == "gemini" else "openai"
+    normalized = choice.lower()
+    ch = normalized if normalized in {"gemini", "lmstudio"} else "openai"
     return run_bat_command(["model", ch])
 
 
@@ -446,11 +502,12 @@ def collect_status(context: WebPanelContext | None = None) -> dict[str, Any]:
     mode = resolve_mode(pids) if running else "OFF"
     llm = get_llm_choice()
 
-    llm_label = (
-        "Gemini 3.5 Flash (Medium)"
-        if llm == "gemini"
-        else "OpenAI (ai_config.json)"
-    )
+    llm_labels = {
+        "gemini": "Gemini 3.5 Flash (Medium)",
+        "lmstudio": "LM Studio (локальная модель)",
+        "openai": "OpenAI (ai_config.json)",
+    }
+    llm_label = llm_labels[llm]
 
     processes: list[dict[str, Any]] = []
     for pid in pids:
@@ -696,7 +753,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <!-- LLM -->
     <div class="mb-6">
       <div class="section-title mb-2 px-1">Модель ИИ</div>
-      <div class="flex gap-3">
+      <div class="flex flex-wrap gap-3">
         <button onclick="setModel('openai')"
                 id="btn-openai"
                 class="flex-1 action-btn px-5 py-3 rounded-3xl border border-slate-700 hover:border-slate-500 font-medium flex items-center justify-center gap-x-2">
@@ -707,6 +764,12 @@ INDEX_HTML = """<!DOCTYPE html>
                 id="btn-gemini"
                 class="flex-1 action-btn px-5 py-3 rounded-3xl border border-slate-700 hover:border-slate-500 font-medium flex items-center justify-center gap-x-2">
           <span>Gemini 3.5 Flash</span>
+        </button>
+        <button onclick="setModel('lmstudio')"
+                id="btn-lmstudio"
+                class="flex-1 action-btn px-5 py-3 rounded-3xl border border-slate-700 hover:border-slate-500 font-medium flex items-center justify-center gap-x-2">
+          <span>LM Studio</span>
+          <span class="text-xs opacity-60">(локально)</span>
         </button>
       </div>
       <div class="text-[10px] text-slate-500 mt-1.5 px-1">После смены модели рекомендуется перезапустить бота.</div>
@@ -856,14 +919,18 @@ INDEX_HTML = """<!DOCTYPE html>
     function updateLLMButtons(llm) {
       const btnO = document.getElementById('btn-openai');
       const btnG = document.getElementById('btn-gemini');
+      const btnL = document.getElementById('btn-lmstudio');
       
-      if (!btnO || !btnG) return;
+      if (!btnO || !btnG || !btnL) return;
       
       btnO.classList.remove('!border-violet-400', 'bg-slate-800');
       btnG.classList.remove('!border-violet-400', 'bg-slate-800');
+      btnL.classList.remove('!border-violet-400', 'bg-slate-800');
       
       if (llm === 'gemini') {
         btnG.classList.add('!border-violet-400', 'bg-slate-800');
+      } else if (llm === 'lmstudio') {
+        btnL.classList.add('!border-violet-400', 'bg-slate-800');
       } else {
         btnO.classList.add('!border-violet-400', 'bg-slate-800');
       }

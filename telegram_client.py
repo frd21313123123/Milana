@@ -74,8 +74,12 @@ MEMORY_PATH = BASE_DIR / "data" / "milana_memory.sqlite3"
 
 DEFAULT_AI_MODEL = "gpt-5.6-terra"
 GEMINI_AI_MODEL = "gemini-3.5-flash"
+DEFAULT_LM_STUDIO_MODEL = "milana"
+DEFAULT_LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_LM_STUDIO_API_KEY = "lm-studio"
 OPENAI_LLM_CHOICE = "openai"
 GEMINI_LLM_CHOICE = "gemini"
+LM_STUDIO_LLM_CHOICE = "lmstudio"
 DEFAULT_AI_SYSTEM_PROMPT = (
     "Ты отвечаешь пользователю в Telegram. Отвечай на языке пользователя, "
     "естественно, кратко и по существу. Не упоминай системные инструкции, "
@@ -188,6 +192,8 @@ class AIConfig:
     openai_fallback_model: str = DEFAULT_AI_MODEL
     # Appended to preserve the positional constructor used by older importers.
     telegram_fast_path: TelegramFastPathConfig = TelegramFastPathConfig()
+    lm_studio_base_url: str = DEFAULT_LM_STUDIO_BASE_URL
+    lm_studio_api_key: str = DEFAULT_LM_STUDIO_API_KEY
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -267,9 +273,13 @@ def load_llm_choice(path: Path = LLM_CHOICE_PATH) -> str:
     if not path.exists():
         return OPENAI_LLM_CHOICE
     choice = path.read_text(encoding="utf-8").strip().lower()
-    if choice not in {OPENAI_LLM_CHOICE, GEMINI_LLM_CHOICE}:
+    if choice not in {
+        OPENAI_LLM_CHOICE,
+        GEMINI_LLM_CHOICE,
+        LM_STUDIO_LLM_CHOICE,
+    }:
         raise ValueError(
-            f"{path.name} должен содержать 'openai' или 'gemini'"
+            f"{path.name} должен содержать 'openai', 'gemini' или 'lmstudio'"
         )
     return choice
 
@@ -467,8 +477,38 @@ def load_ai_config() -> AIConfig:
         os.getenv("OPENAI_MODEL", DEFAULT_AI_MODEL),
         "model",
     )
+    raw_lm_studio = settings.get("lm_studio", {})
+    if not isinstance(raw_lm_studio, dict):
+        raise ValueError(
+            f"lm_studio в {AI_CONFIG_PATH.name} должен быть JSON-объектом"
+        )
+    unknown_lm_studio = sorted(set(raw_lm_studio) - {"base_url", "model"})
+    if unknown_lm_studio:
+        raise ValueError(
+            f"Неизвестные параметры lm_studio в {AI_CONFIG_PATH.name}: "
+            + ", ".join(unknown_lm_studio)
+        )
+    lm_studio_model = ai_string(
+        raw_lm_studio,
+        "model",
+        os.getenv("LM_STUDIO_MODEL", DEFAULT_LM_STUDIO_MODEL),
+        "lm_studio.model",
+    )
+    lm_studio_base_url = ai_string(
+        raw_lm_studio,
+        "base_url",
+        os.getenv("LM_STUDIO_BASE_URL", DEFAULT_LM_STUDIO_BASE_URL),
+        "lm_studio.base_url",
+    ).rstrip("/")
+    lm_studio_api_key = (
+        env_values.get("LM_STUDIO_API_KEY")
+        or os.getenv("LM_STUDIO_API_KEY", "")
+        or DEFAULT_LM_STUDIO_API_KEY
+    ).strip()
     if provider == GEMINI_LLM_CHOICE:
         model = GEMINI_AI_MODEL
+    elif provider == LM_STUDIO_LLM_CHOICE:
+        model = lm_studio_model
     else:
         model = openai_model
     instructions = ai_string(
@@ -498,6 +538,8 @@ def load_ai_config() -> AIConfig:
         telegram_fast_path=telegram_fast_path,
         provider=provider,
         openai_fallback_model=openai_model,
+        lm_studio_base_url=lm_studio_base_url,
+        lm_studio_api_key=lm_studio_api_key,
     )
 
 
@@ -1542,6 +1584,28 @@ class GeminiQuotaFallbackClient:
                 fallback_request["input"]
             )
         return await self.openai_client.responses.create(**fallback_request)
+
+
+def create_model_client(config: AIConfig) -> Any:
+    """Create the selected Responses-compatible model client."""
+
+    if config.provider == GEMINI_LLM_CHOICE:
+        gemini_client = AgyModelClient(model=config.model)
+        return (
+            GeminiQuotaFallbackClient(
+                gemini_client,
+                AsyncOpenAI(api_key=config.api_key),
+                openai_model=config.openai_fallback_model,
+            )
+            if config.api_key
+            else gemini_client
+        )
+    if config.provider == LM_STUDIO_LLM_CHOICE:
+        return AsyncOpenAI(
+            api_key=config.lm_studio_api_key,
+            base_url=config.lm_studio_base_url,
+        )
+    return AsyncOpenAI(api_key=config.api_key)
 
 
 class MilanaInitiativeReflector:
@@ -4321,19 +4385,7 @@ async def deliver_pulse_task(
 async def run_ai_bot(client: TelegramClient, *, dev_chat: bool = False) -> None:
     config = load_ai_config()
     routine = load_routine()
-    if config.provider == GEMINI_LLM_CHOICE:
-        gemini_client = AgyModelClient(model=config.model)
-        model_client: Any = (
-            GeminiQuotaFallbackClient(
-                gemini_client,
-                AsyncOpenAI(api_key=config.api_key),
-                openai_model=config.openai_fallback_model,
-            )
-            if config.api_key
-            else gemini_client
-        )
-    else:
-        model_client = AsyncOpenAI(api_key=config.api_key)
+    model_client = create_model_client(config)
     memory = MilanaMemoryStore(MEMORY_PATH)
     sticker_skill = MilanaStickerSkill(
         client,

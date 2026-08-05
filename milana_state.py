@@ -690,6 +690,15 @@ class MilanaStateStore:
         CREATE INDEX IF NOT EXISTS idx_telegram_outbox_notice_owner_action
             ON telegram_outbox_notice_owners(action_key);
 
+        CREATE TABLE IF NOT EXISTS telegram_notice_action_owners (
+            notice_id TEXT NOT NULL,
+            action_key TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (notice_id, action_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_telegram_notice_action_owner_action
+            ON telegram_notice_action_owners(action_key);
+
         CREATE TABLE IF NOT EXISTS telegram_ack_intents (
             action_key TEXT PRIMARY KEY,
             target_ref TEXT NOT NULL,
@@ -1272,6 +1281,80 @@ class MilanaStateStore:
                 "Telegram notices принадлежат разным outbox actions: " + action_keys
             )
         return owners[0] if owners else None
+
+    def find_telegram_notice_action_owner(
+        self, notice_ids: Iterable[str]
+    ) -> str | None:
+        """Find the durable side-effect batch intersecting ``notice_ids``."""
+
+        normalized = tuple(
+            dict.fromkeys(_identifier(item, "Telegram notice ID") for item in notice_ids)
+        )
+        if not normalized:
+            return None
+        placeholders = ", ".join("?" for _ in normalized)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT DISTINCT action_key
+                FROM telegram_notice_action_owners
+                WHERE notice_id IN ({placeholders})
+                ORDER BY action_key
+                """,
+                normalized,
+            ).fetchall()
+        owners = [str(row["action_key"]) for row in rows]
+        if len(owners) > 1:
+            raise StateConflictError(
+                "Telegram notices принадлежат разным side-effect actions: "
+                + ", ".join(owners)
+            )
+        return owners[0] if owners else None
+
+    def prepare_telegram_notice_action_owner(
+        self, action_key: str, notice_ids: Iterable[str]
+    ) -> str:
+        """Bind a notice batch before its first non-outbox side effect."""
+
+        key = _identifier(action_key, "Telegram side-effect action key")
+        normalized = tuple(
+            dict.fromkeys(_identifier(item, "Telegram notice ID") for item in notice_ids)
+        )
+        if not normalized:
+            raise ValueError("Telegram side-effect owner требует notice IDs")
+        placeholders = ", ".join("?" for _ in normalized)
+        now = _timestamp(_now())
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._connection.execute(
+                    f"""
+                    SELECT DISTINCT action_key
+                    FROM telegram_notice_action_owners
+                    WHERE notice_id IN ({placeholders}) AND action_key != ?
+                    ORDER BY action_key
+                    """,
+                    (*normalized, key),
+                ).fetchall()
+                foreign_owners = [str(row["action_key"]) for row in rows]
+                if foreign_owners:
+                    raise StateConflictError(
+                        "Telegram notices уже принадлежат side-effect action: "
+                        + ", ".join(foreign_owners)
+                    )
+                self._connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO telegram_notice_action_owners (
+                        notice_id, action_key, created_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    ((notice_id, key, now) for notice_id in normalized),
+                )
+                self._connection.commit()
+                return key
+            except Exception:
+                self._connection.rollback()
+                raise
 
     def find_pending_telegram_outbox_for_target(
         self, target_ref: int | str

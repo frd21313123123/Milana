@@ -35,7 +35,7 @@ if /I "%~1"=="ui" goto open_web
 if /I "%~1"=="open" goto open_web
 
 echo Unknown command: %~1
-echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|restart^|model [openai^|gemini]^|stop^|status^|logs^|web]
+echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|restart^|model [openai^|gemini^|lmstudio]^|stop^|status^|logs^|web]
 exit /b 2
 
 :invalid_start_mode
@@ -133,7 +133,7 @@ for /L %%N in (1,1,80) do (
 )
 
 call :read_pid
-call :is_running %BOT_PID%
+call :is_running %BOT_PID% %BOT_START_TICKS%
 if errorlevel 1 (
     echo Bot process exited during startup. Recent errors:
     if exist "%ERR_LOG%" "%PS%" -NoProfile -Command "Get-Content -Encoding utf8 -LiteralPath '%ERR_LOG%' -Tail 20"
@@ -152,7 +152,7 @@ goto action_done
 :model_command
 if "%~2"=="" (
     call :show_llm_choice
-    echo Use: bot_control.bat model [openai^|gemini]
+    echo Use: bot_control.bat model [openai^|gemini^|lmstudio]
     exit /b 0
 )
 if not "%~3"=="" goto invalid_model
@@ -164,10 +164,14 @@ if /I "%~2"=="gemini" (
     call :set_llm_choice gemini
     goto action_done
 )
+if /I "%~2"=="lmstudio" (
+    call :set_llm_choice lmstudio
+    goto action_done
+)
 
 :invalid_model
 echo Unknown LLM model: %~2
-echo Use: bot_control.bat model [openai^|gemini]
+echo Use: bot_control.bat model [openai^|gemini^|lmstudio]
 exit /b 2
 
 :model_menu
@@ -178,6 +182,7 @@ call :show_llm_choice
 echo.
 echo 1. OpenAI (model configured in ai_config.json)
 echo 2. Gemini 3.5 Flash Medium (Gemini 3.5 Flash ^(Medium^))
+echo 3. LM Studio (local OpenAI-compatible server)
 echo 0. Back
 echo.
 set "MODEL_CHOICE="
@@ -188,6 +193,10 @@ if "%MODEL_CHOICE%"=="1" (
 )
 if "%MODEL_CHOICE%"=="2" (
     call :set_llm_choice gemini
+    goto menu_pause
+)
+if "%MODEL_CHOICE%"=="3" (
+    call :set_llm_choice lmstudio
     goto menu_pause
 )
 if "%MODEL_CHOICE%"=="0" goto menu
@@ -287,12 +296,15 @@ if not exist "%LLM_FILE%" exit /b 0
 set "SAVED_LLM_CHOICE="
 set /p "SAVED_LLM_CHOICE=" < "%LLM_FILE%"
 if /I "%SAVED_LLM_CHOICE%"=="gemini" set "LLM_CHOICE=gemini"
+if /I "%SAVED_LLM_CHOICE%"=="lmstudio" set "LLM_CHOICE=lmstudio"
 exit /b 0
 
 :show_llm_choice
 call :load_llm_choice
 if /I "%LLM_CHOICE%"=="gemini" (
     echo Configured LLM: Gemini 3.5 Flash Medium
+) else if /I "%LLM_CHOICE%"=="lmstudio" (
+    echo Configured LLM: LM Studio - local model configured in ai_config.json
 ) else (
     echo Configured LLM: OpenAI - model configured in ai_config.json
 )
@@ -420,12 +432,16 @@ goto action_done
 
 :read_pid
 set "BOT_PID="
-if exist "%PID_FILE%" set /p "BOT_PID=" < "%PID_FILE%"
+set "BOT_START_TICKS="
+if exist "%PID_FILE%" for /f "usebackq tokens=1,2" %%A in ("%PID_FILE%") do (
+    set "BOT_PID=%%A"
+    set "BOT_START_TICKS=%%B"
+)
 exit /b 0
 
 :cleanup_failed_start
 call :read_pid
-call :is_running %BOT_PID%
+call :is_running %BOT_PID% %BOT_START_TICKS%
 if not errorlevel 1 taskkill /PID %BOT_PID% /T /F >nul 2>&1
 if exist "%PID_FILE%" del /q "%PID_FILE%" >nul 2>&1
 if exist "%MODE_FILE%" del /q "%MODE_FILE%" >nul 2>&1
@@ -433,7 +449,7 @@ exit /b 0
 
 :is_running
 if "%~1"=="" exit /b 1
-"%PS%" -NoProfile -Command "$p = Get-Process -Id %~1 -ErrorAction SilentlyContinue; if ($p -and $p.ProcessName -match '^pythonw?$') { exit 0 }; exit 1" >nul 2>&1
+"%PS%" -NoProfile -Command "$p = Get-Process -Id %~1 -ErrorAction SilentlyContinue; if (-not $p -or $p.ProcessName -notmatch '^pythonw?$') { exit 1 }; $expected = '%~2'; if ($expected -match '^[0-9]+$') { if ($p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -eq $expected) { exit 0 }; exit 1 }; $w = Get-CimInstance Win32_Process -Filter 'ProcessId = %~1' -ErrorAction SilentlyContinue; $script = [IO.Path]::GetFullPath($env:SCRIPT); if ($w.CommandLine -and $w.CommandLine.IndexOf($script, [StringComparison]::OrdinalIgnoreCase) -ge 0) { exit 0 }; exit 1" >nul 2>&1
 exit /b %errorlevel%
 
 :find_bot_pids
@@ -444,17 +460,21 @@ rem Prefer the PID recorded when this controller started the bot. Reading the
 rem command line through CIM can fail for a perfectly healthy process.
 if exist "%PID_FILE%" (
     set "SAVED_PID="
-    set /p "SAVED_PID=" < "%PID_FILE%"
+    set "SAVED_START_TICKS="
+    for /f "usebackq tokens=1,2" %%A in ("%PID_FILE%") do (
+        set "SAVED_PID=%%A"
+        set "SAVED_START_TICKS=%%B"
+    )
     echo(!SAVED_PID!| findstr /r "^[0-9][0-9]*$" >nul
     if not errorlevel 1 (
-        "%PS%" -NoProfile -Command "$p = Get-Process -Id !SAVED_PID! -ErrorAction SilentlyContinue; if ($p -and $p.ProcessName -match '^pythonw?$') { exit 0 }; exit 1" >nul 2>&1
+        call :is_running !SAVED_PID! !SAVED_START_TICKS!
         if not errorlevel 1 set "FOUND_PIDS= !SAVED_PID!"
     )
 )
 
 rem Fall back to discovery for bots started outside this controller.
 if not defined FOUND_PIDS (
-for /f "delims=" %%P in ('%PS% -NoProfile -Command "$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; foreach ($process in $processes) { if ($process.CommandLine -and $process.CommandLine -match '(?i)milana_service\.py') { $process.ProcessId } }"') do (
+for /f "delims=" %%P in ('%PS% -NoProfile -Command "$script = [IO.Path]::GetFullPath($env:SCRIPT); $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue; foreach ($process in $processes) { if ($process.CommandLine -and $process.CommandLine.IndexOf($script, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $process.ProcessId } }"') do (
     set "FOUND_PIDS=!FOUND_PIDS! %%P"
 )
 )
