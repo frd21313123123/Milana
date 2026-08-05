@@ -25,6 +25,7 @@ from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
 
 from agy_provider import AgyError, AgyModelClient, AgyQuotaError
+from lm_studio_provider import LMStudioModelClient
 from milana.subprocesses import hidden_subprocess_kwargs
 from milana_memory import (
     MAX_DIARY_ENTRY_LENGTH,
@@ -1601,9 +1602,11 @@ def create_model_client(config: AIConfig) -> Any:
             else gemini_client
         )
     if config.provider == LM_STUDIO_LLM_CHOICE:
-        return AsyncOpenAI(
-            api_key=config.lm_studio_api_key,
-            base_url=config.lm_studio_base_url,
+        return LMStudioModelClient(
+            AsyncOpenAI(
+                api_key=config.lm_studio_api_key,
+                base_url=config.lm_studio_base_url,
+            )
         )
     return AsyncOpenAI(api_key=config.api_key)
 

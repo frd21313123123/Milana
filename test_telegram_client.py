@@ -18,6 +18,7 @@ from telethon import functions, types
 
 from agy_provider import AgyError, AgyQuotaError
 from milana_memory import MilanaMemoryStore
+from lm_studio_provider import LMStudioModelClient
 from milana_schedule import load_routine
 from milana_stickers import (
     StickerChoice,
@@ -413,7 +414,8 @@ class SplitTelegramTextTests(unittest.TestCase):
         with patch("telegram_client.AsyncOpenAI", return_value=expected) as client_type:
             result = create_model_client(config)
 
-        self.assertIs(result, expected)
+        self.assertIsInstance(result, LMStudioModelClient)
+        self.assertIs(result.openai_client, expected)
         client_type.assert_called_once_with(
             api_key="local-token",
             base_url="http://127.0.0.1:1234/v1",
