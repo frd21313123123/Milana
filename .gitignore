@@ -14,3 +14,9 @@ bot-error.log
 data/
 *.sqlite3-wal
 *.sqlite3-shm
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
