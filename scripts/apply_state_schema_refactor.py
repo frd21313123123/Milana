@@ -1,6 +1,7 @@
 """One-shot safe extraction of MilanaStateStore schema bootstrap.
 
 The guarded workflow commits the generated module only after compile, lint, and tests pass.
+This script is intentionally temporary and is removed after the extraction lands.
 """
 
 from __future__ import annotations
