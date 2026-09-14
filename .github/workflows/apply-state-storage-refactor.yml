@@ -7,6 +7,7 @@ on:
     paths:
       - scripts/apply_state_schema_refactor.py
       - scripts/apply_state_telegram_refactor.py
+      - scripts/apply_state_lifecycle_refactor.py
 
 permissions:
   contents: write
@@ -42,6 +43,10 @@ jobs:
         if: hashFiles('scripts/apply_state_telegram_refactor.py') != '' && hashFiles('milana/state_telegram.py') == ''
         run: python scripts/apply_state_telegram_refactor.py
 
+      - name: Apply lifecycle persistence refactor
+        if: hashFiles('scripts/apply_state_lifecycle_refactor.py') != '' && hashFiles('milana/state_lifecycle.py') == ''
+        run: python scripts/apply_state_lifecycle_refactor.py
+
       - name: Compile
         run: python -m compileall -q . -x '(\.git|\.venv|venv|data|sessions)'
 
@@ -58,6 +63,7 @@ jobs:
           git add milana_state.py
           test ! -f milana/state_schema.py || git add milana/state_schema.py
           test ! -f milana/state_telegram.py || git add milana/state_telegram.py
+          test ! -f milana/state_lifecycle.py || git add milana/state_lifecycle.py
           if git diff --cached --quiet; then
             echo "No refactor changes to commit"
             exit 0
