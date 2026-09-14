@@ -1,0 +1,40 @@
+name: Apply README visuals
+
+on:
+  push:
+    branches:
+      - refactor/project-optimization
+    paths:
+      - ".github/workflows/readme-visuals.yml"
+      - "scripts/insert_readme_visuals.py"
+      - "docs/assets/**"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: refactor/project-optimization
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Insert visuals into README
+        run: python scripts/insert_readme_visuals.py
+
+      - name: Commit README and clean one-shot files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/readme-visuals.yml scripts/insert_readme_visuals.py docs/assets/README.md
+          git add README.md
+          git commit -m "Showcase Milana in README"
+          git push
