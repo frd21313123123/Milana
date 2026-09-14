@@ -1,13 +1,36 @@
-# Architecture refactor roadmap
+# Architecture refactor
 
-Крупные runtime-файлы стоит делить без изменения публичных точек входа.
+Крупные runtime-модули разделены без изменения публичных точек входа и runtime-семантики.
 
-Предлагаемый порядок:
+## Telegram client
 
-1. `telegram_client.py`: вынести media, outbox, presence и incoming routing.
-2. `milana_service.py`: вынести bootstrap, Telegram turn orchestration и heartbeat turns.
-3. `milana_state.py`: разделить entities, relationships, goals, events и repository.
-4. После каждого шага сохранять compatibility imports и запускать полный CI.
+`telegram_client.py` остаётся compatibility entrypoint, а самостоятельные обязанности вынесены в:
 
-Главный критерий такого рефакторинга: никаких изменений семантики durable outbox,
-idempotency keys, acknowledgement и recovery в том же коммите, где перемещается код.
+- `milana/telegram_config.py` - конфигурация, dataclass-модели и загрузка настроек;
+- `milana/telegram_cli.py` - CLI parsing и presentation helpers;
+- `milana/telegram_media.py` - MIME detection, загрузка media, GIF conversion и sticker rendering.
+
+Legacy imports и monkey-patch paths, используемые тестами, сохранены.
+
+## Milana service
+
+Provider-neutral валидация state/heartbeat payload вынесена из `milana_service.py` в
+`milana/service_state.py`. Service остаётся владельцем orchestration, model loop и skill lifecycle.
+
+## Persistent state
+
+`milana_state.py` теперь является facade/composition root для SQLite state store. Реализация разделена на:
+
+- `milana/state_models.py` - dataclass-модели, ошибки, validation primitives и initiative policy;
+- `milana/state_schema.py` - SQLite schema bootstrap, additive migrations и compatibility backfills;
+- `milana/state_telegram.py` - Telegram notice journal, durable outbox, ack intents и latency metrics;
+- `milana/state_lifecycle.py` - agent state, needs, recovery windows и heartbeat jobs;
+- `milana/state_world.py` - entities, facts, life events, goals, relationships, summaries и atomic world updates.
+
+`MilanaStateStore` собирает эти части через mixins и сохраняет прежний публичный API и re-export names.
+
+## Safety invariant
+
+Перемещение persistence-кода не меняет durable outbox semantics, idempotency keys,
+acknowledgement, additive migrations или recovery behavior. Каждый этап принимался только после
+успешных `compileall`, Ruff и полного набора unit/integration tests.
