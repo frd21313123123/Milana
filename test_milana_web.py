@@ -1,8 +1,10 @@
 import json
+import sys
 import unittest
 import urllib.request
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from milana_state import MilanaStateStore
 from milana_web import _read_pid_identity, start_web_server
@@ -59,8 +61,12 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.state.close()
 
     def test_status_exposes_life_and_host_state(self):
-        with urllib.request.urlopen(self.panel.url + "api/status", timeout=10) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        # The standalone panel normally checks for the project's Windows venv.
+        # CI intentionally uses the runner interpreter instead, while exercising
+        # the same direct schedule-import path used by an embedded service.
+        with patch("milana_web.PYTHON", Path(sys.executable)):
+            with urllib.request.urlopen(self.panel.url + "api/status", timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
         self.assertIn("life", payload)
         self.assertEqual(payload["life"]["needs"]["social"], 50)
         self.assertTrue(payload["service"]["telegram_host"]["connected"])
