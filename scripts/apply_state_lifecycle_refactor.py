@@ -1,4 +1,7 @@
-"""One-shot safe extraction of agent lifecycle and heartbeat persistence."""
+"""One-shot safe extraction of agent lifecycle and heartbeat persistence.
+
+The guarded workflow commits the generated module only after compile, lint, and tests pass.
+"""
 
 from __future__ import annotations
 
