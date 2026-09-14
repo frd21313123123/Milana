@@ -1,4 +1,7 @@
-"""One-shot safe extraction of world-model persistence from MilanaStateStore."""
+"""One-shot safe extraction of world-model persistence from MilanaStateStore.
+
+The guarded workflow commits the generated module only after compile, lint, and tests pass.
+"""
 
 from __future__ import annotations
 
@@ -101,7 +104,7 @@ def main() -> None:
     text = text.replace(LIFECYCLE_IMPORT, LIFECYCLE_IMPORT + MIXIN_IMPORT, 1)
     old_class = "class MilanaStateStore(TelegramStateStoreMixin, LifecycleStateStoreMixin):\n"
     new_class = (
-        "class MilanaStateStore(" 
+        "class MilanaStateStore("
         "TelegramStateStoreMixin, LifecycleStateStoreMixin, WorldStateStoreMixin):\n"
     )
     if old_class not in text:
