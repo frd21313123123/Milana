@@ -1,11 +1,11 @@
-name: Apply service state refactor
+name: Apply state models refactor
 
 on:
   push:
     branches:
       - refactor/project-optimization
     paths:
-      - scripts/apply_service_state_refactor.py
+      - scripts/apply_state_models_refactor.py
 
 permissions:
   contents: write
@@ -34,7 +34,7 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Apply refactor
-        run: python scripts/apply_service_state_refactor.py
+        run: python scripts/apply_state_models_refactor.py
 
       - name: Compile
         run: python -m compileall -q . -x '(\.git|\.venv|venv|data|sessions)'
@@ -48,11 +48,11 @@ jobs:
       - name: Commit refactor
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add milana_service.py milana/service_state.py pyproject.toml
+          git config user.email "41898282+frd21313123123@users.noreply.github.com"
+          git add milana_state.py milana/state_models.py
           if git diff --cached --quiet; then
             echo "No refactor changes to commit"
             exit 0
           fi
-          git commit -m "Extract service state reducer"
+          git commit -m "Extract state models and policies"
           git push origin HEAD:refactor/project-optimization
