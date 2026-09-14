@@ -1,0 +1,4 @@
+hero.webp
+memory.webp
+multimodal.webp
+dashboard.webp
