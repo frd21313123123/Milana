@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 import urllib.request
 from pathlib import Path
@@ -69,9 +70,16 @@ class EmbeddedWebPanelTests(unittest.TestCase):
             payload["service"]["pending_replies"][0]["message_count"], 2
         )
         self.assertIsNone(payload["service"]["telegram_latency"]["slo_met"])
-        self.assertTrue(payload["schedule"]["available"])
-        self.assertIn("activities", payload["schedule"])
-        self.assertIn("response_policy", payload["schedule"])
+
+        schedule = payload["schedule"]
+        if os.name == "nt":
+            self.assertTrue(schedule["available"])
+            self.assertIn("activities", schedule)
+            self.assertIn("response_policy", schedule)
+        else:
+            # The standalone web controller intentionally targets Windows and
+            # checks for .venv/Scripts/python.exe before exposing schedule data.
+            self.assertFalse(schedule["available"])
 
     def test_status_preserves_full_active_latency_distribution(self):
         self.service_status["telegram_latency"] = {
