@@ -35,11 +35,11 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Apply schema refactor
-        if: hashFiles('scripts/apply_state_schema_refactor.py') != ''
+        if: hashFiles('scripts/apply_state_schema_refactor.py') != '' && hashFiles('milana/state_schema.py') == ''
         run: python scripts/apply_state_schema_refactor.py
 
       - name: Apply Telegram persistence refactor
-        if: hashFiles('scripts/apply_state_telegram_refactor.py') != ''
+        if: hashFiles('scripts/apply_state_telegram_refactor.py') != '' && hashFiles('milana/state_telegram.py') == ''
         run: python scripts/apply_state_telegram_refactor.py
 
       - name: Compile
