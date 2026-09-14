@@ -11,7 +11,7 @@ MODULE_PATH = ROOT / "milana" / "service_state.py"
 PYPROJECT_PATH = ROOT / "pyproject.toml"
 
 IMPORT_ANCHOR = "from milana.host_supervisor import SkillHostSupervisor\n"
-STATE_IMPORT = "from milana.service_state import build_heartbeat_changes\n"
+STATE_IMPORT = "from milana.service_state import _parse_datetime, build_heartbeat_changes\n"
 CONFIG_ANCHOR = "from milana.runtime import (\n"
 CONFIG_IMPORT = "from milana.telegram_config import GEMINI_LLM_CHOICE\n"
 
@@ -65,6 +65,8 @@ def main() -> None:
 
     if "build_heartbeat_changes(" not in text:
         raise RuntimeError("service no longer calls build_heartbeat_changes")
+    if "_parse_datetime(" not in text:
+        raise RuntimeError("service no longer calls _parse_datetime")
 
     new_lines = len(text.splitlines())
     removed = original_lines - new_lines
