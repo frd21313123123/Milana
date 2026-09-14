@@ -1,4 +1,7 @@
-"""One-shot safe extraction of MilanaStateStore schema bootstrap."""
+"""One-shot safe extraction of MilanaStateStore schema bootstrap.
+
+The guarded workflow commits the generated module only after compile, lint, and tests pass.
+"""
 
 from __future__ import annotations
 
