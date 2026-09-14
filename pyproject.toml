@@ -19,15 +19,3 @@ select = ["E9", "F63", "F7", "F82"]
 # importing it. Keep F821 enabled everywhere else while the large service module
 # is split into smaller components in the next refactor step.
 "milana_service.py" = ["F821"]
-
-[tool.coverage.run]
-branch = true
-source = ["milana"]
-omit = [
-  "test_*.py",
-  "test_support/*",
-]
-
-[tool.coverage.report]
-show_missing = true
-skip_covered = true
