@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from milana.state_models import (
