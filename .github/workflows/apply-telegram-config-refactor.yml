@@ -1,11 +1,11 @@
-name: Apply Telegram media refactor
+name: Apply service state refactor
 
 on:
   push:
     branches:
       - refactor/project-optimization
     paths:
-      - scripts/apply_telegram_media_refactor.py
+      - scripts/apply_service_state_refactor.py
 
 permissions:
   contents: write
@@ -34,7 +34,7 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Apply refactor
-        run: python scripts/apply_telegram_media_refactor.py
+        run: python scripts/apply_service_state_refactor.py
 
       - name: Compile
         run: python -m compileall -q . -x '(\.git|\.venv|venv|data|sessions)'
@@ -49,10 +49,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add telegram_client.py milana/telegram_media.py
+          git add milana_service.py milana/service_state.py pyproject.toml
           if git diff --cached --quiet; then
             echo "No refactor changes to commit"
             exit 0
           fi
-          git commit -m "Extract Telegram media helpers"
+          git commit -m "Extract service state reducer"
           git push origin HEAD:refactor/project-optimization
