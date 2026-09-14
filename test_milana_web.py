@@ -1,9 +1,10 @@
 import json
-import os
+import sys
 import unittest
 import urllib.request
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from milana_state import MilanaStateStore
 from milana_web import _read_pid_identity, start_web_server
@@ -60,8 +61,12 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.state.close()
 
     def test_status_exposes_life_and_host_state(self):
-        with urllib.request.urlopen(self.panel.url + "api/status", timeout=10) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        # The standalone panel normally checks for the project's Windows venv.
+        # CI intentionally uses the runner interpreter instead, while exercising
+        # the same direct schedule-import path used by an embedded service.
+        with patch("milana_web.PYTHON", Path(sys.executable)):
+            with urllib.request.urlopen(self.panel.url + "api/status", timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
         self.assertIn("life", payload)
         self.assertEqual(payload["life"]["needs"]["social"], 50)
         self.assertTrue(payload["service"]["telegram_host"]["connected"])
@@ -70,16 +75,9 @@ class EmbeddedWebPanelTests(unittest.TestCase):
             payload["service"]["pending_replies"][0]["message_count"], 2
         )
         self.assertIsNone(payload["service"]["telegram_latency"]["slo_met"])
-
-        schedule = payload["schedule"]
-        if os.name == "nt":
-            self.assertTrue(schedule["available"])
-            self.assertIn("activities", schedule)
-            self.assertIn("response_policy", schedule)
-        else:
-            # The standalone web controller intentionally targets Windows and
-            # checks for .venv/Scripts/python.exe before exposing schedule data.
-            self.assertFalse(schedule["available"])
+        self.assertTrue(payload["schedule"]["available"])
+        self.assertIn("activities", payload["schedule"])
+        self.assertIn("response_policy", payload["schedule"])
 
     def test_status_preserves_full_active_latency_distribution(self):
         self.service_status["telegram_latency"] = {
