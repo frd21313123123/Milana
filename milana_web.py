@@ -26,7 +26,11 @@ from milana.subprocesses import hidden_subprocess_kwargs
 
 # --- пути (как в bot_control.bat) ---
 BASE_DIR = Path(__file__).resolve().parent
-PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
+PYTHON = (
+    BASE_DIR / ".venv" / "Scripts" / "python.exe"
+    if os.name == "nt"
+    else BASE_DIR / ".venv" / "bin" / "python"
+)
 SCRIPT = BASE_DIR / "milana_service.py"
 SCHEDULE_SCRIPT = BASE_DIR / "milana_schedule.py"
 PID_FILE = BASE_DIR / "bot.pid"

@@ -9,6 +9,8 @@ sessions/
 bot.pid
 bot.mode
 llm.choice
+agy.model
+agy.effort
 bot-output.log
 bot-error.log
 data/

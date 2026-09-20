@@ -34,9 +34,26 @@ DATA_URL_RE = re.compile(
 READ_ONLY_SENTINEL = "[[READ_ONLY]]"
 WINDOWS_INLINE_COMMAND_MAX_UNITS = 24_000
 POSIX_INLINE_COMMAND_MAX_BYTES = 64 * 1024
+# Model IDs are obtained from ``agy models``.  The CLI accepts the displayed
+# preset names most reliably across releases, while Milana stores stable IDs.
+DEFAULT_AGY_MODEL = "gemini-3.8-flash-medium"
+DEFAULT_AGY_REASONING_EFFORT = "medium"
+AGY_REASONING_EFFORTS = ("low", "medium", "high")
 AGY_MODEL_ALIASES = {
-    # Current Antigravity CLI versions accept the displayed preset name.
-    "gemini-3.5-flash": "Gemini 3.5 Flash (Medium)",
+    "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
+    "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
+    "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
+    "gemini-3.7-flash-high": "Gemini 3.7 Flash (High)",
+    "gemini-3.7-flash-medium": "Gemini 3.7 Flash (Medium)",
+    "gemini-3.7-flash-low": "Gemini 3.7 Flash (Low)",
+    "gemini-3.6-flash-high": "Gemini 3.6 Flash (High)",
+    "gemini-3.6-flash-medium": "Gemini 3.6 Flash (Medium)",
+    "gemini-3.6-flash-low": "Gemini 3.6 Flash (Low)",
+    "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
+    "gemini-3.1-pro-low": "Gemini 3.1 Pro (Low)",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6 (Thinking)",
+    "claude-opus-4-6-thinking": "Claude Opus 4.6 (Thinking)",
+    "gpt-oss-120b-medium": "GPT-OSS 120B (Medium)",
 }
 
 
@@ -653,7 +670,8 @@ class AgyModelClient:
     def __init__(
         self,
         *,
-        model: str = "gemini-3.5-flash",
+        model: str = DEFAULT_AGY_MODEL,
+        reasoning_effort: str = DEFAULT_AGY_REASONING_EFFORT,
         timeout_seconds: int = 300,
         executable: str = "agy",
         auth_retries: int | None = None,
@@ -663,6 +681,11 @@ class AgyModelClient:
             raise ValueError("Модель agy не может быть пустой")
         if timeout_seconds <= 0:
             raise ValueError("Таймаут agy должен быть положительным")
+        if reasoning_effort not in AGY_REASONING_EFFORTS:
+            raise ValueError(
+                "Уровень рассуждений agy должен быть одним из: "
+                + ", ".join(AGY_REASONING_EFFORTS)
+            )
         if auth_retries is None:
             auth_retries = self._env_int("AGY_AUTH_RETRIES", 2)
         if auth_retry_delay_seconds is None:
@@ -674,6 +697,7 @@ class AgyModelClient:
         if not 0 <= auth_retry_delay_seconds <= 30:
             raise ValueError("AGY_AUTH_RETRY_DELAY_SECONDS должен быть от 0 до 30")
         self.model = model.strip()
+        self.reasoning_effort = reasoning_effort
         self.timeout_seconds = int(timeout_seconds)
         self.executable = executable
         self.auth_retries = auth_retries
@@ -790,16 +814,23 @@ class AgyModelClient:
         *,
         allow_file_tools: bool = True,
     ) -> list[str]:
+        selected_model = AGY_MODEL_ALIASES.get(self.model, self.model)
         command = [
             self.executable,
             "--model",
-            AGY_MODEL_ALIASES.get(self.model, self.model),
+            selected_model,
             "--print-timeout",
             f"{self.timeout_seconds}s",
             "--log-file",
             str(workspace / "agy.log"),
             "--sandbox",
         ]
+        # Current Antigravity CLI model presets already encode their reasoning
+        # level (for example, "Gemini 3.8 Flash (Medium)").  Passing an
+        # additional --effort makes CLI 1.2.7 reject the whole request.
+        # Preserve the option for an explicitly configured non-preset model.
+        if self.model not in AGY_MODEL_ALIASES:
+            command[3:3] = ["--effort", self.reasoning_effort]
         if allow_file_tools:
             command.append("--dangerously-skip-permissions")
         command.extend(["-p", prompt])

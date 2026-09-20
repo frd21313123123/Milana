@@ -24,7 +24,15 @@ from openai import AsyncOpenAI, BadRequestError, OpenAIError
 from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
 
-from agy_provider import AgyError, AgyModelClient, AgyQuotaError
+from agy_provider import (
+    AGY_MODEL_ALIASES,
+    AGY_REASONING_EFFORTS,
+    DEFAULT_AGY_MODEL,
+    DEFAULT_AGY_REASONING_EFFORT,
+    AgyError,
+    AgyModelClient,
+    AgyQuotaError,
+)
 from lm_studio_provider import LMStudioModelClient
 from milana.subprocesses import hidden_subprocess_kwargs
 from milana_memory import (
@@ -71,10 +79,14 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 AI_CONFIG_PATH = BASE_DIR / "ai_config.json"
 LLM_CHOICE_PATH = BASE_DIR / "llm.choice"
+AGY_MODEL_CHOICE_PATH = BASE_DIR / "agy.model"
+AGY_EFFORT_CHOICE_PATH = BASE_DIR / "agy.effort"
 MEMORY_PATH = BASE_DIR / "data" / "milana_memory.sqlite3"
 
 DEFAULT_AI_MODEL = "gpt-5.6-terra"
-GEMINI_AI_MODEL = "gemini-3.5-flash"
+AGY_AI_MODEL = DEFAULT_AGY_MODEL
+# Kept for import compatibility with callers that still use the old name.
+GEMINI_AI_MODEL = AGY_AI_MODEL
 DEFAULT_LM_STUDIO_MODEL = "milana"
 DEFAULT_LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_LM_STUDIO_API_KEY = "lm-studio"
@@ -195,6 +207,7 @@ class AIConfig:
     telegram_fast_path: TelegramFastPathConfig = TelegramFastPathConfig()
     lm_studio_base_url: str = DEFAULT_LM_STUDIO_BASE_URL
     lm_studio_api_key: str = DEFAULT_LM_STUDIO_API_KEY
+    agy_reasoning_effort: str = DEFAULT_AGY_REASONING_EFFORT
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -283,6 +296,73 @@ def load_llm_choice(path: Path = LLM_CHOICE_PATH) -> str:
             f"{path.name} должен содержать 'openai', 'gemini' или 'lmstudio'"
         )
     return choice
+
+
+def load_agy_model(
+    settings: Mapping[str, Any], env_values: Mapping[str, str]
+) -> str:
+    """Resolve and validate the Antigravity model selected for Milana."""
+
+    raw_agy = settings.get("agy", {})
+    if not isinstance(raw_agy, Mapping):
+        raise ValueError(f"agy в {AI_CONFIG_PATH.name} должен быть JSON-объектом")
+    unknown_agy = sorted(set(raw_agy) - {"model", "effort"})
+    if unknown_agy:
+        raise ValueError(
+            f"Неизвестные параметры agy в {AI_CONFIG_PATH.name}: "
+            + ", ".join(unknown_agy)
+        )
+
+    configured = ai_string(raw_agy, "model", AGY_AI_MODEL, "agy.model")
+    saved_choice = (
+        AGY_MODEL_CHOICE_PATH.read_text(encoding="utf-8").strip()
+        if AGY_MODEL_CHOICE_PATH.exists()
+        else ""
+    )
+    selected = (
+        env_values.get("AGY_MODEL")
+        or os.getenv("AGY_MODEL", "")
+        or saved_choice
+        or configured
+    ).strip()
+    if selected not in AGY_MODEL_ALIASES:
+        raise ValueError(
+            "AGY_MODEL должен быть одним из: " + ", ".join(AGY_MODEL_ALIASES)
+        )
+    return selected
+
+
+def load_agy_reasoning_effort(
+    settings: Mapping[str, Any], env_values: Mapping[str, str]
+) -> str:
+    """Resolve the Antigravity reasoning level selected by the controller."""
+
+    raw_agy = settings.get("agy", {})
+    if not isinstance(raw_agy, Mapping):
+        raise ValueError(f"agy в {AI_CONFIG_PATH.name} должен быть JSON-объектом")
+    configured = ai_string(
+        raw_agy,
+        "effort",
+        DEFAULT_AGY_REASONING_EFFORT,
+        "agy.effort",
+    )
+    saved_choice = (
+        AGY_EFFORT_CHOICE_PATH.read_text(encoding="utf-8").strip().lower()
+        if AGY_EFFORT_CHOICE_PATH.exists()
+        else ""
+    )
+    selected = (
+        env_values.get("AGY_EFFORT")
+        or os.getenv("AGY_EFFORT", "")
+        or saved_choice
+        or configured
+    ).strip().lower()
+    if selected not in AGY_REASONING_EFFORTS:
+        raise ValueError(
+            "AGY_EFFORT должен быть одним из: "
+            + ", ".join(AGY_REASONING_EFFORTS)
+        )
+    return selected
 
 
 def ai_string(
@@ -466,6 +546,8 @@ def load_ai_config() -> AIConfig:
     env_values = load_env_file(ENV_PATH)
     settings = load_ai_settings()
     provider = load_llm_choice()
+    agy_model = load_agy_model(settings, env_values)
+    agy_reasoning_effort = load_agy_reasoning_effort(settings, env_values)
 
     # Явно заданное значение из локального .env имеет приоритет для ключа,
     # чтобы пользователь мог заменить устаревший ключ без изменения окружения ОС.
@@ -507,7 +589,7 @@ def load_ai_config() -> AIConfig:
         or DEFAULT_LM_STUDIO_API_KEY
     ).strip()
     if provider == GEMINI_LLM_CHOICE:
-        model = GEMINI_AI_MODEL
+        model = agy_model
     elif provider == LM_STUDIO_LLM_CHOICE:
         model = lm_studio_model
     else:
@@ -541,6 +623,7 @@ def load_ai_config() -> AIConfig:
         openai_fallback_model=openai_model,
         lm_studio_base_url=lm_studio_base_url,
         lm_studio_api_key=lm_studio_api_key,
+        agy_reasoning_effort=agy_reasoning_effort,
     )
 
 
@@ -1591,7 +1674,10 @@ def create_model_client(config: AIConfig) -> Any:
     """Create the selected Responses-compatible model client."""
 
     if config.provider == GEMINI_LLM_CHOICE:
-        gemini_client = AgyModelClient(model=config.model)
+        gemini_client = AgyModelClient(
+            model=config.model,
+            reasoning_effort=config.agy_reasoning_effort,
+        )
         return (
             GeminiQuotaFallbackClient(
                 gemini_client,

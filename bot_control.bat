@@ -10,9 +10,16 @@ set "SCHEDULE_SCRIPT=%ROOT%milana_schedule.py"
 set "PID_FILE=%ROOT%bot.pid"
 set "MODE_FILE=%ROOT%bot.mode"
 set "LLM_FILE=%ROOT%llm.choice"
+set "AGY_MODEL_FILE=%ROOT%agy.model"
+set "AGY_EFFORT_FILE=%ROOT%agy.effort"
 set "OUT_LOG=%ROOT%bot-output.log"
 set "ERR_LOG=%ROOT%bot-error.log"
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+rem The Antigravity installer updates the user PATH, but terminals that were
+rem already open keep the old environment. Prefer the standard CLI location so
+rem a freshly installed agy is available to this controller immediately.
+if exist "%LOCALAPPDATA%\agy\bin\agy.exe" set "PATH=%LOCALAPPDATA%\agy\bin;%PATH%"
 
 if "%~1"=="" (
     set "INTERACTIVE=1"
@@ -26,6 +33,7 @@ if /I "%~1"=="dev" goto start_dev
 if /I "%~1"=="start-dev" goto start_dev
 if /I "%~1"=="restart" goto restart
 if /I "%~1"=="model" goto model_command
+if /I "%~1"=="agy" goto agy_command
 if /I "%~1"=="stop" goto stop
 if /I "%~1"=="status" goto status
 if /I "%~1"=="logs" goto logs
@@ -35,7 +43,7 @@ if /I "%~1"=="ui" goto open_web
 if /I "%~1"=="open" goto open_web
 
 echo Unknown command: %~1
-echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|restart^|model [openai^|gemini^|lmstudio]^|stop^|status^|logs^|web]
+echo Use: bot_control.bat [start [dev]^|dev^|start-dev^|restart^|model [openai^|gemini^|lmstudio]^|agy [model ID^|effort low^|medium^|high]^|stop^|status^|logs^|web]
 exit /b 2
 
 :invalid_start_mode
@@ -53,22 +61,24 @@ echo.
 echo 1. Start bot normally (schedule enabled)
 echo 2. Start DEV chat (immediate replies)
 echo 3. Choose LLM model
-echo 4. Restart bot (keep current mode)
-echo 5. Stop bot
-echo 6. Show status
-echo 7. Show recent logs
-echo 8. Открыть сайт (веб-панель управления Миланой)
+echo 4. Configure Antigravity model and reasoning
+echo 5. Restart bot (keep current mode)
+echo 6. Stop bot
+echo 7. Show status
+echo 8. Show recent logs
+echo 9. Открыть сайт (веб-панель управления Миланой)
 echo 0. Exit
 echo.
 set /p "CHOICE=Choose an action: "
 if "%CHOICE%"=="1" goto start
 if "%CHOICE%"=="2" goto start_dev
 if "%CHOICE%"=="3" goto model_menu
-if "%CHOICE%"=="4" goto restart
-if "%CHOICE%"=="5" goto stop
-if "%CHOICE%"=="6" goto status
-if "%CHOICE%"=="7" goto logs
-if "%CHOICE%"=="8" goto open_web
+if "%CHOICE%"=="4" goto agy_menu
+if "%CHOICE%"=="5" goto restart
+if "%CHOICE%"=="6" goto stop
+if "%CHOICE%"=="7" goto status
+if "%CHOICE%"=="8" goto logs
+if "%CHOICE%"=="9" goto open_web
 if "%CHOICE%"=="0" goto done
 echo Invalid choice.
 goto menu_pause
@@ -90,7 +100,7 @@ call :load_llm_choice
 if /I "%LLM_CHOICE%"=="gemini" (
     where agy >nul 2>&1
     if errorlevel 1 (
-        echo Cannot start with Gemini 3.5 Flash Medium: the "agy" command was not found in PATH.
+        echo Cannot start with Antigravity: the "agy" command was not found in PATH.
         echo Install and configure agy, or switch back with: bot_control.bat model openai
         goto action_done
     )
@@ -181,7 +191,7 @@ echo.
 call :show_llm_choice
 echo.
 echo 1. OpenAI (model configured in ai_config.json)
-echo 2. Gemini 3.5 Flash Medium (Gemini 3.5 Flash ^(Medium^))
+echo 2. Antigravity (agy CLI; model and reasoning configured separately)
 echo 3. LM Studio (local OpenAI-compatible server)
 echo 0. Back
 echo.
@@ -202,6 +212,202 @@ if "%MODEL_CHOICE%"=="3" (
 if "%MODEL_CHOICE%"=="0" goto menu
 echo Invalid choice.
 goto menu_pause
+
+:agy_command
+if "%~2"=="" (
+    call :show_agy_choice
+    echo Use: bot_control.bat agy [model MODEL_ID^|effort low^|medium^|high]
+    exit /b 0
+)
+if /I "%~2"=="model" (
+    if "%~3"=="" goto invalid_agy_command
+    if not "%~4"=="" goto invalid_agy_command
+    call :set_agy_model "%~3"
+    if errorlevel 1 exit /b 2
+    goto action_done
+)
+if /I "%~2"=="effort" (
+    if "%~3"=="" goto invalid_agy_command
+    if not "%~4"=="" goto invalid_agy_command
+    call :set_agy_effort "%~3"
+    if errorlevel 1 exit /b 2
+    goto action_done
+)
+
+:invalid_agy_command
+echo Use: bot_control.bat agy [model MODEL_ID^|effort low^|medium^|high]
+exit /b 2
+
+:agy_menu
+cls
+echo Configure Antigravity
+echo.
+call :show_agy_choice
+echo.
+echo 1. Choose model
+echo 2. Choose reasoning effort
+echo 0. Back
+echo.
+set "AGY_CHOICE="
+set /p "AGY_CHOICE=Choose an action: "
+if "%AGY_CHOICE%"=="1" goto agy_model_menu
+if "%AGY_CHOICE%"=="2" goto agy_effort_menu
+if "%AGY_CHOICE%"=="0" goto menu
+echo Invalid choice.
+goto menu_pause
+
+:agy_model_menu
+cls
+echo Choose Antigravity model
+echo.
+call :show_agy_choice
+echo.
+echo  1. Gemini 3.8 Flash High
+echo  2. Gemini 3.8 Flash Medium
+echo  3. Gemini 3.8 Flash Low
+echo  4. Gemini 3.7 Flash High
+echo  5. Gemini 3.7 Flash Medium
+echo  6. Gemini 3.7 Flash Low
+echo  7. Gemini 3.6 Flash High
+echo  8. Gemini 3.6 Flash Medium
+echo  9. Gemini 3.6 Flash Low
+echo 10. Gemini 3.1 Pro High
+echo 11. Gemini 3.1 Pro Low
+echo 12. Claude Sonnet 4.6 Thinking
+echo 13. Claude Opus 4.6 Thinking
+echo 14. GPT-OSS 120B Medium
+echo  0. Back
+echo.
+set "AGY_MODEL_CHOICE="
+set /p "AGY_MODEL_CHOICE=Choose a model: "
+if "%AGY_MODEL_CHOICE%"=="1" call :set_agy_model gemini-3.8-flash-high
+if "%AGY_MODEL_CHOICE%"=="2" call :set_agy_model gemini-3.8-flash-medium
+if "%AGY_MODEL_CHOICE%"=="3" call :set_agy_model gemini-3.8-flash-low
+if "%AGY_MODEL_CHOICE%"=="4" call :set_agy_model gemini-3.7-flash-high
+if "%AGY_MODEL_CHOICE%"=="5" call :set_agy_model gemini-3.7-flash-medium
+if "%AGY_MODEL_CHOICE%"=="6" call :set_agy_model gemini-3.7-flash-low
+if "%AGY_MODEL_CHOICE%"=="7" call :set_agy_model gemini-3.6-flash-high
+if "%AGY_MODEL_CHOICE%"=="8" call :set_agy_model gemini-3.6-flash-medium
+if "%AGY_MODEL_CHOICE%"=="9" call :set_agy_model gemini-3.6-flash-low
+if "%AGY_MODEL_CHOICE%"=="10" call :set_agy_model gemini-3.1-pro-high
+if "%AGY_MODEL_CHOICE%"=="11" call :set_agy_model gemini-3.1-pro-low
+if "%AGY_MODEL_CHOICE%"=="12" call :set_agy_model claude-sonnet-4-6
+if "%AGY_MODEL_CHOICE%"=="13" call :set_agy_model claude-opus-4-6-thinking
+if "%AGY_MODEL_CHOICE%"=="14" call :set_agy_model gpt-oss-120b-medium
+if "%AGY_MODEL_CHOICE%"=="0" goto agy_menu
+if "%AGY_MODEL_CHOICE%"=="1" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="2" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="3" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="4" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="5" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="6" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="7" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="8" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="9" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="10" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="11" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="12" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="13" goto menu_pause
+if "%AGY_MODEL_CHOICE%"=="14" goto menu_pause
+echo Invalid choice.
+goto menu_pause
+
+:agy_effort_menu
+cls
+echo Choose Antigravity reasoning effort
+echo.
+call :show_agy_choice
+echo.
+echo 1. Low    - fastest, least deliberation
+echo 2. Medium - balanced (default)
+echo 3. High   - slower, most deliberation
+echo 0. Back
+echo.
+set "AGY_EFFORT_CHOICE="
+set /p "AGY_EFFORT_CHOICE=Choose an effort: "
+if "%AGY_EFFORT_CHOICE%"=="1" call :set_agy_effort low
+if "%AGY_EFFORT_CHOICE%"=="2" call :set_agy_effort medium
+if "%AGY_EFFORT_CHOICE%"=="3" call :set_agy_effort high
+if "%AGY_EFFORT_CHOICE%"=="0" goto agy_menu
+if "%AGY_EFFORT_CHOICE%"=="1" goto menu_pause
+if "%AGY_EFFORT_CHOICE%"=="2" goto menu_pause
+if "%AGY_EFFORT_CHOICE%"=="3" goto menu_pause
+echo Invalid choice.
+goto menu_pause
+
+:show_agy_choice
+call :load_agy_model
+call :load_agy_effort
+echo Antigravity model: %AGY_MODEL%
+echo Reasoning effort:  %AGY_EFFORT%
+exit /b 0
+
+:load_agy_model
+set "AGY_MODEL=gemini-3.8-flash-medium"
+if exist "%AGY_MODEL_FILE%" set /p "AGY_MODEL=" < "%AGY_MODEL_FILE%"
+call :is_valid_agy_model "%AGY_MODEL%"
+if errorlevel 1 set "AGY_MODEL=gemini-3.8-flash-medium"
+exit /b 0
+
+:load_agy_effort
+set "AGY_EFFORT=medium"
+if exist "%AGY_EFFORT_FILE%" set /p "AGY_EFFORT=" < "%AGY_EFFORT_FILE%"
+call :is_valid_agy_effort "%AGY_EFFORT%"
+if errorlevel 1 set "AGY_EFFORT=medium"
+exit /b 0
+
+:set_agy_model
+call :is_valid_agy_model "%~1"
+if errorlevel 1 (
+    echo Unknown Antigravity model: %~1
+    exit /b 1
+)
+> "%AGY_MODEL_FILE%" <nul set /p "=%~1"
+set "AGY_MODEL=%~1"
+echo Antigravity model: %AGY_MODEL%
+call :show_agy_restart_hint
+exit /b 0
+
+:set_agy_effort
+call :is_valid_agy_effort "%~1"
+if errorlevel 1 (
+    echo Unknown reasoning effort: %~1
+    echo Use: low, medium, or high
+    exit /b 1
+)
+> "%AGY_EFFORT_FILE%" <nul set /p "=%~1"
+set "AGY_EFFORT=%~1"
+echo Reasoning effort: %AGY_EFFORT%
+call :show_agy_restart_hint
+exit /b 0
+
+:show_agy_restart_hint
+call :find_bot_pids
+if defined BOT_PIDS echo The bot is running. Restart it to use the new Antigravity settings.
+exit /b 0
+
+:is_valid_agy_model
+if /I "%~1"=="gemini-3.8-flash-high" exit /b 0
+if /I "%~1"=="gemini-3.8-flash-medium" exit /b 0
+if /I "%~1"=="gemini-3.8-flash-low" exit /b 0
+if /I "%~1"=="gemini-3.7-flash-high" exit /b 0
+if /I "%~1"=="gemini-3.7-flash-medium" exit /b 0
+if /I "%~1"=="gemini-3.7-flash-low" exit /b 0
+if /I "%~1"=="gemini-3.6-flash-high" exit /b 0
+if /I "%~1"=="gemini-3.6-flash-medium" exit /b 0
+if /I "%~1"=="gemini-3.6-flash-low" exit /b 0
+if /I "%~1"=="gemini-3.1-pro-high" exit /b 0
+if /I "%~1"=="gemini-3.1-pro-low" exit /b 0
+if /I "%~1"=="claude-sonnet-4-6" exit /b 0
+if /I "%~1"=="claude-opus-4-6-thinking" exit /b 0
+if /I "%~1"=="gpt-oss-120b-medium" exit /b 0
+exit /b 1
+
+:is_valid_agy_effort
+if /I "%~1"=="low" exit /b 0
+if /I "%~1"=="medium" exit /b 0
+if /I "%~1"=="high" exit /b 0
+exit /b 1
 
 :restart
 call :find_bot_pids
@@ -284,6 +490,7 @@ if not defined BOT_PIDS (
     call :show_bot_mode
 )
 call :show_llm_choice
+if /I "%LLM_CHOICE%"=="gemini" call :show_agy_choice
 echo.
 call :show_log_status
 echo.
@@ -302,7 +509,7 @@ exit /b 0
 :show_llm_choice
 call :load_llm_choice
 if /I "%LLM_CHOICE%"=="gemini" (
-    echo Configured LLM: Gemini 3.5 Flash Medium
+    echo Configured LLM: Antigravity ^(agy CLI^)
 ) else if /I "%LLM_CHOICE%"=="lmstudio" (
     echo Configured LLM: LM Studio - local model configured in ai_config.json
 ) else (

@@ -268,10 +268,9 @@ Telegram-чата сохраняются отдельные история и к
 и используйте пункт **3. Choose LLM model**. Доступны три варианта:
 
 - OpenAI — модель из поля `model` в `ai_config.json`;
-- Gemini 3.5 Flash Medium — внутренний идентификатор `gemini-3.5-flash`,
-  который клиент сопоставляет актуальному preset `Gemini 3.5 Flash (Medium)`
-  в Antigravity CLI `agy`;
-  если Gemini не может ответить (например, из-за лимита, авторизации, сети или
+- Antigravity — модель из списка `agy models`; по умолчанию используется
+  `gemini-3.8-flash-medium`. Если выбранная модель не может ответить (например,
+  из-за лимита, авторизации, сети или
   региона), бот генерирует текущий ответ моделью OpenAI из `ai_config.json`,
   а следующий вызов снова сначала отправляет в Gemini;
 - LM Studio — локальная модель через OpenAI-совместимый Responses API. По
@@ -334,6 +333,17 @@ AGY_AUTH_RETRY_DELAY_SECONDS=1.0
 используют файловый fallback. Текст быстрого запроса на время генерации виден в командной
 строке процесса текущему пользователю и администраторам компьютера.
 
+В `bot_control.bat` пункт **4. Configure Antigravity model and reasoning**
+позволяет выбрать доступную модель и уровень рассуждений `low`, `medium` или
+`high`. Выбор сохраняется локально в `agy.model` и `agy.effort`, не попадает в
+Git и применяется после следующего запуска или перезапуска бота. То же самое
+можно сделать из терминала:
+
+```powershell
+.\bot_control.bat agy model gemini-3.8-flash-high
+.\bot_control.bat agy effort high
+```
+
 Добавьте в локальный `.env` API-ключ OpenAI (не публикуйте этот файл). Он нужен
 как для основного режима OpenAI, так и для резервных ответов после исчерпания
 лимита Gemini:
@@ -374,8 +384,16 @@ OPENAI_API_KEY=
 ```
 
 - `model` — идентификатор основной модели OpenAI и резервной модели при
-  исчерпании лимита Gemini; для обычных запросов Gemini автоматически
-  используется `gemini-3.5-flash` (preset CLI `Gemini 3.5 Flash (Medium)`);
+  исчерпании лимита Antigravity;
+- `agy.model` — модель Antigravity. Её можно переопределить переменной
+  `AGY_MODEL` в `.env`. Поддерживаются модели, выданные `agy models` на
+  сервере: `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`,
+  `gemini-3.8-flash-low`, `gemini-3.7-flash-high`,
+  `gemini-3.7-flash-medium`, `gemini-3.7-flash-low`,
+  `gemini-3.6-flash-high`, `gemini-3.6-flash-medium`,
+  `gemini-3.6-flash-low`, `gemini-3.1-pro-high`,
+  `gemini-3.1-pro-low`, `claude-sonnet-4-6`,
+  `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`;
 - `lm_studio.base_url` — локальный OpenAI-совместимый адрес LM Studio;
 - `lm_studio.model` — идентификатор загруженной в LM Studio модели;
 - `system_prompt` — системный промпт; он может быть многострочным;

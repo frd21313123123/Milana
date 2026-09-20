@@ -15,6 +15,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from agy_provider import (
+    AGY_MODEL_ALIASES,
+    DEFAULT_AGY_REASONING_EFFORT,
+    DEFAULT_AGY_MODEL,
     AgyAuthError,
     AgyError,
     AgyModelClient,
@@ -44,7 +47,8 @@ class AgyModelClientTests(unittest.TestCase):
     def test_defaults_match_gemini_flash_configuration(self) -> None:
         client = AgyModelClient()
 
-        self.assertEqual(client.model, "gemini-3.5-flash")
+        self.assertEqual(client.model, DEFAULT_AGY_MODEL)
+        self.assertEqual(client.reasoning_effort, DEFAULT_AGY_REASONING_EFFORT)
         self.assertEqual(client.timeout_seconds, 300)
         self.assertEqual(client.executable, "agy")
         self.assertTrue(callable(client.responses.create))
@@ -54,6 +58,8 @@ class AgyModelClientTests(unittest.TestCase):
             AgyModelClient(model="   ")
         with self.assertRaises(ValueError):
             AgyModelClient(timeout_seconds=0)
+        with self.assertRaises(ValueError):
+            AgyModelClient(reasoning_effort="maximum")
 
     def test_error_details_hide_oauth_url_and_report_auth_failure(self) -> None:
         details = AgyModelClient._safe_error_details(
@@ -112,19 +118,50 @@ class AgyModelClientTests(unittest.TestCase):
             with self.assertRaisesRegex(AgyError, "17 секунд"):
                 client._query({"input": []})
 
-    def test_command_uses_selected_model_and_keeps_prompt_last(self) -> None:
-        client = AgyModelClient(model="gemini-3.5-flash", timeout_seconds=42)
+    def test_command_uses_selected_preset_without_duplicate_effort(self) -> None:
+        client = AgyModelClient(model="gemini-3.8-flash-medium", timeout_seconds=42)
         workspace = Path("temporary-workspace")
 
         command = client._command("короткий prompt", workspace)
 
         self.assertEqual(
-            command[:3], ["agy", "--model", "Gemini 3.5 Flash (Medium)"]
+            command[:3], ["agy", "--model", "Gemini 3.8 Flash (Medium)"]
         )
         self.assertIn("--sandbox", command)
+        self.assertNotIn("--effort", command)
         self.assertIn("--dangerously-skip-permissions", command)
         self.assertEqual(command[-2:], ["-p", "короткий prompt"])
         self.assertIn("42s", command)
+
+    def test_command_keeps_effort_for_a_non_preset_model(self) -> None:
+        client = AgyModelClient(model="custom-model", reasoning_effort="high")
+
+        command = client._command("короткий prompt", Path("temporary-workspace"))
+
+        self.assertEqual(
+            command[:5], ["agy", "--model", "custom-model", "--effort", "high"]
+        )
+
+    def test_all_advertised_models_have_cli_presets(self) -> None:
+        self.assertEqual(
+            set(AGY_MODEL_ALIASES),
+            {
+                "gemini-3.8-flash-high",
+                "gemini-3.8-flash-medium",
+                "gemini-3.8-flash-low",
+                "gemini-3.7-flash-high",
+                "gemini-3.7-flash-medium",
+                "gemini-3.7-flash-low",
+                "gemini-3.6-flash-high",
+                "gemini-3.6-flash-medium",
+                "gemini-3.6-flash-low",
+                "gemini-3.1-pro-high",
+                "gemini-3.1-pro-low",
+                "claude-sonnet-4-6",
+                "claude-opus-4-6-thinking",
+                "gpt-oss-120b-medium",
+            },
+        )
 
     def test_query_uses_inline_text_without_request_file_or_dangerous_flag(self) -> None:
         client = AgyModelClient()

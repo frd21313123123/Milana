@@ -47,6 +47,8 @@ from telegram_client import (
     image_mime_type_from_bytes,
     inter_message_typing_delay,
     load_ai_config,
+    load_agy_model,
+    load_agy_reasoning_effort,
     load_env_file,
     load_ai_settings,
     load_llm_choice,
@@ -275,6 +277,17 @@ def make_event(
 
 
 class SplitTelegramTextTests(unittest.TestCase):
+    def setUp(self) -> None:
+        choices = TemporaryDirectory()
+        self.addCleanup(choices.cleanup)
+        for name, filename in (
+            ('AGY_MODEL_CHOICE_PATH', 'agy.model'),
+            ('AGY_EFFORT_CHOICE_PATH', 'agy.effort'),
+        ):
+            selection = patch(f'telegram_client.{name}', Path(choices.name) / filename)
+            selection.start()
+            self.addCleanup(selection.stop)
+
     def test_ai_bot_dev_chat_flag_defaults_off_and_can_be_enabled(self) -> None:
         parser = build_parser()
 
@@ -369,9 +382,47 @@ class SplitTelegramTextTests(unittest.TestCase):
             config = load_ai_config()
 
         self.assertEqual(config.provider, "gemini")
-        self.assertEqual(config.model, "gemini-3.5-flash")
+        self.assertEqual(config.model, "gemini-3.8-flash-medium")
         self.assertEqual(config.api_key, "")
         self.assertEqual(config.openai_fallback_model, "openai-model-from-config")
+
+    def test_load_ai_config_uses_any_supported_agy_model_from_environment(self) -> None:
+        with (
+            patch.dict("os.environ", {"AGY_MODEL": "claude-opus-4-6-thinking"}, clear=True),
+            patch("telegram_client.load_env_file", return_value={}),
+            patch("telegram_client.load_ai_settings", return_value={}),
+            patch("telegram_client.load_llm_choice", return_value="gemini"),
+        ):
+            config = load_ai_config()
+
+        self.assertEqual(config.model, "claude-opus-4-6-thinking")
+
+    def test_load_agy_model_rejects_unknown_identifier(self) -> None:
+        with self.assertRaisesRegex(ValueError, "AGY_MODEL"):
+            load_agy_model({"agy": {"model": "not-a-real-model"}}, {})
+
+    def test_controller_agy_choices_override_json_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            model_path = Path(directory) / "agy.model"
+            effort_path = Path(directory) / "agy.effort"
+            model_path.write_text("claude-sonnet-4-6", encoding="utf-8")
+            effort_path.write_text("high", encoding="utf-8")
+            with (
+                patch("telegram_client.AGY_MODEL_CHOICE_PATH", model_path),
+                patch("telegram_client.AGY_EFFORT_CHOICE_PATH", effort_path),
+            ):
+                self.assertEqual(
+                    load_agy_model(
+                        {"agy": {"model": "gemini-3.8-flash-low"}}, {}
+                    ),
+                    "claude-sonnet-4-6",
+                )
+                self.assertEqual(
+                    load_agy_reasoning_effort(
+                        {"agy": {"effort": "low"}}, {}
+                    ),
+                    "high",
+                )
 
     def test_load_ai_config_for_lm_studio_uses_local_settings_without_openai_key(self) -> None:
         settings = {
@@ -1048,7 +1099,9 @@ class AiBotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ):
             await run_ai_bot(client, dev_chat=True)
 
-        agy_type.assert_called_once_with(model="gemini-3.5-flash")
+        agy_type.assert_called_once_with(
+            model="gemini-3.5-flash", reasoning_effort="medium"
+        )
         openai_type.assert_called_once_with(api_key="test-openai-key")
         model_client = responder_type.call_args.args[1]
         self.assertIsInstance(model_client, GeminiQuotaFallbackClient)
