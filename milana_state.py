@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 
@@ -831,6 +832,22 @@ class MilanaStateStore:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Share the owned connection with modular repositories atomically.
+
+        Callers must not nest transactions or commit the connection themselves.
+        BEGIN IMMEDIATE also serializes read/modify/write across connections.
+        """
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._connection
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
 
     def record_telegram_notice(
         self,

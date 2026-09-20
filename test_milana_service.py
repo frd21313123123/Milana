@@ -222,6 +222,58 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             build_heartbeat_changes(payload, self.state.get_agent_state())
 
+    async def test_scene_context_is_shared_by_fast_and_reflective_turns(self):
+        service = self.service()
+        compact = await service._state_context(_production_telegram_trigger())
+        reflective = await service._state_context(TurnTrigger(kind="heartbeat", occurred_at=NOW))
+        self.assertEqual(compact["current_scene"], reflective["current_scene"])
+        self.assertIn("<scene_day>", compact["scene_day"])
+        scene_id = service.scene.current().scene_id
+        self.supervisor.open_text = "иди домой и ложись спать"
+        service.model_client.responses.values.append(_final(_direct_telegram_payload("пока занята")))
+        await service._execute_turn(_production_telegram_trigger())
+        request = service.model_client.responses.requests[0]
+        self.assertIn("Scene State", request["instructions"])
+        self.assertIn("не означают совершённого перехода", request["instructions"])
+        self.assertIn("<current_scene>", request["instructions"])
+        self.assertEqual(len(service.model_client.responses.requests), 1)
+        self.assertEqual(service.scene.current().scene_id, scene_id)
+        self.assertEqual(service.scene.current().location_type, "university")
+
+    async def test_scene_phone_wait_rechecks_without_calling_model(self):
+        service = self.service(dev_mode=False)
+        current = service.scene.current()
+        unavailable = SimpleNamespace(phone_available=False)
+        with (
+            patch.object(service.scene, "tick", side_effect=[unavailable, current]),
+            patch("milana_service.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            await service._wait_for_scene_phone()
+        sleep.assert_awaited_once_with(30)
+        self.assertEqual(service.model_client.responses.requests, [])
+
+    async def test_delayed_trigger_uses_current_schedule_with_scene(self):
+        service = self.service()
+        trigger = TurnTrigger(kind="heartbeat", occurred_at=NOW-timedelta(hours=6))
+        context = await service._state_context(trigger)
+        self.assertEqual(datetime.fromisoformat(context["schedule"]["now"]), NOW)
+        self.assertEqual(context["schedule"]["current"]["kind"], "study")
+        self.assertIn("в университете", context["current_scene"])
+
+    async def test_scene_blocks_unavailable_media_before_host_call(self):
+        service = self.service()
+        stage = service.staging.begin(_production_telegram_trigger())
+        with self.assertRaises(ValueError):
+            await service._host_action(stage, "token", "send_voice", {}, "key")
+        self.assertEqual(self.supervisor.calls, [])
+
+    async def test_service_wires_scene_to_paused_heartbeat(self):
+        service = self.service()
+        ended = service.scene.end()
+        await service.heartbeat.run_once()
+        self.assertNotEqual(ended.scene_id, service.scene.current().scene_id)
+        self.assertEqual(service.model_client.responses.requests, [])
+
     def test_status_exposes_pending_reply_without_notice_ids(self):
         service = self.service()
         respond_at = NOW + timedelta(minutes=3)
@@ -1629,7 +1681,10 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             await service._flush_notices("77")
 
         planner.assert_called_once_with(NOW)
-        self.assertIn(call(120.0), sleep.await_args_list)
+        delays = [entry.args[0] for entry in sleep.await_args_list if entry.args[0] > 0]
+        self.assertEqual(len(delays), 1)
+        self.assertGreaterEqual(delays[0], 120.0)
+        self.assertLessEqual(delays[0], 162.0)  # scene adds at most 35%, never skips the base wait
         turn = service._turn_queue.get_nowait()
         self.assertEqual(turn.metadata["notice_ids"], ["tg:77:9"])
 

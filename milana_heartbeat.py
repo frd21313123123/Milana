@@ -99,6 +99,7 @@ class MilanaHeartbeat:
         poll_interval_seconds: float = 30.0,
         max_attempts: int = 5,
         dev_mode: bool = False,
+        on_tick: Callable[[datetime], Any] | None = None,
     ) -> None:
         if not isinstance(state, MilanaStateStore):
             raise TypeError("state должен быть MilanaStateStore")
@@ -119,6 +120,7 @@ class MilanaHeartbeat:
         self._next_transition_at = next_transition_at or (lambda _: None)
         self._on_recovery = on_recovery
         self._recovery_context = recovery_context
+        self._on_tick = on_tick
         self.recovery_threshold = recovery_threshold
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.max_attempts = max_attempts
@@ -413,6 +415,8 @@ class MilanaHeartbeat:
     async def run_once(self) -> int:
         """Process recovery, all due explicit jobs and one random heartbeat."""
         now = _aware(self._now())
+        if self._on_tick is not None:
+            await _await_if_needed(self._on_tick(now))
         processed = await self._run_recovery_once(now)
         if processed:
             # Recovery already contains the missed schedule summary and sets a

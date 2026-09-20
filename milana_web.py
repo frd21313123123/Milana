@@ -1303,6 +1303,14 @@ class MilanaHandler(BaseHTTPRequestHandler):
             self.send_json(data)
             return
 
+        if path == "/api/scene":
+            callback = self.panel_context.callback("scene")
+            if callback is None:
+                self.send_json({"ok": False, "message": "Scene State доступен во встроенной панели"}, 409)
+            else:
+                self.send_json(_json_value(callback()))
+            return
+
         self.send_error(404, "Not Found")
 
     # --- POST ---
@@ -1352,6 +1360,10 @@ class MilanaHandler(BaseHTTPRequestHandler):
             return
 
         callback_routes = {
+            "/api/scene/refresh": ("refresh_scene", False),
+            "/api/scene/end": ("end_scene", False),
+            "/api/scene/next": ("next_scene", False),
+            "/api/scene/event": ("add_scene_event", True),
             "/api/heartbeat/pause": ("pause_heartbeat", False),
             "/api/heartbeat/resume": ("resume_heartbeat", False),
             "/api/heartbeat/wake": ("wake_now", False),

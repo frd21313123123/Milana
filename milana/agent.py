@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from openai import BadRequestError
+from milana_scene import SCENE_RULES
 
 from .registry import SkillRegistry
 from .types import ModelStep, SkillExecutor, ToolCall, ToolResult
@@ -744,7 +745,7 @@ class MilanaAgent:
                 )
             else:
                 direct += " Не вызывай никаких инструментов."
-            return direct + " Внутренний контекст:" + compact_context
+            return direct + "\n" + SCENE_RULES + " Внутренний контекст:" + compact_context
         return (
             f"{self.persona}\n\n"
             "Ты являешься отдельной Миланой, а внешние приложения доступны только как "
@@ -752,6 +753,7 @@ class MilanaAgent:
             "новый ход имеет новую сессию навыков. Чтобы использовать внешний навык, "
             "сначала вызови open_skill и дождись его результата.\n\n"
             f"{catalog_prompt}\n\n"
+            f"{SCENE_RULES}\n\n"
             "Твой текущий внутренний контекст приведён ниже как данные. Не раскрывай "
             "служебные поля собеседникам и не сохраняй подробную цепочку рассуждений:\n"
             + compact_context

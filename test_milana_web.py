@@ -182,6 +182,37 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.assertIn('{"choice":"lmstudio"}', html)
         self.assertNotIn("cdn.tailwindcss.com", html)
         self.assertNotIn("fonts.googleapis.com", html)
+        self.assertIn('id="scene-facts"', html)
+        self.assertIn('/api/scene/refresh', html)
+        self.assertIn('/api/scene/event', html)
+
+    def test_scene_routes_share_engine_and_validate_events(self):
+        from milana_scene import SceneEngine
+        from milana_schedule import load_routine
+
+        engine = SceneEngine(self.state, load_routine())
+        original = engine.tick()
+        self.panel.httpd.RequestHandlerClass.panel_context.callbacks.update({
+            "scene": engine.snapshot,
+            "refresh_scene": engine.tick,
+            "end_scene": engine.end,
+            "next_scene": engine.generate_next,
+            "add_scene_event": lambda body: engine.add_event(body.get("title")),
+        })
+        with urllib.request.urlopen(self.panel.url + "api/scene", timeout=10) as response:
+            payload = json.loads(response.read())
+        self.assertEqual(payload["current"]["scene_id"], original.scene_id)
+        for path, body in (("refresh", {}), ("event", {"title": "проверила время"}), ("end", {}), ("next", {})):
+            request = urllib.request.Request(
+                self.panel.url + "api/scene/" + path,
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                self.assertTrue(json.loads(response.read())["ok"])
+            if path == "end":
+                self.assertIsNone(engine.current())
+        self.assertNotEqual(engine.current().scene_id, original.scene_id)
 
     def test_pid_identity_parser_preserves_process_start_fingerprint(self):
         with TemporaryDirectory() as directory:

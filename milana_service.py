@@ -63,6 +63,7 @@ from milana_ipc import (
 from milana_memory import MilanaMemoryStore, PulseTask
 from milana_pulse import DelayedActionDispatcher
 from milana_schedule import WeeklyRoutine, load_routine
+from milana_scene import SceneEngine
 from milana_state import (
     FactSeed,
     GoalChange,
@@ -434,6 +435,8 @@ class MilanaService:
         self.supervisor = supervisor
         self.dev_mode = bool(dev_mode)
         self._now = now
+        self.scene = SceneEngine(state, routine, now=now)
+        self.scene.tick()
         fast_config = config.telegram_fast_path
         self.telegram_fast_path_enabled = bool(
             fast_config.enabled
@@ -488,6 +491,7 @@ class MilanaService:
             next_awake_at=self._next_awake_at,
             next_transition_at=self._next_transition_at,
             recovery_context=self._recovery_context,
+            on_tick=self.scene.tick,
             dev_mode=dev_mode,
         )
         self.delayed_dispatcher = DelayedActionDispatcher(
@@ -1071,6 +1075,7 @@ class MilanaService:
                     # recent reply, online status or active conversation must
                     # not make Milana read the next message immediately.
                     plan = self.routine.plan_response(received)
+                    plan = self.scene.adjust_response_plan(plan, received)
                     respond_at = plan.respond_at
                     detail = plan.policy.label
                     delay = max(0.0, (plan.respond_at - received).total_seconds())
@@ -1086,6 +1091,7 @@ class MilanaService:
                         await asyncio.sleep(delay)
                 else:
                     detail = "Ночные сообщения разбудили Милану"
+                    self.scene.wake_phone(received)
             else:
                 detail = "DEV-режим — ответ без паузы расписания"
             self._set_reply_estimate(
@@ -1351,7 +1357,14 @@ class MilanaService:
                     self._turn_phases.pop(key, None)
                 queue.task_done()
 
+    async def _wait_for_scene_phone(self) -> None:
+        """Recheck after schedule waits, without consuming model calls/retries."""
+        while not self.scene.tick().phone_available:
+            await asyncio.sleep(30)
+
     async def _execute_turn(self, trigger: TurnTrigger) -> TurnResult:
+        if trigger.kind == "telegram_notice" and not self.dev_mode:
+            await self._wait_for_scene_phone()
         loop = asyncio.get_running_loop()
         if trigger.kind == "telegram_notice":
             self._turn_timings[trigger.id] = _TelegramTurnTiming(
@@ -2150,6 +2163,10 @@ class MilanaService:
         arguments: Mapping[str, Any],
         key: str,
     ) -> Mapping[str, Any]:
+        if action in {"send_voice", "send_photo"}:
+            scene = self.scene.tick()
+            if not getattr(scene, "can_voice" if action == "send_voice" else "can_photo"):
+                raise ValueError("Текущая сцена не допускает этот вид сообщения")
         if action in {"send_messages", "send_sticker", "send_sticker_reference"}:
             self._schedule_cosmetic(self._show_online())
         result = await self.supervisor.request(
@@ -2377,7 +2394,7 @@ class MilanaService:
 
     def _initiative_target(self) -> str | int | None:
         now = self._now()
-        if self._is_sleeping(now):
+        if self._is_sleeping(now) or not self.scene.tick(now).phone_available:
             return None
         for relationship in self.state.list_relationships(limit=100):
             if not self.state.can_initiate(relationship.entity_id, now=now):
@@ -2388,6 +2405,8 @@ class MilanaService:
         return None
 
     async def _state_context(self, trigger: TurnTrigger) -> Mapping[str, Any]:
+        context_at = self._now()
+        scene_context = self.scene.model_context(context_at)
         if self.agent._is_compact_telegram_trigger(trigger):
             state = self.state.get_agent_state()
             chat_needs = {
@@ -2403,6 +2422,7 @@ class MilanaService:
                 for entry in self.memory.get_diary(limit=4)
             ]
             return {
+                **scene_context,
                 "world": {
                     "mood": state.mood,
                     "valence": state.valence,
@@ -2410,7 +2430,7 @@ class MilanaService:
                     "needs": chat_needs,
                     "current_intention": _fresh_chat_intention(
                         state,
-                        at=trigger.occurred_at,
+                        at=context_at,
                     ),
                     "relationship": (
                         {
@@ -2424,7 +2444,7 @@ class MilanaService:
                         else None
                     ),
                 },
-                "schedule": self._schedule_context(trigger.occurred_at),
+                "schedule": self._schedule_context(context_at),
                 "memory_notes": diary,
                 "turn_policy": {
                     "one_telegram_message": True,
@@ -2441,8 +2461,9 @@ class MilanaService:
             }
         world = self.state.load_world_context()
         return {
+            **scene_context,
             "world": _json_ready(world),
-            "schedule": self._schedule_context(trigger.occurred_at),
+            "schedule": self._schedule_context(context_at),
             "diary": self.memory.diary_instructions(limit=12),
             "turn_policy": {
                 "max_new_entities": 3,
@@ -2913,6 +2934,11 @@ class MilanaService:
             port=port,
             state_store=self.state,
             callbacks={
+                "scene": self.scene.snapshot,
+                "refresh_scene": self.scene.tick,
+                "end_scene": self.scene.end,
+                "next_scene": self.scene.generate_next,
+                "add_scene_event": lambda body: self.scene.add_event(body.get("title")),
                 "pause_heartbeat": lambda: on_loop(self.heartbeat.pause),
                 "resume_heartbeat": lambda: on_loop(self.heartbeat.resume),
                 "wake_now": lambda: on_loop(
@@ -3027,6 +3053,7 @@ class MilanaService:
         pending_replies = self._reply_estimates_status()
         return {
             "service": "running",
+            "scene": self.scene.snapshot(),
             "dev_mode": self.dev_mode,
             "telegram_host": self.supervisor.status(),
             "skills": [item["id"] for item in self.registry.root_catalog()],
