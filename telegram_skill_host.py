@@ -50,6 +50,7 @@ RPC_OPEN = "telegram.open"
 RPC_MATERIALIZE = "telegram.materialize"  # compatibility/readability alias
 RPC_EXECUTE = "telegram.execute"
 RPC_BACKFILL = "telegram.backfill"
+RPC_READ_MESSAGES = "telegram.read_messages"
 RPC_CLEANUP_TURN = "telegram.cleanup_turn"
 RPC_HEALTH = "telegram.health"
 RPC_PRESENCE = "telegram.presence"
@@ -179,6 +180,10 @@ class TelegramAdapter(Protocol):
 
     async def set_presence(self, online: bool) -> None: ...
 
+    async def read_messages(
+        self, target: str, limit: int
+    ) -> Sequence[Mapping[str, Any]]: ...
+
 
 @dataclass
 class _TargetGrant:
@@ -247,6 +252,7 @@ class TelegramSkillHost:
             RPC_MATERIALIZE: self._handle_open,
             RPC_EXECUTE: self._handle_execute,
             RPC_BACKFILL: self._handle_backfill,
+            RPC_READ_MESSAGES: self._handle_read_messages,
             RPC_CLEANUP_TURN: self._handle_cleanup_turn,
             RPC_HEALTH: self._handle_health,
             RPC_PRESENCE: self._handle_presence,
@@ -795,6 +801,44 @@ class TelegramSkillHost:
         await self.cleanup_turn(turn_id)
         return {"cleaned": True, "turn_id": turn_id}
 
+    async def _handle_read_messages(
+        self, params: Any, request: RequestContext
+    ) -> Mapping[str, Any]:
+        payload = _params_object(params)
+        target = _required_string(payload, "target", max_length=128)
+        limit = payload.get("limit", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise JsonRpcError(INVALID_PARAMS, "limit must be between 1 and 100")
+        reader = getattr(self.adapter, "read_messages", None)
+        if not callable(reader):
+            raise JsonRpcError(INTERNAL_ERROR, "Telegram adapter cannot read messages")
+        try:
+            messages = reader(target, limit)
+            if inspect.isawaitable(messages):
+                messages = await messages
+        except Exception as exc:
+            raise JsonRpcError(
+                INTERNAL_ERROR,
+                f"Telegram read failed: {type(exc).__name__}: {exc}",
+            ) from exc
+        if not isinstance(messages, Sequence):
+            raise JsonRpcError(INTERNAL_ERROR, "Telegram adapter returned invalid messages")
+        safe: list[dict[str, Any]] = []
+        for item in messages:
+            if not isinstance(item, Mapping):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            safe.append(
+                {
+                    "message_id": item.get("message_id"),
+                    "timestamp": item.get("timestamp"),
+                    "text": text[:20_000],
+                }
+            )
+        return {"target": target, "messages": safe}
+
     async def _handle_health(
         self, params: Any, request: RequestContext
     ) -> Mapping[str, Any]:
@@ -1009,6 +1053,25 @@ class TelethonTelegramAdapter:
                 if incoming_count >= wanted_incoming:
                     break
         return tuple(notices[:limit])
+
+    async def read_messages(
+        self, target: str, limit: int
+    ) -> Sequence[Mapping[str, Any]]:
+        await self._ensure_connected()
+        entity = await self.client.get_entity(target)
+        messages: list[dict[str, Any]] = []
+        async for message in self.client.iter_messages(entity, limit=limit):
+            message_id = getattr(message, "id", None)
+            if isinstance(message_id, bool) or not isinstance(message_id, int):
+                continue
+            messages.append(
+                {
+                    "message_id": message_id,
+                    "timestamp": _utc_iso(getattr(message, "date", None)),
+                    "text": str(getattr(message, "raw_text", "") or ""),
+                }
+            )
+        return tuple(messages)
 
     async def backfill_before_ack(
         self, target: str | int, through_message_id: int
@@ -1859,6 +1922,7 @@ __all__ = [
     "LOCAL_STAGED_ACTIONS",
     "READ_ACTIONS",
     "RPC_BACKFILL",
+    "RPC_READ_MESSAGES",
     "RPC_CLEANUP_TURN",
     "RPC_EXECUTE",
     "RPC_HEALTH",

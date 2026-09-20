@@ -24,6 +24,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from agy_provider import AgyError
+from agy_recovery import (
+    DEFAULT_UNLOCKER_PATH,
+    activate_unlocker_async,
+    extract_unlocker_key,
+    installed_unlocker_version,
+    is_unlocker_recoverable_error,
+)
 from milana import (
     MilanaAgent,
     TurnResult,
@@ -357,6 +365,47 @@ class TurnPreemptedError(RuntimeError):
     """A lower-priority model turn yielded to an incoming user message."""
 
 
+class _RecoveringResponses:
+    """Responses facade that performs one guarded unlocker recovery retry."""
+
+    def __init__(self, owner: "_RecoveringModelClient") -> None:
+        self._owner = owner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._owner._client.responses, name)
+
+    async def create(self, **request: Any) -> Any:
+        try:
+            return await self._owner._client.responses.create(**request)
+        except AgyError as exc:
+            if not is_unlocker_recoverable_error(exc):
+                raise
+            try:
+                recovered = await self._owner._recover(exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as recovery_error:  # recovery must not kill the worker
+                print(
+                    "Antigravity recovery failed: "
+                    f"{type(recovery_error).__name__}: {recovery_error}",
+                    file=sys.stderr,
+                )
+                recovered = False
+            if not recovered:
+                raise
+            return await self._owner._client.responses.create(**request)
+
+
+class _RecoveringModelClient:
+    def __init__(self, client: Any, recover: Any) -> None:
+        self._client = client
+        self._recover = recover
+        self.responses = _RecoveringResponses(self)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
 class MilanaService:
     """Own the model, memory, world, schedule, heartbeat and skill registry."""
 
@@ -374,7 +423,10 @@ class MilanaService:
         now: Any = _now,
     ) -> None:
         self.config = config
-        self.model_client = model_client
+        self._agy_recovery_lock = asyncio.Lock()
+        self._agy_recovery_attempt_at = 0.0
+        self._agy_recovered_at = 0.0
+        self.model_client = _RecoveringModelClient(model_client, self._recover_agy)
         self.memory = memory
         self.state = state
         self.routine = routine
@@ -409,7 +461,7 @@ class MilanaService:
         )
         self.registry = registry
         self.agent = MilanaAgent(
-            model_client,
+            self.model_client,
             model=config.model,
             persona=config.instructions,
             registry=registry,
@@ -576,6 +628,56 @@ class MilanaService:
         )
         rpc_server.register_method("telegram.notice", service._rpc_telegram_notice)
         return service
+
+    async def _recover_agy(self, error: AgyError) -> bool:
+        """Try to self-heal a regional Antigravity denial once per cooldown."""
+
+        if not is_unlocker_recoverable_error(error):
+            return False
+        now = time.monotonic()
+        async with self._agy_recovery_lock:
+            now = time.monotonic()
+            if now - self._agy_recovered_at < 90.0:
+                return True
+            if now - self._agy_recovery_attempt_at < 300.0:
+                return False
+            self._agy_recovery_attempt_at = now
+            binary = Path(
+                os.environ.get("AG_UNLOCKER_BIN", str(DEFAULT_UNLOCKER_PATH))
+            ).expanduser()
+            version = await asyncio.to_thread(installed_unlocker_version, binary)
+            if not version:
+                return False
+            try:
+                payload = await self.supervisor.request(
+                    "telegram.read_messages",
+                    {"target": "@nova_txt", "limit": 100},
+                    timeout=30.0,
+                )
+            except Exception as exc:  # Telegram may be offline; retry later.
+                print(
+                    "Antigravity recovery could not read Telegram: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                return False
+            if not isinstance(payload, Mapping):
+                return False
+            messages = payload.get("messages", [])
+            if not isinstance(messages, list):
+                return False
+            key = extract_unlocker_key(messages, version)
+            if not key:
+                return False
+            activated = await activate_unlocker_async(binary, key)
+            if not activated:
+                return False
+            self._agy_recovered_at = time.monotonic()
+            print(
+                f"Antigravity unlocker {version} activated; retrying the request",
+                file=sys.stderr,
+            )
+            return True
 
     def _seed_world(self) -> None:
         if self.state.get_entity("milana") is None:
