@@ -19,7 +19,20 @@ if errorlevel 1 (
 )
 
 echo.
-echo === 2/2: Google Antigravity ===
+echo === 2/3: Antigravity Unlocker ===
+echo Enter the unlocker key only in the SSH window, then enable the proxy route.
+echo Do not paste the key into chat or save it in the repository.
+echo.
+"%SSH%" -tt %SERVER% "/root/.local/share/agunlocker/ag_unlocker --tui"
+if errorlevel 1 (
+    echo.
+    echo Antigravity Unlocker activation did not finish. Fix the error and run this file again.
+    pause
+    exit /b 1
+)
+
+echo.
+echo === 3/3: Google Antigravity ===
 echo Open the URL shown by Antigravity in your browser, sign in to Google,
 echo and paste the one-time code back into the SSH window. Exit agy after login.
 echo.
