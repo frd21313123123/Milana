@@ -5,13 +5,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call, patch
 
 from milana import ToolResult, TurnTrigger, empty_turn_payload
 from milana_heartbeat import HeartbeatReason, HeartbeatTrigger
 from milana_ipc import MediaPathValidator
 from milana_memory import MilanaMemoryStore
-from milana_schedule import load_routine
+from milana_schedule import ResponsePlan, ResponsePolicy, load_routine
 from milana_service import MilanaService, TurnPreemptedError, build_heartbeat_changes
 from milana_state import MilanaStateStore, StateConflictError, TelegramTurnMetric
 from telegram_client import AIConfig, MessageFlowConfig, TelegramFastPathConfig
@@ -1594,6 +1594,44 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(turns[0].metadata["notice_ids"][0], "tg:77:1")
         self.assertEqual(turns[-1].metadata["notice_ids"][-1], "tg:77:205")
+
+    async def test_recent_chat_still_waits_for_the_current_schedule(self):
+        service = self.service(dev_mode=False)
+        self.memory.add_message(
+            77,
+            "assistant",
+            "недавний ответ",
+            telegram_message_id=8,
+            created_at=(NOW - timedelta(minutes=1)).isoformat(),
+        )
+        self.memory.set_last_attentive_at(NOW)
+        notice = {
+            "source": "telegram",
+            "notice_id": "tg:77:9",
+            "chat_id": 77,
+            "message_id": 9,
+            "timestamp": NOW.isoformat(),
+            "sender": {"id": 88, "display_name": "Лера"},
+            "media_type": "text",
+        }
+        service._notice_buffers["77"] = [notice]
+        service._notice_first_at["77"] = asyncio.get_running_loop().time()
+        plan = ResponsePlan(
+            received_at=NOW,
+            respond_at=NOW + timedelta(seconds=120),
+            policy=ResponsePolicy(True, 10, 240),
+        )
+
+        with (
+            patch.object(service.routine, "plan_response", return_value=plan) as planner,
+            patch("milana_service.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            await service._flush_notices("77")
+
+        planner.assert_called_once_with(NOW)
+        self.assertIn(call(120.0), sleep.await_args_list)
+        turn = service._turn_queue.get_nowait()
+        self.assertEqual(turn.metadata["notice_ids"], ["tg:77:9"])
 
     async def test_pending_outbox_notice_is_not_merged_with_fresh_notice(self):
         service = self.service()

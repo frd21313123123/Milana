@@ -991,19 +991,9 @@ def format_response_policy(policy: ResponsePolicy) -> str:
 
 
 def format_attention_behavior(routine: WeeklyRoutine) -> str:
-    behavior = routine.online_behavior
-    recent = format_response_policy(
-        ResponsePolicy(
-            True,
-            behavior.online_response_min_seconds,
-            behavior.online_response_max_seconds,
-        )
-    )
-    ramp = format_response_delay(behavior.attention_ramp_seconds)
-    return (
-        f"после online {recent}, затем плавно возвращается к диапазону занятия "
-        f"за {ramp}"
-    )
+    # The current service deliberately does not shorten reading delays merely
+    # because the account was recently online or replied in the same chat.
+    return "online и активный диалог не сокращают задержку расписания"
 
 
 def format_activity_range(activity: Activity) -> str:

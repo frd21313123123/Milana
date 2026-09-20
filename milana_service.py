@@ -1060,20 +1060,17 @@ class MilanaService:
             detail = "Ответ поставлен в очередь"
             if not self.dev_mode:
                 received = self._now()
-                active_conversation = self._chat_recently_active(
-                    notices[-1]["chat_id"], received
-                )
                 night_wake = False
-                if self._is_sleeping(received) and not active_conversation:
+                if self._is_sleeping(received):
                     threshold = self._night_thresholds.setdefault(
                         chat_key, self._random.randint(3, 8)
                     )
                     night_wake = len(notices) >= threshold
-                if not night_wake and not active_conversation:
-                    plan = self.routine.plan_response(
-                        received,
-                        last_attentive_at=self.memory.get_last_attentive_at(),
-                    )
+                if not night_wake:
+                    # Every new incoming batch obeys the current schedule.  A
+                    # recent reply, online status or active conversation must
+                    # not make Milana read the next message immediately.
+                    plan = self.routine.plan_response(received)
                     respond_at = plan.respond_at
                     detail = plan.policy.label
                     delay = max(0.0, (plan.respond_at - received).total_seconds())
@@ -1088,7 +1085,7 @@ class MilanaService:
                     if delay:
                         await asyncio.sleep(delay)
                 else:
-                    detail = "Диалог уже активен — ответ без паузы расписания"
+                    detail = "Ночные сообщения разбудили Милану"
             else:
                 detail = "DEV-режим — ответ без паузы расписания"
             self._set_reply_estimate(
@@ -2796,20 +2793,6 @@ class MilanaService:
             separators=(",", ":"),
         )
         self.state.add_world_summary(period_start, this_week, content, at=current)
-
-    def _chat_recently_active(
-        self, chat_id: str | int, at: datetime
-    ) -> bool:
-        history = self.memory.get_chat_history(chat_id, limit=1)
-        if not history or history[-1].role != "assistant":
-            return False
-        try:
-            sent_at = _parse_datetime(
-                history[-1].created_at, field_name="history.created_at"
-            )
-        except (TypeError, ValueError):
-            return False
-        return timedelta(0) <= at - sent_at <= timedelta(minutes=30)
 
     def _start_web_panel(self, port: int) -> None:
         try:
