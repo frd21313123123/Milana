@@ -10,6 +10,7 @@ User=root
 WorkingDirectory=/opt/milana
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/root/.local/bin:/opt/milana/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AG_LS_PROXY=http://127.0.0.1:53129
 ExecStart=/opt/milana/.venv/bin/python -u /opt/milana/milana_service.py
 Restart=on-failure
 RestartSec=10
