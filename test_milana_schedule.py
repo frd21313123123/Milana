@@ -252,12 +252,15 @@ class MilanaScheduleTests(unittest.TestCase):
         )
 
     def test_online_behavior_is_loaded_and_validated(self) -> None:
+        config = json.loads(SCHEDULE_PATH.read_text(encoding="utf-8"))
+        config.pop("online_behavior")
+        self.assertEqual(WeeklyRoutine(config).online_behavior.attention_ramp_seconds, 180)
         self.assertEqual(
             self.routine.online_behavior,
             OnlineBehavior(
                 online_response_min_seconds=1,
                 online_response_max_seconds=10,
-                attention_ramp_seconds=900,
+                attention_ramp_seconds=180,
                 post_reply_online_min_seconds=30,
                 post_reply_online_max_seconds=60,
                 spontaneous_online_interval_min_seconds=900,
@@ -330,9 +333,12 @@ class MilanaScheduleTests(unittest.TestCase):
         expected = {
             0: ResponsePolicy(True, 1, 10),
             2: ResponsePolicy(True, 1, 10),
-            60: ResponsePolicy(True, 2, 18),
-            300: ResponsePolicy(True, 16, 163),
-            900: policy,
+            10: ResponsePolicy(True, 2, 15),
+            60: ResponsePolicy(True, 16, 163),
+            90: ResponsePolicy(True, 30, 305),
+            120: ResponsePolicy(True, 45, 447),
+            180: policy,
+            300: policy,
             1200: policy,
         }
 
@@ -344,6 +350,14 @@ class MilanaScheduleTests(unittest.TestCase):
                     now - timedelta(seconds=age_seconds),
                 )
                 self.assertEqual(actual, expected_policy)
+
+        bounds = [self.routine.attentive_response_policy(
+            policy, now, now - timedelta(seconds=age)
+        ) for age in range(181)]
+        self.assertEqual([p.min_delay_seconds for p in bounds],
+                         sorted(p.min_delay_seconds for p in bounds))
+        self.assertEqual([p.max_delay_seconds for p in bounds],
+                         sorted(p.max_delay_seconds for p in bounds))
 
     def test_plan_response_uses_recent_attention_and_normalizes_timezone(self) -> None:
         received_at = datetime(2026, 7, 13, 19, 10, tzinfo=YEKT)

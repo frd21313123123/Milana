@@ -67,7 +67,7 @@ DEFAULT_RESPONSE_BEHAVIOR: Mapping[str, Any] = {
 DEFAULT_ONLINE_BEHAVIOR: Mapping[str, int] = {
     "online_response_min_seconds": 1,
     "online_response_max_seconds": 10,
-    "attention_ramp_seconds": 15 * 60,
+    "attention_ramp_seconds": 3 * 60,
     "post_reply_online_min_seconds": 30,
     "post_reply_online_max_seconds": 60,
     "spontaneous_online_interval_min_seconds": 15 * 60,

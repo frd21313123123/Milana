@@ -2995,7 +2995,7 @@ class MilanaMessageResponderTests(unittest.IsolatedAsyncioTestCase):
             clock.value = datetime(2026, 7, 13, 23, 35, tzinfo=YEKT)
             await responder.process(make_event(clock.value, message_id=301))
 
-        self.assertEqual(clock.delays[-2:], [7, 2])
+        self.assertEqual(clock.delays[-2:], [10, 2])
         self.assertEqual(
             responder.presence.sleep_deferred_until,
             clock.value + timedelta(minutes=30),

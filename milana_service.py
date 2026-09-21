@@ -62,7 +62,7 @@ from milana_ipc import (
 )
 from milana_memory import MilanaMemoryStore, PulseTask
 from milana_pulse import DelayedActionDispatcher
-from milana_schedule import WeeklyRoutine, load_routine
+from milana_schedule import ResponsePlan, WeeklyRoutine, load_routine
 from milana_scene import SceneEngine
 from milana_future_actions import FutureActionStore
 from milana_state import (
@@ -508,6 +508,7 @@ class MilanaService:
         self._turn_queue: asyncio.Queue[TurnTrigger] = asyncio.Queue()
         self._notice_buffers: dict[str, list[dict[str, Any]]] = {}
         self._notice_first_at: dict[str, float] = {}
+        self._notice_attention: dict[str, tuple[datetime, datetime | None, int]] = {}
         self._notice_tasks: dict[str, asyncio.Task[None]] = {}
         self._reply_estimates: dict[str, dict[str, Any]] = {}
         self._reply_estimates_lock = threading.Lock()
@@ -535,6 +536,13 @@ class MilanaService:
         self._presence_lock = asyncio.Lock()
         self._presence_online = False
         self._attention_until: datetime | None = None
+        self._attention_version = 0
+        self._attention_changed = asyncio.Event()
+        self._last_attentive_at = self.memory.get_last_attentive_at()
+        if self._last_attentive_at is not None and self._last_attentive_at > self._now():
+            self._last_attentive_at = self.memory.set_last_attentive_at(
+                self._now(), only_if_later=False
+            )
 
     def _set_reply_estimate(
         self,
@@ -884,6 +892,8 @@ class MilanaService:
             self._web_panel.stop()
             self._web_panel = None
         if not self.dev_mode:
+            self._attention_reference_at(self._now())
+            self._attention_until = None
             try:
                 await self._set_presence(False)
             except Exception:
@@ -951,6 +961,10 @@ class MilanaService:
             }
         self._seen_notices.add(notice_id)
         chat_key = str(chat_id)
+        received = self.last_telegram_notice_at
+        self._notice_attention[chat_key] = (
+            received, self._attention_reference_at(received), self._attention_version
+        )
         summary_task = self._summary_tasks.pop(chat_key, None)
         if summary_task is not None:
             summary_task.cancel()
@@ -1069,35 +1083,30 @@ class MilanaService:
             respond_at = self._now()
             detail = "Ответ поставлен в очередь"
             if not self.dev_mode:
-                received = self._now()
+                now = self._now()
+                arrival = self._notice_attention.get(chat_key)
+                if arrival is None:
+                    arrival = (now, self._attention_reference_at(now), self._attention_version)
+                received, attentive_at, attention_version = arrival
                 night_wake = False
-                if self._is_sleeping(received):
+                if self._is_sleeping(now):
                     threshold = self._night_thresholds.setdefault(
                         chat_key, self._random.randint(3, 8)
                     )
                     night_wake = len(notices) >= threshold
                 if not night_wake:
-                    # Every new incoming batch obeys the current schedule.  A
-                    # recent reply, online status or active conversation must
-                    # not make Milana read the next message immediately.
-                    plan = self.routine.plan_response(received)
-                    plan = self.scene.adjust_response_plan(plan, received)
+                    plan = self.routine.plan_response(
+                        received, last_attentive_at=attentive_at
+                    )
+                    plan = self.scene.adjust_response_plan(plan, now)
+                    plan = await self._wait_for_reply_plan(
+                        chat_key, notices, plan, attention_version
+                    )
                     respond_at = plan.respond_at
                     detail = plan.policy.label
-                    delay = max(0.0, (plan.respond_at - received).total_seconds())
-                    self._set_reply_estimate(
-                        chat_key,
-                        status="waiting",
-                        notice_ids=notice_ids,
-                        message_count=len(notices),
-                        respond_at=respond_at,
-                        detail=detail,
-                    )
-                    if delay:
-                        await asyncio.sleep(delay)
                 else:
                     detail = "Ночные сообщения разбудили Милану"
-                    self.scene.wake_phone(received)
+                    self.scene.wake_phone(now)
             else:
                 detail = "DEV-режим — ответ без паузы расписания"
             self._set_reply_estimate(
@@ -1110,6 +1119,7 @@ class MilanaService:
             )
             notices = self._notice_buffers.pop(chat_key, [])
             self._notice_first_at.pop(chat_key, None)
+            self._notice_attention.pop(chat_key, None)
             self._notice_tasks.pop(chat_key, None)
             if not notices:
                 return
@@ -2233,7 +2243,6 @@ class MilanaService:
                     self.state.complete_telegram_ack_intent(
                         ack_key, at=self._now()
                     )
-        self.memory.set_last_attentive_at(self._now())
         return sent_count > 0
 
     async def _host_action(
@@ -2263,6 +2272,10 @@ class MilanaService:
         )
         if not isinstance(result, Mapping):
             raise TypeError("Telegram host action must return an object")
+        if action in {"send_messages", "send_sticker", "send_sticker_reference"} and (
+            result.get("status") == "sent" or result.get("sent_message_ids")
+        ):
+            self._start_post_reply_attention()
         return result
 
     async def _cleanup_telegram_turn(self, turn_id: str) -> None:
@@ -2319,6 +2332,80 @@ class MilanaService:
         self._cosmetic_tasks.add(task)
         task.add_done_callback(self._cosmetic_tasks.discard)
 
+    def _record_attention(self, at: datetime) -> None:
+        if self._last_attentive_at is None or at > self._last_attentive_at:
+            self._last_attentive_at = self.memory.set_last_attentive_at(at)
+
+    def _attention_reference_at(self, at: datetime) -> datetime | None:
+        # Persist only the portion of an online window that actually elapsed.
+        if self._attention_until is not None:
+            self._record_attention(min(at, self._attention_until))
+        return self._last_attentive_at
+
+    def _start_attention_window(self, seconds: int) -> None:
+        if self.dev_mode:
+            return
+        now = self._now()
+        until = max(self._attention_until or now, now + timedelta(seconds=seconds))
+        cursor = now
+        while cursor < until:
+            state = self.routine.state_at(cursor)
+            if state.current is not None and state.current.kind == "sleep":
+                until = cursor
+                break
+            if state.next_at is None or state.next_at >= until:
+                break
+            cursor = state.next_at
+        self._attention_until = until
+        self._record_attention(now)
+        self._attention_version += 1
+        self._attention_changed.set()
+        self._attention_changed = asyncio.Event()
+
+    def _start_post_reply_attention(self) -> None:
+        behavior = self.routine.online_behavior
+        self._start_attention_window(self._random.randint(
+            behavior.post_reply_online_min_seconds,
+            behavior.post_reply_online_max_seconds,
+        ))
+
+    async def _wait_for_reply_plan(
+        self, chat_key: str, notices: Sequence[Mapping[str, Any]],
+        plan: ResponsePlan, attention_version: int,
+    ) -> ResponsePlan:
+        while True:
+            changed = self._attention_changed
+            if attention_version != self._attention_version:
+                attention_version = self._attention_version
+                now = self._now()
+                candidate = self.routine.plan_response(
+                    now, last_attentive_at=self._attention_reference_at(now)
+                )
+                candidate = self.scene.adjust_response_plan(candidate, now)
+                if candidate.respond_at < plan.respond_at:
+                    plan = candidate
+            self._set_reply_estimate(
+                chat_key, status="waiting",
+                notice_ids=[item["notice_id"] for item in notices],
+                message_count=len(notices), respond_at=plan.respond_at,
+                detail=plan.policy.label,
+            )
+            delay = max(0.0, (plan.respond_at - self._now()).total_seconds())
+            if not delay:
+                return plan
+            timer = asyncio.create_task(asyncio.sleep(delay))
+            activity = asyncio.create_task(changed.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (timer, activity), return_when=asyncio.FIRST_COMPLETED
+                )
+                if timer in done:
+                    return plan
+            finally:
+                for task in (timer, activity):
+                    task.cancel()
+                await asyncio.gather(timer, activity, return_exceptions=True)
+
     async def _set_presence(self, online: bool) -> None:
         if self.dev_mode:
             return
@@ -2333,15 +2420,7 @@ class MilanaService:
     async def _show_online(self) -> None:
         if self.dev_mode:
             return
-        behavior = self.routine.online_behavior
-        seconds = self._random.randint(
-            behavior.post_reply_online_min_seconds,
-            behavior.post_reply_online_max_seconds,
-        )
-        self._attention_until = max(
-            self._attention_until or self._now(),
-            self._now() + timedelta(seconds=seconds),
-        )
+        self._start_post_reply_attention()
         await self._set_presence(True)
 
     async def _presence_loop(self) -> None:
@@ -2355,6 +2434,16 @@ class MilanaService:
         spontaneous_until: datetime | None = None
         while True:
             now = self._now()
+            self._attention_reference_at(now)
+            # Retire the old window before considering another spontaneous visit.
+            if spontaneous_until is not None and now >= spontaneous_until:
+                spontaneous_until = None
+                next_spontaneous = now + timedelta(
+                    seconds=self._random.randint(
+                        behavior.spontaneous_online_interval_min_seconds,
+                        behavior.spontaneous_online_interval_max_seconds,
+                    )
+                )
             should_be_online = False
             if not self._is_sleeping(now):
                 if self._attention_until is not None and now < self._attention_until:
@@ -2368,18 +2457,13 @@ class MilanaService:
                             behavior.spontaneous_online_duration_max_seconds,
                         )
                     )
+                    self._start_attention_window(
+                        int((spontaneous_until - now).total_seconds())
+                    )
                     should_be_online = True
             else:
                 spontaneous_until = None
                 self._attention_until = None
-            if spontaneous_until is not None and now >= spontaneous_until:
-                spontaneous_until = None
-                next_spontaneous = now + timedelta(
-                    seconds=self._random.randint(
-                        behavior.spontaneous_online_interval_min_seconds,
-                        behavior.spontaneous_online_interval_max_seconds,
-                    )
-                )
             try:
                 await self._set_presence(should_be_online)
             except Exception as exc:  # host supervisor handles recovery
@@ -2438,6 +2522,7 @@ class MilanaService:
                         or f"Telegram delayed action was not sent: {outcome.get('status')}"
                     )
                 )
+            self._start_post_reply_attention()
             self.heartbeat.notify_delayed_result(
                 {"task_id": task.id, "action": task.action, "status": "sent"},
                 idempotency_key=f"delayed-result:{task.id}",

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,6 +19,31 @@ from telegram_client import AIConfig, MessageFlowConfig, TelegramFastPathConfig
 
 
 NOW = datetime(2026, 7, 14, 10, 0, tzinfo=timezone.utc)
+
+
+class _ReplyClock:
+    """Controllable timers: cancelled waits never advance the clock."""
+
+    def __init__(self):
+        self.value = NOW
+        self.calls = asyncio.Queue()
+        self.yield_once = asyncio.sleep
+
+    def now(self):
+        return self.value
+
+    async def sleep(self, seconds):
+        if seconds <= 0:
+            await self.yield_once(0)
+            return
+        deadline = self.value + timedelta(seconds=seconds)
+        release = asyncio.Event()
+        await self.calls.put((seconds, release))
+        await release.wait()
+        self.value = max(self.value, deadline)
+
+    async def next_timer(self):
+        return await asyncio.wait_for(self.calls.get(), timeout=1)
 
 
 class _Responses:
@@ -1200,7 +1226,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.memory.get_chat_history(77)[0].content, "привет")
 
     async def test_hanging_presence_never_delays_network_send(self):
-        service = self.service()
+        service = self.service(dev_mode=False)
         never = asyncio.Event()
 
         async def hanging_presence():
@@ -1221,6 +1247,8 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 timeout=0.1,
             )
             self.assertEqual(outcome["status"], "sent")
+            self.assertEqual(self.memory.get_last_attentive_at(), NOW)
+            self.assertGreater(service._attention_until, NOW)
         finally:
             service.staging.discard(trigger.id)
             for task in tuple(service._cosmetic_tasks):
@@ -1647,7 +1675,8 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turns[0].metadata["notice_ids"][0], "tg:77:1")
         self.assertEqual(turns[-1].metadata["notice_ids"][-1], "tg:77:205")
 
-    async def test_recent_chat_still_waits_for_the_current_schedule(self):
+    async def test_recent_chat_uses_attention_before_scene_adjustment(self):
+        self.memory.set_last_attentive_at(NOW)
         service = self.service(dev_mode=False)
         self.memory.add_message(
             77,
@@ -1656,7 +1685,6 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             telegram_message_id=8,
             created_at=(NOW - timedelta(minutes=1)).isoformat(),
         )
-        self.memory.set_last_attentive_at(NOW)
         notice = {
             "source": "telegram",
             "notice_id": "tg:77:9",
@@ -1670,8 +1698,8 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         service._notice_first_at["77"] = asyncio.get_running_loop().time()
         plan = ResponsePlan(
             received_at=NOW,
-            respond_at=NOW + timedelta(seconds=120),
-            policy=ResponsePolicy(True, 10, 240),
+            respond_at=NOW + timedelta(seconds=10),
+            policy=ResponsePolicy(True, 1, 10),
         )
 
         with (
@@ -1680,13 +1708,200 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             await service._flush_notices("77")
 
-        planner.assert_called_once_with(NOW)
+        planner.assert_called_once_with(NOW, last_attentive_at=NOW)
         delays = [entry.args[0] for entry in sleep.await_args_list if entry.args[0] > 0]
         self.assertEqual(len(delays), 1)
-        self.assertGreaterEqual(delays[0], 120.0)
-        self.assertLessEqual(delays[0], 162.0)  # scene adds at most 35%, never skips the base wait
+        self.assertGreaterEqual(delays[0], 10.0)
+        self.assertLessEqual(delays[0], 13.5)
         turn = service._turn_queue.get_nowait()
         self.assertEqual(turn.metadata["notice_ids"], ["tg:77:9"])
+
+    async def test_online_activity_is_persisted_only_as_it_elapses(self):
+        service = self.service(dev_mode=False)
+        clock = _ReplyClock()
+        service._now = clock.now
+        with patch.object(service._random, "randint", return_value=60):
+            await service._show_online()
+        self.assertEqual(self.memory.get_last_attentive_at(), NOW)
+        self.assertEqual(service._attention_until, NOW + timedelta(seconds=60))
+
+        clock.value += timedelta(seconds=20)
+        service._start_attention_window(60)
+        self.assertEqual(self.memory.get_last_attentive_at(), clock.value)
+        version = service._attention_version
+        clock.value = NOW + timedelta(seconds=70)
+        self.assertEqual(service._attention_reference_at(clock.value), clock.value)
+        clock.value = NOW + timedelta(seconds=90)
+        reference = service._attention_reference_at(clock.value)
+        self.assertEqual(reference, NOW + timedelta(seconds=80))
+        self.assertEqual(service._attention_version, version)
+        policy = service.routine.attentive_response_policy(
+            ResponsePolicy(True, 60, 600), clock.value, reference
+        )
+        self.assertEqual(policy, ResponsePolicy(True, 2, 15))
+        clock.value += timedelta(seconds=300)
+        self.assertEqual(service._attention_reference_at(clock.value), reference)
+
+    def test_attention_survives_restart_and_future_values_are_capped(self):
+        past = (NOW - timedelta(seconds=90)).astimezone(timezone(timedelta(hours=5)))
+        self.memory.set_last_attentive_at(past)
+        service = self.service(dev_mode=False)
+        self.assertEqual(service._attention_reference_at(NOW), past)
+        self.assertEqual(service.routine.attentive_response_policy(
+            ResponsePolicy(True, 60, 600), NOW, service._attention_reference_at(NOW)
+        ), ResponsePolicy(True, 30, 305))
+        self.memory.set_last_attentive_at(NOW + timedelta(minutes=5))
+        restarted = self.service(dev_mode=False)
+        self.assertEqual(restarted._attention_reference_at(NOW), NOW)
+        self.assertEqual(self.memory.get_last_attentive_at(), NOW)
+        self.assertIsNone(restarted._attention_until)
+
+    async def test_spontaneous_online_records_activity_and_ends_gradient_at_exit(self):
+        service = self.service(dev_mode=False)
+        clock = _ReplyClock()
+        service._now = clock.now
+        with (
+            patch("milana_service.asyncio.sleep", new=clock.sleep),
+            patch.object(service._random, "randint", side_effect=lambda low, high: low),
+        ):
+            worker = asyncio.create_task(service._presence_loop())
+            try:
+                _, release = await clock.next_timer()
+                clock.value += timedelta(seconds=900)
+                release.set()
+                _, release = await clock.next_timer()
+                self.assertTrue(service._presence_online)
+                self.assertEqual(service._attention_version, 1)
+                self.assertEqual(self.memory.get_last_attentive_at(), clock.value)
+                end = clock.value + timedelta(seconds=120)
+                clock.value = end
+                release.set()
+                await clock.next_timer()
+                self.assertFalse(service._presence_online)
+                self.assertEqual(self.memory.get_last_attentive_at(), end)
+                self.assertEqual(service._attention_version, 1)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_pending_reply_accelerates_once_and_updates_estimate(self):
+        service = self.service(dev_mode=False)
+        clock = _ReplyClock()
+        service._now = clock.now
+        notice = _production_telegram_trigger().metadata["notices"][0]
+        service._notice_buffers["77"] = [notice]
+        service._notice_first_at["77"] = asyncio.get_running_loop().time()
+        original = service.routine.plan_response
+
+        def plan(at, **kwargs):
+            return original(at, randint=lambda low, high: high, **kwargs)
+
+        with (
+            patch("milana_service.asyncio.sleep", new=clock.sleep),
+            patch.object(service.routine, "plan_response", side_effect=plan) as planner,
+            patch.object(service.scene, "adjust_response_plan", side_effect=lambda plan, at: plan),
+        ):
+            worker = asyncio.create_task(service._flush_notices("77"))
+            try:
+                delay, old_release = await clock.next_timer()
+                self.assertGreater(delay, 10)
+                clock.value += timedelta(seconds=5)
+                service._start_attention_window(120)
+                delay, release = await clock.next_timer()
+                self.assertEqual(delay, 10)
+                expected = clock.value + timedelta(seconds=10)
+                self.assertEqual(datetime.fromisoformat(
+                    service._reply_estimates["77"]["respond_at"]
+                ), expected)
+                clock.value += timedelta(seconds=1)
+                service._attention_reference_at(clock.value)
+                self.assertEqual(planner.call_count, 2)
+                old_release.set()
+                self.assertTrue(service._turn_queue.empty())
+                release.set()
+                await asyncio.wait_for(worker, timeout=1)
+                self.assertEqual(service._turn_queue.qsize(), 1)
+                self.assertEqual(service._turn_queue.get_nowait().metadata["notice_ids"], [notice["notice_id"]])
+                self.assertNotIn("77", service._notice_attention)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+    async def test_attention_before_wait_registration_is_not_lost_or_used_to_postpone(self):
+        service = self.service(dev_mode=False)
+        old_plan = ResponsePlan(NOW, NOW + timedelta(seconds=2), ResponsePolicy(True, 1, 10))
+        service._start_attention_window(120)
+        slower = replace(old_plan, respond_at=NOW + timedelta(seconds=10))
+        with (
+            patch.object(service.routine, "plan_response", return_value=slower) as planner,
+            patch.object(service.scene, "adjust_response_plan", side_effect=lambda plan, at: plan),
+            patch("milana_service.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            result = await service._wait_for_reply_plan("77", [], old_plan, 0)
+        planner.assert_called_once_with(NOW, last_attentive_at=NOW)
+        self.assertEqual(result.respond_at, old_plan.respond_at)
+        sleep.assert_awaited_once_with(2)
+
+    async def test_series_uses_latest_arrival_snapshot_before_quiet_wait(self):
+        self.memory.set_last_attentive_at(NOW - timedelta(seconds=10))
+        service = self.service(dev_mode=False)
+        service.config = replace(service.config, message_flow=replace(
+            service.config.message_flow, input_quiet_seconds=30, input_max_wait_seconds=120
+        ))
+        clock = _ReplyClock()
+        service._now = clock.now
+        first = _production_telegram_trigger(9).metadata["notices"][0]
+        second = _production_telegram_trigger(10).metadata["notices"][0]
+        original = service.routine.plan_response
+        with (
+            patch("milana_service.asyncio.sleep", new=clock.sleep),
+            patch.object(service.routine, "plan_response", wraps=original) as planner,
+            patch.object(service.scene, "adjust_response_plan", side_effect=lambda plan, at: plan),
+        ):
+            await service._rpc_telegram_notice(first, None)
+            cancelled_worker = service._notice_tasks["77"]
+            await clock.next_timer()
+            clock.value += timedelta(seconds=20)
+            await service._rpc_telegram_notice(second, None)
+            worker = service._notice_tasks["77"]
+            try:
+                _, release = await clock.next_timer()
+                received = clock.value
+                await service._rpc_telegram_notice(second, None)  # duplicate must not reset it
+                self.assertIs(service._notice_tasks["77"], worker)
+                clock.value += timedelta(seconds=300)
+                release.set()
+                await asyncio.wait_for(worker, timeout=1)
+                await asyncio.gather(cancelled_worker, return_exceptions=True)
+                planner.assert_called_once_with(
+                    received, last_attentive_at=NOW - timedelta(seconds=10)
+                )
+                turn = service._turn_queue.get_nowait()
+                self.assertEqual(turn.metadata["notice_ids"], [first["notice_id"], second["notice_id"]])
+                self.assertTrue(service._turn_queue.empty())
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, cancelled_worker, return_exceptions=True)
+
+    async def test_recent_attention_preserves_sleep_phone_and_dev_rules(self):
+        service = self.service(dev_mode=False)
+        bedtime = datetime(2026, 7, 13, 23, 30, tzinfo=timezone(timedelta(hours=5)))
+        service._now = lambda: bedtime - timedelta(seconds=10)
+        service._start_attention_window(120)
+        self.assertEqual(service._attention_until, bedtime)
+        plan = service.routine.plan_response(bedtime, last_attentive_at=bedtime)
+        self.assertGreater((plan.respond_at - bedtime).total_seconds(), 3600)
+
+        service._now = lambda: NOW
+        short = ResponsePlan(NOW, NOW + timedelta(seconds=10), ResponsePolicy(True, 1, 10))
+        unavailable = replace(service.scene.current(), phone_available=False)
+        with patch.object(service.scene, "tick", return_value=unavailable):
+            adjusted = service.scene.adjust_response_plan(short, NOW)
+        self.assertGreaterEqual(adjusted.respond_at, unavailable.expected_end)
+        service.dev_mode = True
+        version = service._attention_version
+        service._start_attention_window(60)
+        self.assertEqual(service._attention_version, version)
 
     async def test_pending_outbox_notice_is_not_merged_with_fresh_notice(self):
         service = self.service()
