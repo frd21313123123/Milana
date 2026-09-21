@@ -1303,10 +1303,15 @@ class MilanaHandler(BaseHTTPRequestHandler):
             self.send_json(data)
             return
 
-        if path in {"/api/scene", "/api/future-actions"}:
-            callback = self.panel_context.callback("future_actions" if path == "/api/future-actions" else "scene")
+        if path in {"/api/scene", "/api/future-actions", "/api/phone-session"}:
+            callback_name = {
+                "/api/scene": "scene",
+                "/api/future-actions": "future_actions",
+                "/api/phone-session": "phone_session",
+            }[path]
+            callback = self.panel_context.callback(callback_name)
             if callback is None:
-                self.send_json({"ok": False, "message": "Scene State доступен во встроенной панели"}, 409)
+                self.send_json({"ok": False, "message": "Данные доступны во встроенной панели"}, 409)
             else:
                 self.send_json(_json_value(callback()))
             return

@@ -65,6 +65,7 @@ from milana_pulse import DelayedActionDispatcher
 from milana_schedule import ResponsePlan, WeeklyRoutine, load_routine
 from milana_scene import SceneEngine
 from milana_future_actions import FutureActionStore
+from milana_phone import PHONE_PLAN_SCHEMA, PhoneSession, PhoneSessionStore
 from milana_state import (
     FactSeed,
     GoalChange,
@@ -440,6 +441,15 @@ class MilanaService:
         self.scene.tick()
         self.future_actions = FutureActionStore(state)
         self.future_actions.recover()
+        self.phone_sessions = PhoneSessionStore(state)
+        self.phone_sessions.recover(self._now())
+        self.phone_session_enabled = bool(
+            getattr(config, "phone_session", None)
+            and config.phone_session.enabled
+            and not self.dev_mode
+        )
+        self._phone_lock = asyncio.Lock()
+        self._phone_scheduled_visits: set[str] = set()
         fast_config = config.telegram_fast_path
         self.telegram_fast_path_enabled = bool(
             fast_config.enabled
@@ -483,6 +493,7 @@ class MilanaService:
                 config.telegram_fast_path.max_reply_messages
             ),
             state_context=self._state_context,
+            schema_contributor=self._phone_schema_contributor,
             tool_result_content=self._tool_result_media,
             model_generation_observer=self._set_telegram_model_typing,
             future_actions_enabled=True,
@@ -543,6 +554,14 @@ class MilanaService:
             self._last_attentive_at = self.memory.set_last_attentive_at(
                 self._now(), only_if_later=False
             )
+
+    @staticmethod
+    def _phone_schema_contributor(
+        _active_skills: tuple[str, ...], trigger: TurnTrigger
+    ) -> Mapping[str, Any]:
+        if trigger.kind == "phone_session_plan":
+            return {"phone_session": PHONE_PLAN_SCHEMA}
+        return {}
 
     def _set_reply_estimate(
         self,
@@ -802,7 +821,12 @@ class MilanaService:
                     {
                         "turn_id": recovery_turn,
                         "notice_ids": list(intent.notice_ids),
-                        "include_history": False,
+                        "include_history": not bool(intent.notice_ids),
+                        **(
+                            {"target_ref": _target_ref(intent.target_ref)}
+                            if not intent.notice_ids
+                            else {}
+                        ),
                     },
                     timeout=30.0,
                 )
@@ -1208,8 +1232,12 @@ class MilanaService:
                 )
             self._turn_queue.task_done()
 
-    @staticmethod
-    def _turn_key(trigger: TurnTrigger) -> str:
+    def _turn_key(self, trigger: TurnTrigger) -> str:
+        if self.phone_session_enabled and trigger.kind in {
+            "telegram_notice",
+            "phone_session_visit",
+        }:
+            return "__telegram__"
         chat = trigger.metadata.get("chat_id")
         return str(chat) if chat is not None else "__life__"
 
@@ -1378,7 +1406,323 @@ class MilanaService:
         while not self.scene.tick().phone_available:
             await asyncio.sleep(30)
 
+    @staticmethod
+    def _phone_target(trigger: TurnTrigger) -> str | None:
+        value = trigger.metadata.get("chat_id")
+        if value is None:
+            value = trigger.metadata.get("_telegram_target_ref")
+        if value is None and trigger.kind == "future_action":
+            action = trigger.metadata.get("future_action")
+            if isinstance(action, Mapping):
+                value = action.get("target_id")
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            return str(value)
+        return None
+
+    def _uses_phone_session(self, trigger: TurnTrigger) -> bool:
+        return self.phone_session_enabled and (
+            trigger.kind in {"telegram_notice", "phone_session_visit", "future_action"}
+            or trigger.metadata.get("_telegram_target_ref") is not None
+        )
+
+    def _sleep_context(self, session: PhoneSession) -> dict[str, Any]:
+        now = self._now()
+        schedule = self.routine.state_at(now)
+        bedtime = schedule.current is not None and schedule.current.kind == "sleep"
+        reminder = getattr(self.config, "phone_session", None)
+        minimum = int(getattr(reminder, "sleep_reminder_min_seconds", 600))
+        maximum = int(getattr(reminder, "sleep_reminder_max_seconds", 1200))
+        # The chosen interval is stable enough for one process and bounded in
+        # persisted state by the last actual reminder-bearing reply.
+        interval = self._random.randint(minimum, maximum)
+        last = session.last_sleep_reminder_at
+        reminder_due = bedtime and (
+            last is None or (now - last).total_seconds() >= interval
+        )
+        overdue = 0
+        if bedtime and schedule.current is not None:
+            local_now = schedule.now
+            start = local_now.replace(
+                hour=schedule.current.start // 60,
+                minute=schedule.current.start % 60,
+                second=0,
+                microsecond=0,
+            )
+            if start > local_now:
+                start -= timedelta(days=1)
+            overdue = max(0, int((local_now - start).total_seconds()))
+        return {
+            "planned_bedtime": bedtime,
+            "bedtime_overdue_seconds": overdue,
+            "sleep_reminder_due": reminder_due,
+        }
+
+    async def _ensure_phone_session(
+        self, trigger: TurnTrigger
+    ) -> tuple[PhoneSession, str]:
+        now = self._now()
+        session = self.phone_sessions.active()
+        created = session is None
+        if session is None:
+            settings = self.config.phone_session
+            duration = self._random.randint(
+                settings.duration_min_seconds, settings.duration_max_seconds
+            )
+            session = self.phone_sessions.start(trigger.kind, now, duration)
+            self._start_attention_window(duration)
+            try:
+                await self._set_presence(True)
+            except Exception as exc:
+                self.last_turn_error = f"presence: {type(exc).__name__}: {exc}"
+
+        needs_plan = (
+            created
+            or not session.remaining_plan
+            or now >= session.next_decision_at
+        )
+        target = self._phone_target(trigger)
+        if trigger.kind == "telegram_notice" and target is not None:
+            needs_plan = (
+                needs_plan
+                or not session.remaining_plan
+                or session.remaining_plan[0].target_ref != target
+            )
+        if needs_plan:
+            session = await self._plan_phone_session(session, trigger)
+        if self.routine.state_at(now).current is not None and self.routine.state_at(now).current.kind == "sleep":
+            self.scene.keep_phone_awake(session.next_decision_at, at=now)
+
+        target = self._phone_target(trigger)
+        intent = "reply" if trigger.kind in {"telegram_notice", "future_action"} else "read"
+        if target is not None:
+            for visit in session.remaining_plan:
+                if visit.target_ref == target:
+                    intent = visit.intent
+                    break
+        return session, intent
+
+    async def _plan_phone_session(
+        self, session: PhoneSession, cause: TurnTrigger | None
+    ) -> PhoneSession:
+        now = self._now()
+        try:
+            pages: list[Mapping[str, Any]] = []
+            dialogs: list[Mapping[str, Any]] = []
+            offset = 0
+            for _ in range(20):
+                page = await self.supervisor.request(
+                    "telegram.list_dialogs",
+                    {"offset": offset, "limit": 50},
+                    timeout=20.0,
+                )
+                if not isinstance(page, Mapping):
+                    raise TypeError("telegram.list_dialogs must return an object")
+                pages.append(page)
+                raw_dialogs = page.get("dialogs", [])
+                if isinstance(raw_dialogs, list):
+                    dialogs.extend(
+                        item for item in raw_dialogs if isinstance(item, Mapping)
+                    )
+                next_offset = page.get("next_offset")
+                if not page.get("has_more") or not isinstance(next_offset, int):
+                    break
+                offset = next_offset
+            catalog = {
+                "dialogs": dialogs,
+                "pages_loaded": len(pages),
+                "has_more": bool(pages and pages[-1].get("has_more")),
+            }
+        except Exception as exc:
+            # The durable notice journal remains a complete fallback catalog.
+            catalog = {"dialogs": [], "has_more": False, "error": str(exc)}
+        pending = self.state.list_pending_telegram_notices(
+            limit=1000, include_deferred=True
+        )
+        pending_chats: dict[str, int] = {}
+        for notice in pending:
+            chat_id = notice.get("chat_id")
+            if isinstance(chat_id, (str, int)) and not isinstance(chat_id, bool):
+                key = str(chat_id)
+                pending_chats[key] = pending_chats.get(key, 0) + 1
+        metadata = {
+            "phone_session_id": session.id,
+            "reason": cause.kind if cause is not None else "reconsideration",
+            "dialogs": catalog,
+            "pending_chats": pending_chats,
+            "future_actions": self.future_actions.snapshot(now),
+            "previous_results": self.phone_sessions.snapshot().get("recent_actions", []),
+            **self._sleep_context(session),
+        }
+        plan_trigger = TurnTrigger(
+            kind="phone_session_plan",
+            occurred_at=now,
+            revision=self.state.get_agent_state().revision,
+            metadata=metadata,
+        )
+        stage = self.staging.begin(plan_trigger)
+        try:
+            result = await self.agent.run_turn(plan_trigger)
+            self.staging.finish(plan_trigger.id)
+            plan = result.payload.get("phone_session")
+            if not isinstance(plan, Mapping):
+                raise ValueError("Model omitted phone_session plan")
+            normalized = dict(plan)
+            # A mature external reason means the phone has already been taken.
+            # The per-chat turn may still decide to read silently.
+            if cause is not None and cause.kind != "phone_session_plan":
+                normalized["decision"] = "continue"
+                target = self._phone_target(cause)
+                if target is not None:
+                    raw_visits = normalized.get("visits")
+                    visits = (
+                        [dict(item) for item in raw_visits if isinstance(item, Mapping)]
+                        if isinstance(raw_visits, list)
+                        else []
+                    )
+                    selected = next(
+                        (item for item in visits if str(item.get("target_ref")) == target),
+                        {"target_ref": target, "intent": "reply"},
+                    )
+                    normalized["visits"] = [
+                        selected,
+                        *[
+                            item
+                            for item in visits
+                            if str(item.get("target_ref")) != target
+                        ],
+                    ]
+            session = self.phone_sessions.apply_plan(session.id, normalized, now)
+            if session.status != "active":
+                self.scene.end_phone_use(now)
+                return session
+            self._enqueue_planned_visits(session, cause)
+            self._reorder_phone_worker_queue(session)
+            return session
+        except BaseException as exc:
+            self.staging.discard(plan_trigger.id)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            self.last_turn_error = f"phone-plan: {type(exc).__name__}: {exc}"
+            target = self._phone_target(cause) if cause is not None else None
+            fallback = {
+                "decision": "continue",
+                "reconsider_seconds": self.config.phone_session.duration_min_seconds,
+                "visits": (
+                    [{"target_ref": target, "intent": "reply"}] if target else []
+                ),
+            }
+            return self.phone_sessions.apply_plan(session.id, fallback, now)
+
+    def _enqueue_planned_visits(
+        self, session: PhoneSession, cause: TurnTrigger | None
+    ) -> None:
+        current = self._phone_target(cause) if cause is not None else None
+        pending_targets = {
+            str(item.get("chat_id"))
+            for item in self.state.list_pending_telegram_notices(
+                limit=1000, include_deferred=True
+            )
+            if item.get("chat_id") is not None
+        }
+        for visit in session.remaining_plan[:4]:
+            if visit.target_ref == current or visit.target_ref in pending_targets:
+                continue
+            key = f"{session.id}:{visit.target_ref}"
+            if key in self._phone_scheduled_visits:
+                continue
+            self._phone_scheduled_visits.add(key)
+            self._turn_queue.put_nowait(
+                TurnTrigger(
+                    kind="phone_session_visit",
+                    occurred_at=self._now(),
+                    source_skill="telegram",
+                    revision=self.state.get_agent_state().revision,
+                    metadata={
+                        "chat_id": visit.target_ref,
+                        "notice_ids": [],
+                        "notices": [],
+                        "phone_intent": visit.intent,
+                        "_telegram_target_ref": visit.target_ref,
+                        "_phone_visit_key": key,
+                    },
+                )
+            )
+
+    def _reorder_phone_worker_queue(self, session: PhoneSession) -> None:
+        """Apply the model's chat order to mature Telegram work already queued."""
+        queue = self._worker_queues.get("__telegram__")
+        if queue is None or queue.empty():
+            return
+        pending: list[Any] = []
+        while True:
+            try:
+                pending.append(queue.get_nowait())
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        order = {
+            visit.target_ref: index
+            for index, visit in enumerate(session.remaining_plan)
+        }
+        turns = [item for item in pending if isinstance(item, TurnTrigger)]
+        sentinels = [item for item in pending if not isinstance(item, TurnTrigger)]
+        turns.sort(
+            key=lambda item: order.get(
+                self._phone_target(item) or "", len(order) + pending.index(item)
+            )
+        )
+        for item in (*turns, *sentinels):
+            queue.put_nowait(item)
+
     async def _execute_turn(self, trigger: TurnTrigger) -> TurnResult:
+        if not self._uses_phone_session(trigger):
+            return await self._execute_turn_unlocked(trigger)
+        if trigger.kind == "telegram_notice":
+            await self._wait_for_scene_phone()
+        async with self._phone_lock:
+            visit_key = trigger.metadata.get("_phone_visit_key")
+            session, intent = await self._ensure_phone_session(trigger)
+            target = self._phone_target(trigger)
+            if target is not None:
+                session_id = session.id
+                self.phone_sessions.select_visit(session_id, target)
+                trigger = replace(
+                    trigger,
+                    metadata={
+                        **trigger.metadata,
+                        "phone_session_id": session_id,
+                        "phone_intent": intent,
+                        **self._sleep_context(session),
+                    },
+                )
+            try:
+                result = await self._execute_turn_unlocked(trigger)
+            finally:
+                if isinstance(visit_key, str):
+                    self._phone_scheduled_visits.discard(visit_key)
+            if target is not None:
+                telegram = result.payload.get("telegram")
+                outcome = "read"
+                if isinstance(telegram, Mapping):
+                    if telegram.get("messages"):
+                        outcome = "replied"
+                    elif telegram.get("reaction") is not None:
+                        outcome = "reacted"
+                self.phone_sessions.finish_visit(
+                    session.id,
+                    target_ref=target,
+                    intent=intent,
+                    outcome=outcome,
+                    at=self._now(),
+                )
+                if self._sleep_context(session).get("sleep_reminder_due") and outcome == "replied":
+                    self.phone_sessions.mark_sleep_reminder(session.id, self._now())
+                latest = self.phone_sessions.active()
+                if latest is not None and not latest.remaining_plan:
+                    self._schedule_phone_reconsideration("plan_completed")
+            return result
+
+    async def _execute_turn_unlocked(self, trigger: TurnTrigger) -> TurnResult:
         if trigger.kind == "telegram_notice" and not self.dev_mode:
             await self._wait_for_scene_phone()
         loop = asyncio.get_running_loop()
@@ -1803,7 +2147,7 @@ class MilanaService:
     async def _commit_turn(self, result: TurnResult, stage: StagedTurn) -> TurnResult:
         current = self.state.get_agent_state()
         changes = build_heartbeat_changes(result.payload, current)
-        telegram_turn = result.trigger.kind == "telegram_notice"
+        telegram_turn = result.trigger.kind in {"telegram_notice", "phone_session_visit"}
         if result.payload.get("future_actions") or result.trigger.kind == "future_action":
             # Resolve a staged sticker into the host's existing durable reference
             # before journaling; per-turn picker IDs cannot survive a restart.
@@ -2186,12 +2530,17 @@ class MilanaService:
                     sender_name="Милана",
                 )
         latest_id = self._latest_message_id(target)
-        if reaction is not None and latest_id is not None:
+        reaction_emoji = reaction
+        reaction_message_id = latest_id
+        if isinstance(reaction, Mapping):
+            reaction_emoji = reaction.get("emoji")
+            reaction_message_id = reaction.get("message_id")
+        if reaction_emoji is not None and isinstance(reaction_message_id, int):
             await self._host_action(
                 stage,
                 token,
                 "reaction",
-                {"message_id": latest_id, "reaction": reaction},
+                {"message_id": reaction_message_id, "reaction": reaction_emoji},
                 stage.action_key("final:reaction"),
             )
         sender_id = self._latest_sender_id(target)
@@ -2211,18 +2560,16 @@ class MilanaService:
         if message_ids:
             ack_key = stage.action_key("final:acknowledge")
             ack_intent: TelegramAckIntent | None = None
-            if notice_ids:
-                # Delivery/materialization has completed. Make the notice
-                # terminal together with a durable recovery instruction before
-                # crossing the network boundary where a successful response can
-                # be lost.
-                ack_intent = self.state.prepare_telegram_ack_intent(
-                    ack_key,
-                    target_ref,
-                    notice_ids,
-                    message_ids,
-                    at=self._now(),
-                )
+            # Delivery/materialization has completed. Persist recovery before
+            # crossing the network boundary where a successful response can be
+            # lost. Dialog visits have no notice IDs but still need durable read.
+            ack_intent = self.state.prepare_telegram_ack_intent(
+                ack_key,
+                target_ref,
+                notice_ids,
+                message_ids,
+                at=self._now(),
+            )
             try:
                 await self._host_action(
                     stage,
@@ -2258,7 +2605,8 @@ class MilanaService:
             if not getattr(scene, "can_voice" if action == "send_voice" else "can_photo"):
                 raise ValueError("Текущая сцена не допускает этот вид сообщения")
         if action in {"send_messages", "send_sticker", "send_sticker_reference"}:
-            self._schedule_cosmetic(self._show_online())
+            if not self.phone_session_enabled:
+                self._schedule_cosmetic(self._show_online())
         result = await self.supervisor.request(
             "telegram.execute",
             {
@@ -2305,7 +2653,7 @@ class MilanaService:
     ) -> None:
         """Show typing only while the selected Telegram turn calls the model."""
 
-        if trigger.kind != "telegram_notice":
+        if trigger.kind not in {"telegram_notice", "phone_session_visit"}:
             return
         try:
             stage = self.staging.get(trigger.id)
@@ -2435,6 +2783,35 @@ class MilanaService:
         while True:
             now = self._now()
             self._attention_reference_at(now)
+            if self.phone_session_enabled:
+                active = self.phone_sessions.active()
+                if active is not None:
+                    scheduled = self.routine.state_at(now).current
+                    if scheduled is not None and scheduled.kind == "sleep" and active.next_decision_at > now:
+                        self.scene.keep_phone_awake(active.next_decision_at, at=now)
+                    scene = self.scene.tick(now)
+                    if scene.phone_battery <= 0:
+                        self.phone_sessions.end(active.id, "phone_unavailable", now)
+                        self.scene.end_phone_use(now)
+                        active = None
+                if active is not None and now >= active.next_decision_at:
+                    self._schedule_phone_reconsideration("window_elapsed")
+                elif active is None and now >= next_spontaneous:
+                    self._schedule_phone_reconsideration("spontaneous")
+                    next_spontaneous = now + timedelta(
+                        seconds=self._random.randint(
+                            behavior.spontaneous_online_interval_min_seconds,
+                            behavior.spontaneous_online_interval_max_seconds,
+                        )
+                    )
+                should_be_online = active is not None
+                try:
+                    await self._set_presence(should_be_online)
+                except Exception as exc:
+                    self.last_turn_error = f"presence: {type(exc).__name__}: {exc}"
+                    self._presence_online = False
+                await asyncio.sleep(5.0)
+                continue
             # Retire the old window before considering another spontaneous visit.
             if spontaneous_until is not None and now >= spontaneous_until:
                 spontaneous_until = None
@@ -2471,7 +2848,72 @@ class MilanaService:
                 self._presence_online = False
             await asyncio.sleep(5.0)
 
+    def _schedule_phone_reconsideration(self, reason: str) -> None:
+        if any(
+            not task.done() and task.get_name() == "milana-phone-reconsider"
+            for task in self._management_tasks
+        ):
+            return
+        task = asyncio.create_task(
+            self._phone_reconsider(reason), name="milana-phone-reconsider"
+        )
+        self._management_tasks.add(task)
+        task.add_done_callback(self._management_tasks.discard)
+
+    async def _phone_reconsider(self, reason: str) -> None:
+        async with self._phone_lock:
+            now = self._now()
+            session = self.phone_sessions.active()
+            if session is None:
+                if self._is_sleeping(now) or not self.scene.tick(now).phone_available:
+                    return
+                settings = self.config.phone_session
+                session = self.phone_sessions.start(
+                    reason,
+                    now,
+                    self._random.randint(
+                        settings.duration_min_seconds, settings.duration_max_seconds
+                    ),
+                )
+            session = await self._plan_phone_session(session, None)
+            if session.status != "active":
+                self.scene.end_phone_use(now)
+                await self._set_presence(False)
+                return
+            self._start_attention_window(
+                max(1, int((session.next_decision_at - now).total_seconds()))
+            )
+            if self.routine.state_at(now).current is not None and self.routine.state_at(now).current.kind == "sleep":
+                self.scene.keep_phone_awake(session.next_decision_at, at=now)
+            await self._set_presence(True)
+
     async def _deliver_delayed_action(self, task: PulseTask) -> None:
+        if self.phone_session_enabled:
+            trigger = TurnTrigger(
+                kind="phone_session_visit",
+                occurred_at=self._now(),
+                source_skill="telegram",
+                revision=self.state.get_agent_state().revision,
+                metadata={
+                    "chat_id": task.chat_id,
+                    "_telegram_target_ref": _target_ref(task.chat_id),
+                    "phone_intent": "reply",
+                },
+            )
+            async with self._phone_lock:
+                session, _ = await self._ensure_phone_session(trigger)
+                await self._deliver_delayed_action_unlocked(task)
+                self.phone_sessions.finish_visit(
+                    session.id,
+                    target_ref=str(task.chat_id),
+                    intent="reply",
+                    outcome="replied",
+                    at=self._now(),
+                )
+            return
+        await self._deliver_delayed_action_unlocked(task)
+
+    async def _deliver_delayed_action_unlocked(self, task: PulseTask) -> None:
         turn_id = f"delayed:{task.id}"
         target = _target_ref(task.chat_id)
         opened = await self.supervisor.request(
@@ -2484,7 +2926,8 @@ class MilanaService:
         ):
             raise RuntimeError("Telegram host did not issue a delayed-action token")
         try:
-            self._schedule_cosmetic(self._show_online())
+            if not self.phone_session_enabled:
+                self._schedule_cosmetic(self._show_online())
             if task.action == "send_message":
                 action = "send_messages"
                 arguments = {"messages": [task.message]}
@@ -2826,6 +3269,8 @@ class MilanaService:
         }
 
     def _is_sleeping(self, at: datetime) -> bool:
+        if self.phone_session_enabled and self.phone_sessions.active() is not None:
+            return False
         current = self.routine.state_at(at).current
         return current is not None and current.kind == "sleep"
 
@@ -2883,6 +3328,8 @@ class MilanaService:
     def _latest_sender_id(cls, context: Mapping[str, Any]) -> str | int | None:
         messages = cls._messages(context)
         for item in reversed(messages):
+            if item.get("outgoing") is True:
+                continue
             sender = item.get("sender")
             if isinstance(sender, Mapping) and isinstance(sender.get("id"), (str, int)):
                 return sender["id"]
@@ -2892,6 +3339,8 @@ class MilanaService:
         self, target_ref: str | int, context: Mapping[str, Any]
     ) -> None:
         for item in self._messages(context):
+            if item.get("outgoing") is True:
+                continue
             text = str(item.get("text", "") or "").strip()
             media_type = item.get("media_type")
             if not text:
@@ -2917,7 +3366,9 @@ class MilanaService:
     def _record_incoming_relationship(
         self, target_ref: str | int, context: Mapping[str, Any]
     ) -> str | None:
-        messages = self._messages(context)
+        messages = [
+            item for item in self._messages(context) if item.get("outgoing") is not True
+        ]
         if not messages:
             return f"telegram:{target_ref}" if self.state.get_entity(
                 f"telegram:{target_ref}"
@@ -3114,6 +3565,7 @@ class MilanaService:
             state_store=self.state,
             callbacks={
                 "future_actions": lambda: self.future_actions.snapshot(self._now()),
+                "phone_session": self.phone_sessions.snapshot,
                 "cancel_future_action": lambda body: self.future_actions.cancel(require_id(body, "намерения"), now=self._now()),
                 "reschedule_future_action": lambda body: self.future_actions.reschedule_future_action(
                     require_id(body, "намерения"), body.get("due_at"), now=self._now()),
@@ -3240,6 +3692,7 @@ class MilanaService:
             "service": "running",
             "scene": self.scene.snapshot(),
             "future_actions": self.future_actions.snapshot(self._now()),
+            "phone_session": self.phone_sessions.snapshot(),
             "dev_mode": self.dev_mode,
             "telegram_host": self.supervisor.status(),
             "skills": [item["id"] for item in self.registry.root_catalog()],

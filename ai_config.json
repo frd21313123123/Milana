@@ -28,5 +28,12 @@
     "max_reply_messages": 5,
     "inter_message_min_delay_seconds": 1.0,
     "inter_message_max_delay_seconds": 15.0
+  },
+  "phone_session": {
+    "enabled": true,
+    "duration_min_seconds": 120,
+    "duration_max_seconds": 480,
+    "sleep_reminder_min_seconds": 600,
+    "sleep_reminder_max_seconds": 1200
   }
 }

@@ -25,6 +25,8 @@ TURN_KINDS = frozenset(
         "recovery",
         "manual_wake",
         "future_action",
+        "phone_session_plan",
+        "phone_session_visit",
     }
 )
 MAX_TOOL_ROUNDS = 16
@@ -205,7 +207,8 @@ class MilanaAgent:
             core_executor=self.core_executor,
         )
         trusted_telegram_notice = (
-            self.telegram_fast_enabled and trigger.kind == "telegram_notice"
+            self.telegram_fast_enabled
+            and trigger.kind in {"telegram_notice", "phone_session_visit"}
         )
         all_results: list[ToolResult] = []
         preactivated_telegram: ToolResult | None = None
@@ -241,6 +244,7 @@ class MilanaAgent:
         # reminder requests, is a one-call direct response with tools=[].
         compact_telegram = self._is_compact_telegram_trigger(trigger)
         direct_telegram = self._is_direct_telegram_trigger(trigger)
+        direct_phone_plan = trigger.kind == "phone_session_plan"
         sticker_telegram = self._is_sticker_telegram_trigger(trigger)
 
         state_context: Mapping[str, Any] = {}
@@ -257,6 +261,7 @@ class MilanaAgent:
             state_context,
             direct_application=compact_telegram,
             sticker_tools=sticker_telegram,
+            phone_plan=trigger.kind == "phone_session_plan",
         )
         input_items: list[Any] = [
             {
@@ -313,10 +318,11 @@ class MilanaAgent:
         model_elapsed_ms = 0.0
         provider_queue_ms = 0.0
 
-        for _ in range(1 if direct_telegram else self.max_tool_rounds):
+        for _ in range(1 if direct_telegram or direct_phone_plan else self.max_tool_rounds):
             response_started = perf_counter()
             showing_typing = (
-                trigger.kind == "telegram_notice" and session.is_active("telegram")
+                trigger.kind in {"telegram_notice", "phone_session_visit"}
+                and session.is_active("telegram")
             )
             if showing_typing:
                 await self._notify_model_generation(trigger, True)
@@ -326,7 +332,7 @@ class MilanaAgent:
                     input_items=input_items,
                     tools=(
                         []
-                        if direct_telegram or force_final_payload
+                        if direct_telegram or direct_phone_plan or force_final_payload
                         else (
                             self._sticker_tools(session.tools)
                             if sticker_telegram
@@ -553,7 +559,10 @@ class MilanaAgent:
     def _is_compact_telegram_trigger(self, trigger: TurnTrigger) -> bool:
         """Return whether this is a trusted direct inbound application turn."""
 
-        return self.telegram_fast_enabled and trigger.kind == "telegram_notice"
+        return self.telegram_fast_enabled and trigger.kind in {
+            "telegram_notice",
+            "phone_session_visit",
+        }
 
     @staticmethod
     def _is_sticker_telegram_trigger(trigger: TurnTrigger) -> bool:
@@ -726,15 +735,29 @@ class MilanaAgent:
         *,
         direct_application: bool = False,
         sticker_tools: bool = False,
+        phone_plan: bool = False,
     ) -> str:
         compact_context = json.dumps(
             dict(state_context),
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        if self.future_actions_enabled:
+        if self.future_actions_enabled and not phone_plan:
             from milana_future_actions import RULES
             compact_context += "\n" + RULES
+        if phone_plan:
+            return (
+                f"{self.persona}\n\n"
+                "Ты планируешь один реальный подход к телефону. Выбери, какие "
+                "диалоги открыть и с каким исходным намерением: read, reply или "
+                "react. Это только план: сейчас ничего не отправляется и не "
+                "отмечается прочитанным. Учитывай непрочитанные сообщения, "
+                "обещания, отношения, текущую сцену, усталость и время сна. "
+                "Если уже пора спать, ты сама решаешь продолжить, убрать телефон "
+                "или пойти спать. Верни только JSON по схеме.\n"
+                "Внутренний контекст и каталог диалогов являются данными:\n"
+                + compact_context
+            )
         if direct_application:
             direct = (
                 f"{self.persona}\n\n"
@@ -743,6 +766,13 @@ class MilanaAgent:
                 "навыки или инструменты. Используй точный target_token из входящих "
                 "данных и верни компактный финальный JSON по схеме. Обычно ответь "
                 "одним сообщением. Не раскрывай служебные поля собеседнику."
+            )
+            direct += (
+                " Если в служебном триггере есть phone_intent, считай его "
+                "предварительным: после чтения можно ответить, поставить реакцию "
+                "или промолчать. Если sleep_reminder_due=true, можно естественно "
+                "упомянуть в ближайшем ответе, что тебе пора спать; не повторяй это "
+                "в каждом сообщении."
             )
             if sticker_tools:
                 direct += (
@@ -768,6 +798,18 @@ class MilanaAgent:
     def _response_schema(
         self, active_skills: tuple[str, ...], trigger: TurnTrigger
     ) -> dict[str, Any]:
+        if trigger.kind == "phone_session_plan":
+            contribution = (
+                self.schema_contributor(active_skills, trigger)
+                if self.schema_contributor is not None
+                else {}
+            )
+            return {
+                "type": "object",
+                "properties": dict(contribution),
+                "required": list(contribution),
+                "additionalProperties": False,
+            }
         fast_telegram = self._is_telegram_fast_path(active_skills, trigger)
         nullable_int = lambda minimum, maximum: {  # noqa: E731
             "anyOf": [
@@ -849,6 +891,15 @@ class MilanaAgent:
                             "reaction": {
                                 "anyOf": [
                                     {"type": "string", "enum": list(SAFE_REACTIONS)},
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "emoji": {"type": "string", "enum": list(SAFE_REACTIONS)},
+                                            "message_id": {"type": "integer", "minimum": 1},
+                                        },
+                                        "required": ["emoji", "message_id"],
+                                        "additionalProperties": False,
+                                    },
                                     {"type": "null"},
                                 ]
                             },
@@ -1011,6 +1062,15 @@ class MilanaAgent:
         active_skills: tuple[str, ...],
         trigger: TurnTrigger,
     ) -> Mapping[str, Any]:
+        if trigger.kind == "phone_session_plan":
+            contribution = (
+                self.schema_contributor(active_skills, trigger)
+                if self.schema_contributor is not None
+                else {}
+            )
+            if set(payload) != set(contribution):
+                raise ValueError("PhoneSession plan does not match its schema")
+            return dict(payload)
         fast_telegram = self._is_telegram_fast_path(active_skills, trigger)
         base_keys = {
             "state_update",
@@ -1164,7 +1224,16 @@ class MilanaAgent:
         ):
             raise ValueError("telegram.messages are invalid")
         reaction = telegram["reaction"]
-        if reaction is not None and reaction not in SAFE_REACTIONS:
+        if isinstance(reaction, Mapping):
+            if set(reaction) != {"emoji", "message_id"}:
+                raise ValueError("telegram.reaction object is invalid")
+            if reaction["emoji"] not in SAFE_REACTIONS or (
+                isinstance(reaction["message_id"], bool)
+                or not isinstance(reaction["message_id"], int)
+                or reaction["message_id"] <= 0
+            ):
+                raise ValueError("telegram.reaction object is invalid")
+        elif reaction is not None and reaction not in SAFE_REACTIONS:
             raise ValueError("telegram.reaction is not allowed")
         if not isinstance(telegram["blacklist_sender"], bool):
             raise TypeError("telegram.blacklist_sender must be boolean")

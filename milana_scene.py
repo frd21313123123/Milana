@@ -369,11 +369,11 @@ class SceneEngine:
         family = scene.metadata["template_family"]
         template = TEMPLATES[family][scene.metadata["variant"]]
         eating = family == "food" and template.key in {"eat", "tea"}
-        recovering = family in {"sleep", "rest"}
         charging = scene.location_type == "home" and family in {"sleep", "rest", "personal"}
         clamp = lambda value: max(0.0, min(100.0, value))
         battery = clamp(scene.phone_battery + minutes * (.7 if charging else -.035 - .04 * (1 - scene.attention)))
         awake = db.execute("SELECT 1 FROM scene_facts WHERE scene_id=? AND key='briefly_awake' AND value='true' AND expires_at>?", (scene.scene_id, at.timestamp())).fetchone()
+        recovering = family == "rest" or (family == "sleep" and not awake)
         available = battery > 0 and (family != "sleep" or bool(awake))
         return replace(
             scene, updated_at=at,
@@ -522,6 +522,27 @@ class SceneEngine:
         """Existing night-message threshold can wake her without moving her."""
         now = self._time(at)
         self.add_fact(SceneFact("briefly_awake", True, now + timedelta(minutes=15)), at=now)
+        self.tick(now)
+
+    def keep_phone_awake(self, until: datetime, at: datetime | None = None) -> None:
+        """Keep a planned night phone session physically awake until reconsideration."""
+        now = self._time(at)
+        if until.tzinfo is None or until <= now:
+            raise ValueError("Phone awake deadline must be a future aware datetime")
+        self.add_fact(SceneFact("briefly_awake", True, until), at=now)
+        self.tick(now)
+
+    def end_phone_use(self, at: datetime | None = None) -> None:
+        """Remove a phone-session wake override so scheduled sleep resumes now."""
+        now = self._time(at)
+        self.tick(now)
+        with self.state.transaction() as db:
+            scene = self._current(db)
+            if scene is not None:
+                db.execute(
+                    "DELETE FROM scene_facts WHERE scene_id=? AND key='briefly_awake'",
+                    (scene.scene_id,),
+                )
         self.tick(now)
 
     def snapshot(self, at: datetime | None = None) -> dict[str, Any]:

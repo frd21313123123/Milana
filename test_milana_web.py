@@ -50,6 +50,11 @@ class EmbeddedWebPanelTests(unittest.TestCase):
             callbacks={
                 "wake_now": lambda: self.actions.append("wake"),
                 "update_state": lambda body: self.actions.append(("state", body)),
+                "phone_session": lambda: {
+                    "status": "active",
+                    "session": {"id": "phone-1", "selected_chat": "77"},
+                    "recent_actions": [],
+                },
             },
             status_provider=lambda: self.service_status,
         )
@@ -72,6 +77,18 @@ class EmbeddedWebPanelTests(unittest.TestCase):
         self.assertTrue(payload["schedule"]["available"])
         self.assertIn("activities", payload["schedule"])
         self.assertIn("response_policy", payload["schedule"])
+
+    def test_phone_session_route_and_panel_block(self):
+        with urllib.request.urlopen(
+            self.panel.url + "api/phone-session", timeout=10
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(payload["status"], "active")
+        self.assertEqual(payload["session"]["selected_chat"], "77")
+        with urllib.request.urlopen(self.panel.url, timeout=10) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn('id="phone-status"', html)
+        self.assertIn("renderPhone", html)
 
     def test_status_preserves_full_active_latency_distribution(self):
         self.service_status["telegram_latency"] = {

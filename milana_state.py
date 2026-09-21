@@ -1067,8 +1067,6 @@ class MilanaStateStore:
                 _identifier(item, "Telegram notice ID") for item in notice_ids
             )
         )
-        if not notices:
-            raise ValueError("Telegram ack intent требует notice IDs")
         normalized_messages: list[int] = []
         for message_id in message_ids:
             if (
@@ -1125,15 +1123,16 @@ class MilanaStateStore:
                         )
                 # This is intentionally in the same transaction as the intent.
                 # A host retry may now safely see these notices as terminal.
-                self._connection.execute(
-                    f"""
-                    UPDATE telegram_notice_journal
-                    SET status = 'handled', handled_at = ?, updated_at = ?,
-                        next_attempt_at = NULL, last_error = NULL
-                    WHERE notice_id IN ({placeholders}) AND status = 'pending'
-                    """,
-                    (timestamp, timestamp, *notices),
-                )
+                if notices:
+                    self._connection.execute(
+                        f"""
+                        UPDATE telegram_notice_journal
+                        SET status = 'handled', handled_at = ?, updated_at = ?,
+                            next_attempt_at = NULL, last_error = NULL
+                        WHERE notice_id IN ({placeholders}) AND status = 'pending'
+                        """,
+                        (timestamp, timestamp, *notices),
+                    )
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()

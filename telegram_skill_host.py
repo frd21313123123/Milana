@@ -51,6 +51,7 @@ RPC_MATERIALIZE = "telegram.materialize"  # compatibility/readability alias
 RPC_EXECUTE = "telegram.execute"
 RPC_BACKFILL = "telegram.backfill"
 RPC_READ_MESSAGES = "telegram.read_messages"
+RPC_LIST_DIALOGS = "telegram.list_dialogs"
 RPC_CLEANUP_TURN = "telegram.cleanup_turn"
 RPC_HEALTH = "telegram.health"
 RPC_PRESENCE = "telegram.presence"
@@ -184,6 +185,10 @@ class TelegramAdapter(Protocol):
         self, target: str, limit: int
     ) -> Sequence[Mapping[str, Any]]: ...
 
+    async def list_dialogs(
+        self, offset: int, limit: int
+    ) -> Sequence[Mapping[str, Any]]: ...
+
 
 @dataclass
 class _TargetGrant:
@@ -253,6 +258,7 @@ class TelegramSkillHost:
             RPC_EXECUTE: self._handle_execute,
             RPC_BACKFILL: self._handle_backfill,
             RPC_READ_MESSAGES: self._handle_read_messages,
+            RPC_LIST_DIALOGS: self._handle_list_dialogs,
             RPC_CLEANUP_TURN: self._handle_cleanup_turn,
             RPC_HEALTH: self._handle_health,
             RPC_PRESENCE: self._handle_presence,
@@ -578,6 +584,26 @@ class TelegramSkillHost:
             raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
         message_ids = _internal_id_set(result.pop("_message_ids", ()), "message")
         sender_ids = _internal_scalar_id_set(result.pop("_sender_ids", ()), "sender")
+        # Every message exposed to the model may be selected for a reaction.
+        # Incoming rows in ``messages`` may additionally be acknowledged by the
+        # service.  The host still validates every later action against this set.
+        exposed_message_ids = set(message_ids)
+        exposed_sender_ids = set(sender_ids)
+        for collection_name in ("messages", "history"):
+            collection = result.get(collection_name, ())
+            if not isinstance(collection, list):
+                continue
+            for item in collection:
+                if not isinstance(item, Mapping):
+                    continue
+                item_id = item.get("message_id")
+                if isinstance(item_id, int) and not isinstance(item_id, bool):
+                    exposed_message_ids.add(item_id)
+                sender = item.get("sender")
+                if isinstance(sender, Mapping):
+                    sender_id = sender.get("id")
+                    if isinstance(sender_id, (str, int)) and not isinstance(sender_id, bool):
+                        exposed_sender_ids.add(sender_id)
         expected_message_ids: set[int] = set()
         for notice_id in raw_notice_ids:
             try:
@@ -601,8 +627,8 @@ class TelegramSkillHost:
         token = secrets.token_urlsafe(24)
         self._grants.setdefault(turn_id, {})[token] = _TargetGrant(
             target=target,
-            message_ids=message_ids,
-            sender_ids=sender_ids,
+            message_ids=frozenset(exposed_message_ids),
+            sender_ids=frozenset(exposed_sender_ids),
         )
         result["target_token"] = token
         result["target_ref"] = target
@@ -839,6 +865,59 @@ class TelegramSkillHost:
             )
         return {"target": target, "messages": safe}
 
+    async def _handle_list_dialogs(
+        self, params: Any, request: RequestContext
+    ) -> Mapping[str, Any]:
+        payload = _params_object(params)
+        offset = payload.get("offset", 0)
+        limit = payload.get("limit", 50)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise JsonRpcError(INVALID_PARAMS, "offset must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise JsonRpcError(INVALID_PARAMS, "limit must be between 1 and 50")
+        reader = getattr(self.adapter, "list_dialogs", None)
+        if not callable(reader):
+            raise JsonRpcError(INTERNAL_ERROR, "Telegram adapter cannot list dialogs")
+        try:
+            rows = reader(offset, limit + 1)
+            if inspect.isawaitable(rows):
+                rows = await rows
+        except Exception as exc:
+            raise JsonRpcError(
+                INTERNAL_ERROR,
+                f"Telegram dialog listing failed: {type(exc).__name__}: {exc}",
+            ) from exc
+        if not isinstance(rows, Sequence):
+            raise JsonRpcError(INTERNAL_ERROR, "Telegram adapter returned invalid dialogs")
+        safe: list[dict[str, Any]] = []
+        for item in rows[:limit]:
+            if not isinstance(item, Mapping):
+                continue
+            target_ref = item.get("target_ref")
+            if isinstance(target_ref, bool) or not isinstance(target_ref, (str, int)):
+                continue
+            safe.append(
+                {
+                    "target_ref": target_ref,
+                    "title": str(item.get("title", ""))[:300],
+                    "kind": str(item.get("kind", "private"))[:32],
+                    "unread_count": max(0, int(item.get("unread_count", 0) or 0)),
+                    "last_activity_at": item.get("last_activity_at"),
+                    "actions": [
+                        action
+                        for action in item.get("actions", [])
+                        if action in {"read", "reply", "react"}
+                    ],
+                }
+            )
+        return {
+            "offset": offset,
+            "limit": limit,
+            "dialogs": safe,
+            "has_more": len(rows) > limit,
+            "next_offset": offset + len(safe) if len(rows) > limit else None,
+        }
+
     async def _handle_health(
         self, params: Any, request: RequestContext
     ) -> Mapping[str, Any]:
@@ -1073,6 +1152,48 @@ class TelethonTelegramAdapter:
             )
         return tuple(messages)
 
+    async def list_dialogs(
+        self, offset: int, limit: int
+    ) -> Sequence[Mapping[str, Any]]:
+        await self._ensure_connected()
+        result: list[dict[str, Any]] = []
+        index = 0
+        async for dialog in self.client.iter_dialogs():
+            if index < offset:
+                index += 1
+                continue
+            if len(result) >= limit:
+                break
+            entity = getattr(dialog, "entity", None)
+            if bool(getattr(dialog, "is_channel", False)):
+                kind = "channel"
+            elif bool(getattr(dialog, "is_group", False)):
+                kind = "group"
+            else:
+                kind = "private"
+            message = getattr(dialog, "message", None)
+            broadcast = bool(getattr(entity, "broadcast", False))
+            send_messages = bool(getattr(entity, "megagroup", False)) or not broadcast
+            actions = ["read", "react"]
+            if send_messages:
+                actions.insert(1, "reply")
+            result.append(
+                {
+                    "target_ref": getattr(dialog, "id", None),
+                    "title": str(getattr(dialog, "name", "") or ""),
+                    "kind": kind,
+                    "unread_count": int(getattr(dialog, "unread_count", 0) or 0),
+                    "last_activity_at": (
+                        _utc_iso(getattr(message, "date", None))
+                        if getattr(message, "date", None) is not None
+                        else None
+                    ),
+                    "actions": actions,
+                }
+            )
+            index += 1
+        return tuple(result)
+
     async def backfill_before_ack(
         self, target: str | int, through_message_id: int
     ) -> Sequence[TelegramNotice]:
@@ -1247,6 +1368,11 @@ class TelethonTelegramAdapter:
                     }
                 )
             history.reverse()
+        if not selected:
+            # An explicit dialog visit exposes its actual incoming messages as
+            # the acknowledgement set. Outgoing rows remain in history so the
+            # model understands the conversation but are never marked read.
+            materialized = [dict(item) for item in history if not item.get("outgoing")]
         return {
             "_target": target,
             "_message_ids": sorted(message_ids),
@@ -1923,6 +2049,7 @@ __all__ = [
     "READ_ACTIONS",
     "RPC_BACKFILL",
     "RPC_READ_MESSAGES",
+    "RPC_LIST_DIALOGS",
     "RPC_CLEANUP_TURN",
     "RPC_EXECUTE",
     "RPC_HEALTH",

@@ -194,6 +194,17 @@ class TelegramFastPathConfig:
 
 
 @dataclass(frozen=True)
+class PhoneSessionConfig:
+    """Global phone-use coordination and bedtime reminder bounds."""
+
+    enabled: bool = False
+    duration_min_seconds: int = 120
+    duration_max_seconds: int = 480
+    sleep_reminder_min_seconds: int = 600
+    sleep_reminder_max_seconds: int = 1200
+
+
+@dataclass(frozen=True)
 class AIConfig:
     api_key: str
     model: str
@@ -208,6 +219,7 @@ class AIConfig:
     lm_studio_base_url: str = DEFAULT_LM_STUDIO_BASE_URL
     lm_studio_api_key: str = DEFAULT_LM_STUDIO_API_KEY
     agy_reasoning_effort: str = DEFAULT_AGY_REASONING_EFFORT
+    phone_session: PhoneSessionConfig = PhoneSessionConfig()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -469,6 +481,54 @@ def load_message_flow_config(settings: Mapping[str, Any]) -> MessageFlowConfig:
     )
 
 
+def load_phone_session_config(settings: Mapping[str, Any]) -> PhoneSessionConfig:
+    raw = settings.get("phone_session", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"phone_session в {AI_CONFIG_PATH.name} должен быть JSON-объектом")
+    allowed = {
+        "enabled",
+        "duration_min_seconds",
+        "duration_max_seconds",
+        "sleep_reminder_min_seconds",
+        "sleep_reminder_max_seconds",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Неизвестные параметры phone_session в {AI_CONFIG_PATH.name}: "
+            + ", ".join(unknown)
+        )
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled в phone_session должен быть boolean")
+
+    def bounded(name: str, default: int, minimum: int, maximum: int) -> int:
+        value = raw.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(
+                f"{name} в phone_session должен быть целым числом от {minimum} до {maximum}"
+            )
+        return value
+
+    duration_min = bounded("duration_min_seconds", 120, 120, 480)
+    duration_max = bounded("duration_max_seconds", 480, 120, 480)
+    reminder_min = bounded("sleep_reminder_min_seconds", 600, 60, 3600)
+    reminder_max = bounded("sleep_reminder_max_seconds", 1200, 60, 3600)
+    if duration_min > duration_max:
+        raise ValueError("duration_min_seconds не может быть больше duration_max_seconds")
+    if reminder_min > reminder_max:
+        raise ValueError(
+            "sleep_reminder_min_seconds не может быть больше sleep_reminder_max_seconds"
+        )
+    return PhoneSessionConfig(
+        enabled=enabled,
+        duration_min_seconds=duration_min,
+        duration_max_seconds=duration_max,
+        sleep_reminder_min_seconds=reminder_min,
+        sleep_reminder_max_seconds=reminder_max,
+    )
+
+
 def load_telegram_fast_path_config(
     settings: Mapping[str, Any],
 ) -> TelegramFastPathConfig:
@@ -606,6 +666,7 @@ def load_ai_config() -> AIConfig:
     )
     message_flow = load_message_flow_config(settings)
     telegram_fast_path = load_telegram_fast_path_config(settings)
+    phone_session = load_phone_session_config(settings)
 
     if provider == OPENAI_LLM_CHOICE and not api_key:
         raise ValueError("Добавьте OPENAI_API_KEY в переменные среды или файл .env")
@@ -624,6 +685,7 @@ def load_ai_config() -> AIConfig:
         lm_studio_base_url=lm_studio_base_url,
         lm_studio_api_key=lm_studio_api_key,
         agy_reasoning_effort=agy_reasoning_effort,
+        phone_session=phone_session,
     )
 
 

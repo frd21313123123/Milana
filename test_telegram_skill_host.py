@@ -30,6 +30,7 @@ class _Adapter:
         self.backfill_notices = ()
         self.materialize_calls = []
         self.terminal_acknowledged = []
+        self.dialogs = []
 
     async def start(self, callback):
         self.callback = callback
@@ -86,6 +87,9 @@ class _Adapter:
 
     async def set_presence(self, online):
         self.online = online
+
+    async def list_dialogs(self, offset, limit):
+        return self.dialogs[offset : offset + limit]
 
 
 def _request(method, *, key=None):
@@ -748,6 +752,57 @@ class TelegramSkillHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result, {"online": True, "applied": False, "timed_out": True}
         )
+
+
+    async def test_dialog_catalog_is_paginated_and_sanitized(self):
+        self.adapter.dialogs = [
+            {
+                "target_ref": index,
+                "title": f"dialog {index}",
+                "kind": "group" if index % 2 else "private",
+                "unread_count": index,
+                "last_activity_at": "2026-09-21T20:00:00+00:00",
+                "actions": ["read", "reply", "react", "unsafe"],
+            }
+            for index in range(55)
+        ]
+        page = await self.host._handle_list_dialogs(
+            {"offset": 0, "limit": 50}, _request("telegram.list_dialogs")
+        )
+        self.assertEqual(len(page["dialogs"]), 50)
+        self.assertTrue(page["has_more"])
+        self.assertEqual(page["next_offset"], 50)
+        self.assertEqual(page["dialogs"][3]["actions"], ["read", "reply", "react"])
+
+    async def test_history_message_is_authorized_for_selected_reaction(self):
+        self.adapter.materialized = {
+            "_target": 10,
+            "_message_ids": [],
+            "_sender_ids": [],
+            "messages": [],
+            "history": [
+                {
+                    "message_id": 41,
+                    "sender": {"id": 22, "display_name": "Лера"},
+                    "outgoing": False,
+                    "text": "старое сообщение",
+                }
+            ],
+        }
+        opened = await self.host._handle_open(
+            {"turn_id": "history-reaction", "notice_ids": [], "target_ref": 10},
+            _request("telegram.open"),
+        )
+        await self.host._handle_execute(
+            {
+                "turn_id": "history-reaction",
+                "target_token": opened["target_token"],
+                "action": "reaction",
+                "arguments": {"message_id": 41, "reaction": "❤"},
+            },
+            _request("telegram.execute", key="history-reaction:41"),
+        )
+        self.assertEqual(self.adapter.executed[-1][1]["message_id"], 41)
 
 
 class TelethonBackfillTests(unittest.IsolatedAsyncioTestCase):
