@@ -348,7 +348,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["tools"], [])
         self.assertEqual(
             set(request["text"]["format"]["schema"]["properties"]),
-            {"telegram"},
+            {"telegram", "future_actions"},
         )
         self.assertNotIn("Доступные корневые навыки", request["instructions"])
         self.assertNotIn("requires_tools", result.trigger.metadata)

@@ -1303,8 +1303,8 @@ class MilanaHandler(BaseHTTPRequestHandler):
             self.send_json(data)
             return
 
-        if path == "/api/scene":
-            callback = self.panel_context.callback("scene")
+        if path in {"/api/scene", "/api/future-actions"}:
+            callback = self.panel_context.callback("future_actions" if path == "/api/future-actions" else "scene")
             if callback is None:
                 self.send_json({"ok": False, "message": "Scene State доступен во встроенной панели"}, 409)
             else:
@@ -1360,6 +1360,9 @@ class MilanaHandler(BaseHTTPRequestHandler):
             return
 
         callback_routes = {
+            "/api/future-actions/cancel": ("cancel_future_action", True),
+            "/api/future-actions/execute": ("execute_future_action", True),
+            "/api/future-actions/reschedule": ("reschedule_future_action", True),
             "/api/scene/refresh": ("refresh_scene", False),
             "/api/scene/end": ("end_scene", False),
             "/api/scene/next": ("next_scene", False),

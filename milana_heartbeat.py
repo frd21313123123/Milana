@@ -35,6 +35,7 @@ class HeartbeatReason(StrEnum):
     RECOVERY = "recovery"
     MANUAL_WAKE = "manual_wake"
     DELAYED_RESULT = "delayed_result"
+    FUTURE_ACTION = "future_action"
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,8 @@ class MilanaHeartbeat:
         max_attempts: int = 5,
         dev_mode: bool = False,
         on_tick: Callable[[datetime], Any] | None = None,
+        future_actions: Any = None,
+        is_busy: SleepCheck | None = None,
     ) -> None:
         if not isinstance(state, MilanaStateStore):
             raise TypeError("state должен быть MilanaStateStore")
@@ -121,6 +124,8 @@ class MilanaHeartbeat:
         self._on_recovery = on_recovery
         self._recovery_context = recovery_context
         self._on_tick = on_tick
+        self.future_actions = future_actions
+        self._is_busy = is_busy or (lambda _: False)
         self.recovery_threshold = recovery_threshold
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.max_attempts = max_attempts
@@ -417,21 +422,51 @@ class MilanaHeartbeat:
         now = _aware(self._now())
         if self._on_tick is not None:
             await _await_if_needed(self._on_tick(now))
+        future_processed = await self._run_future_action(now)
         processed = await self._run_recovery_once(now)
         if processed:
             # Recovery already contains the missed schedule summary and sets a
             # fresh random heartbeat.  Do not replay stale internal wakes in
             # the same scheduler cycle.
-            return processed
+            return processed + future_processed
         self._ensure_transition_job(now)
         jobs = self.state.claim_due_heartbeat_jobs(now, limit=20)
         for job in jobs:
             processed += int(await self._execute_job(job, now))
         processed += await self._run_random_heartbeat(now)
-        return processed
+        return processed + future_processed
+
+    async def _run_future_action(self, now: datetime) -> int:
+        if self.future_actions is None:
+            return 0
+        action = self.future_actions.claim_due(now, sleeping=self._is_sleeping(now), busy=self._is_busy(now))
+        if action is None:
+            return 0
+        trigger = HeartbeatTrigger(
+            reason=HeartbeatReason.FUTURE_ACTION,
+            scheduled_at=datetime.fromisoformat(action["due_at"]), fired_at=now,
+            payload={"future_action": action},
+            logical_id=f"future_action:{action['id']}:execute:{action['version']}",
+        )
+        try:
+            await _await_if_needed(self.execute(trigger))
+        except asyncio.CancelledError:
+            self.future_actions.retry(action["id"], now, "cancelled turn")
+            raise
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self.future_actions.retry(action["id"], now, self._last_error)
+            return 0
+        # A model may deliberately do nothing. It is never an implicit success.
+        self.future_actions.retry(action["id"], now, postpone=True)
+        return 1
 
     def _next_timeout(self, now: datetime) -> float:
         candidates: list[datetime] = []
+        if self.future_actions is not None:
+            future_due = self.future_actions.next_due_at()
+            if future_due is not None:
+                candidates.append(future_due)
         state = self.state.get_agent_state()
         if not state.heartbeat_paused and state.next_heartbeat_at is not None:
             candidates.append(_aware(state.next_heartbeat_at))

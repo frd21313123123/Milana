@@ -24,6 +24,7 @@ TURN_KINDS = frozenset(
         "schedule_transition",
         "recovery",
         "manual_wake",
+        "future_action",
     }
 )
 MAX_TOOL_ROUNDS = 16
@@ -152,6 +153,7 @@ class MilanaAgent:
         tool_result_content: ToolResultContentProvider | None = None,
         model_generation_observer: ModelGenerationObserver | None = None,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
+        future_actions_enabled: bool = False,
     ) -> None:
         if not isinstance(persona, str) or not persona.strip():
             raise ValueError("Персона Миланы не может быть пустой")
@@ -189,6 +191,7 @@ class MilanaAgent:
         self.tool_result_content = tool_result_content
         self.model_generation_observer = model_generation_observer
         self.max_tool_rounds = max_tool_rounds
+        self.future_actions_enabled = future_actions_enabled
         self._supports_temperature: bool | None = None
         self._supports_structured_output: bool | None = None
 
@@ -729,6 +732,9 @@ class MilanaAgent:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        if self.future_actions_enabled:
+            from milana_future_actions import RULES
+            compact_context += "\n" + RULES
         if direct_application:
             direct = (
                 f"{self.persona}\n\n"
@@ -815,6 +821,9 @@ class MilanaAgent:
             # world/memory patches belong to autonomous background turns.
             properties = {}
         required = list(properties)
+        if self.future_actions_enabled:
+            properties["future_actions"] = self._bounded_object_array(8)
+            required.append("future_actions")
         if "telegram" in active_skills:
             properties["telegram"] = {
                 "anyOf": [
@@ -1011,6 +1020,12 @@ class MilanaAgent:
             "relationship_updates",
         }
         expected_keys = set() if fast_telegram else set(base_keys)
+        if self.future_actions_enabled:
+            from milana_future_actions import validate_operations
+            payload = dict(payload)
+            payload.setdefault("future_actions", [])
+            validate_operations(payload["future_actions"])
+            expected_keys.add("future_actions")
         telegram_active = "telegram" in active_skills
         if telegram_active:
             expected_keys.add("telegram")
@@ -1041,6 +1056,8 @@ class MilanaAgent:
             )
             for key in contribution_keys:
                 normalized[key] = payload[key]
+            if self.future_actions_enabled:
+                normalized["future_actions"] = payload["future_actions"]
             return normalized
 
         state_update = payload.get("state_update")
@@ -1113,6 +1130,8 @@ class MilanaAgent:
                     else self.max_reply_messages
                 ),
             )
+        if self.future_actions_enabled:
+            normalized["future_actions"] = payload["future_actions"]
         return normalized
 
     @staticmethod

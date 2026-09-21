@@ -64,6 +64,7 @@ from milana_memory import MilanaMemoryStore, PulseTask
 from milana_pulse import DelayedActionDispatcher
 from milana_schedule import WeeklyRoutine, load_routine
 from milana_scene import SceneEngine
+from milana_future_actions import FutureActionStore
 from milana_state import (
     FactSeed,
     GoalChange,
@@ -437,6 +438,8 @@ class MilanaService:
         self._now = now
         self.scene = SceneEngine(state, routine, now=now)
         self.scene.tick()
+        self.future_actions = FutureActionStore(state)
+        self.future_actions.recover()
         fast_config = config.telegram_fast_path
         self.telegram_fast_path_enabled = bool(
             fast_config.enabled
@@ -482,6 +485,7 @@ class MilanaService:
             state_context=self._state_context,
             tool_result_content=self._tool_result_media,
             model_generation_observer=self._set_telegram_model_typing,
+            future_actions_enabled=True,
         )
         self.heartbeat = MilanaHeartbeat(
             state,
@@ -491,8 +495,10 @@ class MilanaService:
             next_awake_at=self._next_awake_at,
             next_transition_at=self._next_transition_at,
             recovery_context=self._recovery_context,
-            on_tick=self.scene.tick,
+            on_tick=self._life_tick,
             dev_mode=dev_mode,
+            future_actions=self.future_actions,
+            is_busy=lambda at: (not self.scene.tick(at).phone_available or self.scene.current().attention >= .75),
         )
         self.delayed_dispatcher = DelayedActionDispatcher(
             memory,
@@ -1375,7 +1381,9 @@ class MilanaService:
         active_skills: tuple[str, ...] = ()
         try:
             agent_started = loop.time()
-            result = await self._resume_telegram_outbox(trigger, stage)
+            result = await self._resume_future_plan(trigger, stage)
+            if result is None:
+                result = await self._resume_telegram_outbox(trigger, stage)
             if result is None:
                 result = await self.agent.run_turn(trigger)
             timing = self._turn_timings.get(trigger.id)
@@ -1561,6 +1569,44 @@ class MilanaService:
             model_elapsed_ms=0.0,
             provider_queue_ms=0.0,
         )
+
+    async def _resume_future_plan(self, trigger: TurnTrigger, stage: StagedTurn) -> TurnResult | None:
+        plan = self.future_actions.plan(stage.action_key("final:messages"))
+        if plan is None:
+            # A merged notice retry must use the original delivery owner's plan.
+            notices = self._trigger_notice_ids(trigger)
+            owner = self.state.find_telegram_outbox_for_notice_ids(notices) if notices else None
+            if owner is not None:
+                plan = self.future_actions.plan(owner.action_key)
+        if plan is None:
+            return None
+        payload = dict(plan["payload"])
+        if plan["target_id"] is not None:
+            notices = (payload.get("telegram") or {}).get("_notice_ids", list(self._trigger_notice_ids(trigger)))
+            params = {
+                "turn_id": stage.turn_id, "trigger": trigger.model_payload(),
+                "notice_ids": notices, "include_history": False,
+            }
+            if not notices:
+                params["target_ref"] = plan["target_id"]
+            context = await self.supervisor.request("telegram.open", params, timeout=20.0)
+            TelegramSkillExecutor._register_targets(stage, context)
+            token, target = stage.require_target()
+            if str(target["target_ref"]) != plan["target_id"]:
+                raise PermissionError("Future plan target changed during recovery")
+            if payload.get("telegram") is not None:
+                payload["telegram"] = {**payload["telegram"], "target_token": token}
+            for action in payload.get("_future_staged_actions", []):
+                arguments = dict(action["payload"])
+                if "target_token" in arguments:
+                    arguments.update(target_token=token, target=dict(target))
+                stage.actions.append(StagedAction(action["kind"], arguments, action["idempotency_key"]))
+        # The journal owns validated operations; old capability tokens are never
+        # interpreted again. The delivery callback uses the original journal key.
+        payload["future_actions"] = []
+        payload["_future_plan_key"] = plan["action_key"]
+        return TurnResult(turn_id=trigger.id, trigger=trigger, payload=payload,
+                          active_skills=("telegram",) if stage.default_target_token else ())
 
     def _record_telegram_turn_metric(
         self, trigger: TurnTrigger, *, outcome: str
@@ -1748,12 +1794,31 @@ class MilanaService:
         current = self.state.get_agent_state()
         changes = build_heartbeat_changes(result.payload, current)
         telegram_turn = result.trigger.kind == "telegram_notice"
-        if not telegram_turn:
+        if result.payload.get("future_actions") or result.trigger.kind == "future_action":
+            # Resolve a staged sticker into the host's existing durable reference
+            # before journaling; per-turn picker IDs cannot survive a restart.
+            for action in stage.actions:
+                if action.kind == "send_sticker" and not action.payload.get("_durable_reference"):
+                    resolved = await self._host_action(stage, action.payload["target_token"],
+                        "schedule_sticker", {"sticker_id": action.payload["sticker_id"], "delay_seconds": 1},
+                        action.idempotency_key + ":resolve")
+                    if not isinstance(resolved.get("sticker"), Mapping):
+                        raise ValueError("Host did not resolve a durable sticker reference")
+                    action.payload["sticker"] = dict(resolved["sticker"])
+                    action.payload["_durable_reference"] = True
+        future_plan = self.future_actions.stage_turn(
+            stage, result.payload, now=self._now(), scene=self.scene.tick(),
+            schedule_end=self._next_transition_at(self._now()),
+        )
+        if telegram_turn and future_plan is not None:
+            self.future_actions.prepare_plan(*future_plan)
+        if not telegram_turn and "_future_plan_key" not in result.payload:
             self.state.apply_heartbeat_changes(
                 changes,
                 expected_revision=stage.expected_revision,
                 at=self._now(),
                 record_heartbeat=True,
+                on_commit=(lambda db: self.future_actions.prepare_plan(*future_plan, db=db)) if future_plan else None,
             )
             self._maybe_create_weekly_summary(self._now())
         if telegram_turn and any(
@@ -1794,6 +1859,9 @@ class MilanaService:
                 )
                 or outbound_sent
             )
+        self.future_actions.finish_plan(
+            result.payload.get("_future_plan_key", stage.action_key("final:messages")), self._now()
+        )
         if telegram_turn:
             # The user-visible reply is independent from the shared world-state
             # revision.  Rebase its optional compact patch after delivery and
@@ -1906,8 +1974,8 @@ class MilanaService:
             outcome = await self._host_action(
                 stage,
                 payload["target_token"],
-                "send_sticker",
-                {"sticker_id": payload["sticker_id"]},
+                "send_sticker_reference" if payload.get("_durable_reference") else "send_sticker",
+                {"sticker": payload["sticker"]} if payload.get("_durable_reference") else {"sticker_id": payload["sticker_id"]},
                 action.idempotency_key,
             )
             if outcome.get("status") != "sent":
@@ -1946,11 +2014,17 @@ class MilanaService:
             else ()
         )
         sent_count = 0
+        if not messages:
+            # A read acknowledgement can make the notice terminal. Commit a
+            # silent cancellation/reschedule before that boundary as well.
+            self.future_actions.finish_plan(stage.action_key("final:messages"), self._now())
         if messages:
             action_key = stage.action_key("final:messages")
             owner = self.state.find_telegram_outbox_for_notice_ids(notice_ids)
-            if owner is None and not notice_ids:
-                owner = self.state.find_pending_telegram_outbox_for_target(target_ref)
+            if (owner is None and not notice_ids and stage.trigger.kind != "future_action"
+                    and self.future_actions.plan(action_key) is None):
+                owner = self.state.find_pending_telegram_outbox_for_target(
+                    target_ref, include=lambda entry: self.future_actions.plan(entry.action_key) is None)
             if owner is not None:
                 if owner.target_ref != str(target_ref):
                     raise StateConflictError(
@@ -2055,6 +2129,10 @@ class MilanaService:
                     complete=complete,
                     first_sent_at=first_sent_at,
                     deduplicated_part_indexes=deduplicated_indexes,
+                    on_complete=lambda db, entry: self.future_actions.finish_plan(
+                        action_key, self._now(), db=db,
+                        result={"telegram_message_ids": list(entry.sent_message_ids)},
+                    ),
                 )
                 timing = self._turn_timings.get(stage.turn_id)
                 send_finished = asyncio.get_running_loop().time()
@@ -2078,6 +2156,9 @@ class MilanaService:
                         str(outcome.get("error") or "Telegram reply is incomplete")
                     )
             sent_count = len(messages) if outbox.status == "sent" else 0
+            if outbox.status == "sent":
+                self.future_actions.finish_plan(action_key, self._now(),
+                    result={"telegram_message_ids": list(outbox.sent_message_ids)})
             for index, message in enumerate(messages[:sent_count]):
                 message_id = outbox.message_id_for_part(index)
                 if not isinstance(message_id, int):
@@ -2369,15 +2450,20 @@ class MilanaService:
             HeartbeatReason.SCHEDULE_TRANSITION: "schedule_transition",
             HeartbeatReason.RECOVERY: "recovery",
             HeartbeatReason.MANUAL_WAKE: "manual_wake",
+            HeartbeatReason.FUTURE_ACTION: "future_action",
         }.get(trigger.reason, "heartbeat")
         metadata = dict(trigger.payload)
         if trigger.logical_id is not None:
             metadata["_logical_action_scope"] = trigger.logical_id
         initiative = (
             None
-            if trigger.reason == HeartbeatReason.RECOVERY
+            if trigger.reason in {HeartbeatReason.RECOVERY, HeartbeatReason.FUTURE_ACTION}
             else self._initiative_target()
         )
+        if trigger.reason == HeartbeatReason.FUTURE_ACTION:
+            action = trigger.payload["future_action"]
+            initiative = action["target_id"]
+            metadata["chat_id"] = action["target_id"]
         if initiative is not None:
             metadata["_telegram_target_ref"] = initiative
         completion = asyncio.get_running_loop().create_future()
@@ -2391,6 +2477,10 @@ class MilanaService:
             )
         )
         await completion
+
+    def _life_tick(self, at: datetime) -> None:
+        self.scene.tick(at)
+        self.future_actions.refresh_activity_ends()
 
     def _initiative_target(self) -> str | int | None:
         now = self._now()
@@ -2574,9 +2664,13 @@ class MilanaService:
                 for item in history
                 if isinstance(item, Mapping)
             )
-        if not history:
-            return {}
-        return {"durable_memory": history}
+        pending = [
+            {"id": action["id"], "intent": action["intent"][:300],
+             "context": action["context"][:200], "due_at": action["due_at"],
+             "trigger_type": action["trigger_type"], "is_promise": action["is_promise"]}
+            for action in self.future_actions.list(status="pending", target_id=target, limit=10)
+        ]
+        return {"durable_memory": history, "pending_future_actions": pending}
 
     def _tool_result_media(self, result: Any) -> Sequence[Mapping[str, Any]]:
         found: list[tuple[str, str | None]] = []
@@ -2934,6 +3028,12 @@ class MilanaService:
             port=port,
             state_store=self.state,
             callbacks={
+                "future_actions": lambda: self.future_actions.snapshot(self._now()),
+                "cancel_future_action": lambda body: self.future_actions.cancel(require_id(body, "намерения"), now=self._now()),
+                "reschedule_future_action": lambda body: self.future_actions.reschedule_future_action(
+                    require_id(body, "намерения"), body.get("due_at"), now=self._now()),
+                "execute_future_action": lambda body: self.future_actions.reschedule_future_action(
+                    require_id(body, "намерения"), self._now(), now=self._now()),
                 "scene": self.scene.snapshot,
                 "refresh_scene": self.scene.tick,
                 "end_scene": self.scene.end,
@@ -3054,6 +3154,7 @@ class MilanaService:
         return {
             "service": "running",
             "scene": self.scene.snapshot(),
+            "future_actions": self.future_actions.snapshot(self._now()),
             "dev_mode": self.dev_mode,
             "telegram_host": self.supervisor.status(),
             "skills": [item["id"] for item in self.registry.root_catalog()],

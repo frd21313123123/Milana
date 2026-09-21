@@ -1374,7 +1374,7 @@ class MilanaStateStore:
                 raise
 
     def find_pending_telegram_outbox_for_target(
-        self, target_ref: int | str
+        self, target_ref: int | str, *, include: Any = None
     ) -> TelegramOutboxEntry | None:
         """Return the sole unfinished initiative send for a target.
 
@@ -1396,6 +1396,8 @@ class MilanaStateStore:
                 (target,),
             ).fetchall()
         owners = [self._telegram_outbox_from_row(row) for row in rows]
+        if include is not None:
+            owners = [owner for owner in owners if include(owner)]
         if len(owners) > 1:
             action_keys = ", ".join(entry.action_key for entry in owners)
             raise StateConflictError(
@@ -1503,6 +1505,7 @@ class MilanaStateStore:
         complete: bool,
         first_sent_at: datetime | None = None,
         deduplicated_part_indexes: Sequence[int] = (),
+        on_complete: Any = None,
     ) -> TelegramOutboxEntry:
         """Persist one contiguous host result starting at the durable cursor.
 
@@ -1626,6 +1629,8 @@ class MilanaStateStore:
                 ).fetchone()
                 assert updated is not None
                 result = self._telegram_outbox_from_row(updated)
+                if complete and on_complete is not None:
+                    on_complete(self._connection, result)
                 self._connection.commit()
                 return result
             except Exception:
@@ -3602,6 +3607,7 @@ class MilanaStateStore:
         at: datetime | None = None,
         record_heartbeat: bool = True,
         idempotency_key: str | None = None,
+        on_commit: Any = None,
     ) -> AgentState:
         """Atomically apply one bounded heartbeat result.
 
@@ -3731,6 +3737,8 @@ class MilanaStateStore:
                         "INSERT INTO state_change_ledger (action_key, applied_at) VALUES (?, ?)",
                         (clean_idempotency_key, _timestamp(changed_at)),
                     )
+                if on_commit is not None:
+                    on_commit(self._connection)
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
