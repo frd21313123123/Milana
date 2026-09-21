@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field, replace
@@ -127,6 +128,9 @@ ToolResultContentProvider = Callable[
     [ToolResult], Sequence[Mapping[str, Any]] | Awaitable[Sequence[Mapping[str, Any]]]
 ]
 ModelGenerationObserver = Callable[[TurnTrigger, bool], None | Awaitable[None]]
+StickerIntentClassifier = Callable[
+    [Any], bool | None | Awaitable[bool | None]
+]
 
 
 class SkillActivationRequired(RuntimeError):
@@ -154,6 +158,7 @@ class MilanaAgent:
         schema_contributor: SchemaContributor | None = None,
         tool_result_content: ToolResultContentProvider | None = None,
         model_generation_observer: ModelGenerationObserver | None = None,
+        sticker_intent_classifier: StickerIntentClassifier | None = None,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
         future_actions_enabled: bool = False,
     ) -> None:
@@ -192,6 +197,7 @@ class MilanaAgent:
         self.schema_contributor = schema_contributor
         self.tool_result_content = tool_result_content
         self.model_generation_observer = model_generation_observer
+        self.sticker_intent_classifier = sticker_intent_classifier
         self.max_tool_rounds = max_tool_rounds
         self.future_actions_enabled = future_actions_enabled
         self._supports_temperature: bool | None = None
@@ -221,9 +227,34 @@ class MilanaAgent:
             preactivated_telegram = await session.execute_tool(
                 ToolCall.from_arguments("open_skill", {"skill_id": "telegram"})
             )
-            if self._materialized_telegram_requests_sticker(
+            requests_sticker = self._materialized_telegram_requests_sticker(
                 preactivated_telegram.output
+            )
+            if (
+                self.sticker_intent_classifier is not None
+                and not self._materialized_telegram_has_sticker_command(
+                    preactivated_telegram.output
+                )
             ):
+                try:
+                    classified = self.sticker_intent_classifier(
+                        preactivated_telegram.output
+                    )
+                    if hasattr(classified, "__await__"):
+                        classified = await classified  # type: ignore[misc]
+                    if classified is not None:
+                        if not isinstance(classified, bool):
+                            raise TypeError(
+                                "sticker_intent_classifier must return bool or None"
+                            )
+                        requests_sticker = classified
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Classification is advisory. The conservative local matcher
+                    # remains the exact pre-Jev behavior.
+                    pass
+            if requests_sticker:
                 # Sticker access is the sole exception on an inbound route.  Its
                 # child is activated programmatically so open_skill is never a
                 # model round and never appears in the model's tool catalog.
@@ -327,17 +358,28 @@ class MilanaAgent:
             if showing_typing:
                 await self._notify_model_generation(trigger, True)
             try:
+                route = trigger.metadata.get("_jev_route")
+                available_tools = (
+                    self._sticker_tools(session.tools)
+                    if sticker_telegram
+                    else list(session.tools)
+                )
+                if route == "reflect":
+                    available_tools = []
+                elif route in {"initiative", "open_loop"}:
+                    available_tools = [
+                        tool
+                        for tool in available_tools
+                        if tool.get("name")
+                        not in {"write_diary", "inspect_schedule", "schedule_wakeup"}
+                    ]
                 response = await self._create_response(
                     instructions=instructions,
                     input_items=input_items,
                     tools=(
                         []
                         if direct_telegram or direct_phone_plan or force_final_payload
-                        else (
-                            self._sticker_tools(session.tools)
-                            if sticker_telegram
-                            else list(session.tools)
-                        )
+                        else available_tools
                     ),
                     schema=self._response_schema(session.active_skill_ids, trigger),
                     max_output_tokens=self._max_output_tokens_for(
@@ -621,6 +663,21 @@ class MilanaAgent:
             ):
                 return True
         return False
+
+    @staticmethod
+    def _materialized_telegram_has_sticker_command(output: Any) -> bool:
+        if not isinstance(output, Mapping):
+            return False
+        context = output.get("context")
+        messages = context.get("messages") if isinstance(context, Mapping) else None
+        if not isinstance(messages, (list, tuple)):
+            return False
+        return any(
+            isinstance(message, Mapping)
+            and isinstance(message.get("text"), str)
+            and bool(re.match(r"^\s*/sticker\b", message["text"], re.IGNORECASE))
+            for message in messages
+        )
 
     # Compatibility for callers from the initial fast-path rollout.  The
     # method now means exactly "needs the sticker-only exception".

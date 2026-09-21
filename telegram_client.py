@@ -8,6 +8,7 @@ import base64
 import gzip
 import io
 import json
+import logging
 import math
 import os
 import random
@@ -34,6 +35,11 @@ from agy_provider import (
     AgyQuotaError,
 )
 from lm_studio_provider import LMStudioModelClient
+from jev_provider import (
+    DEFAULT_JEV_BASE_URL,
+    DEFAULT_JEV_MODEL,
+    JevConfig,
+)
 from milana.subprocesses import hidden_subprocess_kwargs
 from milana_memory import (
     MAX_DIARY_ENTRY_LENGTH,
@@ -100,6 +106,8 @@ DEFAULT_AI_SYSTEM_PROMPT = (
 )
 DEFAULT_MAX_OUTPUT_TOKENS = 1200
 SYSTEM_RANDOM = random.SystemRandom()
+LOGGER = logging.getLogger(__name__)
+_JEV_MISSING_KEY_WARNED = False
 SUPPORTED_IMAGE_MIME_TYPES = {
     "image/gif",
     "image/jpeg",
@@ -220,6 +228,7 @@ class AIConfig:
     lm_studio_api_key: str = DEFAULT_LM_STUDIO_API_KEY
     agy_reasoning_effort: str = DEFAULT_AGY_REASONING_EFFORT
     phone_session: PhoneSessionConfig = PhoneSessionConfig()
+    jev: JevConfig = JevConfig()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -529,6 +538,83 @@ def load_phone_session_config(settings: Mapping[str, Any]) -> PhoneSessionConfig
     )
 
 
+def load_jev_config(
+    settings: Mapping[str, Any], env_values: Mapping[str, str]
+) -> JevConfig:
+    raw = settings.get("jev", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"jev в {AI_CONFIG_PATH.name} должен быть JSON-объектом")
+    allowed = {
+        "enabled",
+        "model",
+        "base_url",
+        "confidence_threshold",
+        "timeout_seconds",
+        "sticker_timeout_seconds",
+        "failure_threshold",
+        "cooldown_seconds",
+        "phone_planner",
+        "sticker_intent",
+        "heartbeat_router",
+        "initiative",
+        "open_loops",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Неизвестные параметры jev в {AI_CONFIG_PATH.name}: "
+            + ", ".join(unknown)
+        )
+
+    def flag(name: str, default: bool) -> bool:
+        value = raw.get(name, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} в jev должен быть boolean")
+        return value
+
+    failure_threshold = raw.get("failure_threshold", 3)
+    if (
+        isinstance(failure_threshold, bool)
+        or not isinstance(failure_threshold, int)
+        or not 1 <= failure_threshold <= 20
+    ):
+        raise ValueError("failure_threshold в jev должен быть целым числом от 1 до 20")
+    threshold = ai_number(raw, "confidence_threshold", 0.80, 0, 1)
+    timeout_seconds = ai_number(raw, "timeout_seconds", 3.0, 0.1, 30)
+    sticker_timeout = ai_number(raw, "sticker_timeout_seconds", 1.5, 0.1, 30)
+    cooldown = ai_number(raw, "cooldown_seconds", 300.0, 1, 86_400)
+    api_key = (
+        env_values.get("TYPESAFE_API_KEY")
+        or os.getenv("TYPESAFE_API_KEY", "")
+    ).strip()
+    requested = flag("enabled", True)
+    effective = requested and bool(api_key)
+    global _JEV_MISSING_KEY_WARNED
+    if requested and not api_key and not _JEV_MISSING_KEY_WARNED:
+        LOGGER.warning(
+            "Jev включён, но TYPESAFE_API_KEY отсутствует; используется прежняя модель"
+        )
+        _JEV_MISSING_KEY_WARNED = True
+    return JevConfig(
+        enabled=effective,
+        api_key=api_key,
+        model=ai_string(raw, "model", DEFAULT_JEV_MODEL, "jev.model"),
+        base_url=ai_string(
+            raw, "base_url", DEFAULT_JEV_BASE_URL, "jev.base_url"
+        ).rstrip("/"),
+        confidence_threshold=threshold,
+        timeout_seconds=timeout_seconds,
+        sticker_timeout_seconds=sticker_timeout,
+        failure_threshold=failure_threshold,
+        cooldown_seconds=cooldown,
+        phone_planner=flag("phone_planner", True),
+        sticker_intent=flag("sticker_intent", True),
+        heartbeat_router=flag("heartbeat_router", True),
+        initiative=flag("initiative", True),
+        open_loops=flag("open_loops", True),
+    )
+
+
 def load_telegram_fast_path_config(
     settings: Mapping[str, Any],
 ) -> TelegramFastPathConfig:
@@ -667,6 +753,7 @@ def load_ai_config() -> AIConfig:
     message_flow = load_message_flow_config(settings)
     telegram_fast_path = load_telegram_fast_path_config(settings)
     phone_session = load_phone_session_config(settings)
+    jev = load_jev_config(settings, env_values)
 
     if provider == OPENAI_LLM_CHOICE and not api_key:
         raise ValueError("Добавьте OPENAI_API_KEY в переменные среды или файл .env")
@@ -686,6 +773,7 @@ def load_ai_config() -> AIConfig:
         lm_studio_api_key=lm_studio_api_key,
         agy_reasoning_effort=agy_reasoning_effort,
         phone_session=phone_session,
+        jev=jev,
     )
 
 

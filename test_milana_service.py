@@ -15,6 +15,7 @@ from milana_memory import MilanaMemoryStore
 from milana_schedule import ResponsePlan, ResponsePolicy, load_routine
 from milana_service import MilanaService, TurnPreemptedError, build_heartbeat_changes
 from milana_state import MilanaStateStore, StateConflictError, TelegramTurnMetric
+from jev_provider import JevConfig, JevResult, JevUnavailableError
 from telegram_client import AIConfig, MessageFlowConfig, TelegramFastPathConfig
 
 
@@ -59,6 +60,28 @@ class _Responses:
 class _Model:
     def __init__(self, values=()):
         self.responses = _Responses(values)
+
+
+class _Jev:
+    def __init__(self, answers=None, error=None):
+        self.answers = answers or {}
+        self.error = error
+        self.requests = []
+
+    async def evaluate(self, **request):
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return JevResult(
+            model="jev-1.13.0",
+            answers=self.answers,
+            input_tokens=100,
+            output_tokens=20,
+            elapsed_ms=10,
+        )
+
+    async def record_rejection(self, _scenario, _exc):
+        return None
 
 
 class _Supervisor:
@@ -208,6 +231,8 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
         model=None,
         dev_mode=True,
         fast_max_reply_messages=1,
+        jev_client=None,
+        jev_config=None,
     ):
         config = AIConfig(
             api_key="test",
@@ -226,6 +251,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
                 dev_chat_only=False,
                 max_reply_messages=fast_max_reply_messages,
             ),
+            jev=jev_config or JevConfig(),
         )
         return MilanaService(
             config=config,
@@ -235,8 +261,146 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             routine=load_routine(),
             rpc_server=SimpleNamespace(),
             supervisor=self.supervisor,
+            jev_client=jev_client,
             dev_mode=dev_mode,
             now=lambda: NOW,
+        )
+
+    async def test_jev_skip_finishes_heartbeat_without_main_model(self):
+        jev = _Jev(
+            {
+                "route": {
+                    "type": "choice",
+                    "choice": "skip",
+                    "confidence": 0.95,
+                    "probabilities": {"skip": 0.95, "reflect": 0.05},
+                }
+            }
+        )
+        service = self.service(
+            jev_client=jev,
+            jev_config=JevConfig(enabled=True, api_key="test"),
+        )
+        await service._on_heartbeat(
+            HeartbeatTrigger(
+                HeartbeatReason.HEARTBEAT,
+                scheduled_at=NOW,
+                fired_at=NOW,
+            )
+        )
+        self.assertEqual(len(jev.requests), 1)
+        self.assertEqual(service.model_client.responses.requests, [])
+        self.assertTrue(service._turn_queue.empty())
+
+    async def test_jev_unavailable_queues_legacy_heartbeat(self):
+        jev = _Jev(error=JevUnavailableError("offline"))
+        service = self.service(
+            jev_client=jev,
+            jev_config=JevConfig(enabled=True, api_key="test"),
+        )
+        task = asyncio.create_task(
+            service._on_heartbeat(
+                HeartbeatTrigger(
+                    HeartbeatReason.HEARTBEAT,
+                    scheduled_at=NOW,
+                    fired_at=NOW,
+                )
+            )
+        )
+        turn = await asyncio.wait_for(service._turn_queue.get(), 1)
+        self.assertNotIn("_jev_route", turn.metadata)
+        turn.metadata["_completion_future"].set_result(None)
+        await task
+
+    async def test_low_confidence_jev_route_has_no_partial_metadata(self):
+        jev = _Jev(
+            {
+                "route": {
+                    "type": "choice",
+                    "choice": "reflect",
+                    "confidence": 0.55,
+                    "probabilities": {"skip": 0.45, "reflect": 0.55},
+                }
+            }
+        )
+        service = self.service(
+            jev_client=jev,
+            jev_config=JevConfig(enabled=True, api_key="test"),
+        )
+        task = asyncio.create_task(
+            service._on_heartbeat(
+                HeartbeatTrigger(
+                    HeartbeatReason.HEARTBEAT,
+                    scheduled_at=NOW,
+                    fired_at=NOW,
+                )
+            )
+        )
+        turn = await asyncio.wait_for(service._turn_queue.get(), 1)
+        self.assertNotIn("_jev_route", turn.metadata)
+        self.assertNotIn("_jev_context", turn.metadata)
+        turn.metadata["_completion_future"].set_result(None)
+        await task
+
+    async def test_explicit_heartbeat_reasons_bypass_jev(self):
+        jev = _Jev()
+        service = self.service(
+            jev_client=jev,
+            jev_config=JevConfig(enabled=True, api_key="test"),
+        )
+        for reason in (
+            HeartbeatReason.FUTURE_ACTION,
+            HeartbeatReason.RECOVERY,
+            HeartbeatReason.MANUAL_WAKE,
+            HeartbeatReason.SCHEDULE_WAKEUP,
+        ):
+            with self.subTest(reason=reason):
+                route = await service._jev_heartbeat_route(
+                    HeartbeatTrigger(reason, scheduled_at=NOW, fired_at=NOW)
+                )
+                self.assertIsNone(route)
+        self.assertEqual(jev.requests, [])
+
+    async def test_jev_sticker_choice_is_advisory(self):
+        jev = _Jev(
+            {
+                "intent": {
+                    "type": "choice",
+                    "choice": "request",
+                    "confidence": 0.9,
+                    "probabilities": {"request": 0.9, "none": 0.1},
+                }
+            }
+        )
+        service = self.service(
+            jev_client=jev,
+            jev_config=JevConfig(enabled=True, api_key="test"),
+        )
+        decision = await service._jev_sticker_intent(
+            {"context": {"messages": [{"text": "а можно котика стикером?"}]}}
+        )
+        self.assertTrue(decision)
+
+    def test_open_loop_snapshot_combines_actionable_and_waiting_items(self):
+        service = self.service()
+        self.state.create_goal(
+            "закончить проект",
+            description="дописать последнюю часть",
+            goal_id="project",
+            at=NOW,
+        )
+        self.state.create_entity(
+            "person", "Лера", entity_id="telegram:77", is_real=True, at=NOW
+        )
+        self.state.upsert_relationship(
+            "telegram:77", awaiting_reply=True, at=NOW
+        )
+        snapshot = service._open_loop_snapshot(NOW)
+        by_id = {item.id: item for item in snapshot.candidates}
+        self.assertTrue(by_id["goal:project"].actionable)
+        self.assertFalse(by_id["relationship:telegram:77"].actionable)
+        self.assertNotIn(
+            "relationship:telegram:77", {item.id for item in snapshot.actionable}
         )
 
     def test_absolute_need_change_is_bounded_to_fifteen(self):
@@ -1685,6 +1849,7 @@ class MilanaServiceTests(unittest.IsolatedAsyncioTestCase):
             telegram_message_id=8,
             created_at=(NOW - timedelta(minutes=1)).isoformat(),
         )
+
         notice = {
             "source": "telegram",
             "notice_id": "tg:77:9",

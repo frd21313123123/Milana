@@ -11,6 +11,7 @@ from milana_phone import PhoneSessionStore
 from milana_schedule import load_routine
 from milana_service import MilanaService
 from milana_state import MilanaStateStore
+from jev_provider import JevConfig, JevResult
 from telegram_client import (
     AIConfig,
     MessageFlowConfig,
@@ -36,6 +37,52 @@ class _Responses:
     async def create(self, **request):
         self.requests.append(request)
         return self.values.pop(0)
+
+
+class _JevPhone:
+    def __init__(self):
+        self.requests = []
+
+    async def evaluate(self, **request):
+        self.requests.append(request)
+        return JevResult(
+            model="jev-1.13.0",
+            answers={
+                "decision": {
+                    "type": "choice",
+                    "choice": "continue",
+                    "confidence": 0.95,
+                    "probabilities": {
+                        "continue": 0.95,
+                        "put_away": 0.03,
+                        "go_to_sleep": 0.02,
+                    },
+                },
+                "duration": {
+                    "type": "choice",
+                    "choice": "medium",
+                    "confidence": 0.9,
+                    "probabilities": {"short": 0.05, "medium": 0.9, "long": 0.05},
+                },
+                "dialog_0": {
+                    "type": "choice",
+                    "choice": "reply",
+                    "confidence": 0.9,
+                    "probabilities": {
+                        "skip": 0.03,
+                        "read": 0.03,
+                        "reply": 0.9,
+                        "react": 0.04,
+                    },
+                },
+            },
+            input_tokens=200,
+            output_tokens=50,
+            elapsed_ms=10,
+        )
+
+    async def record_rejection(self, _scenario, _exc):
+        return None
 
 
 class _Supervisor:
@@ -192,6 +239,40 @@ class PhoneSessionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.state.close()
         self.memory.close()
         self.tmp.cleanup()
+
+    async def test_jev_phone_plan_avoids_main_model_when_confident(self):
+        responses = _Responses([])
+        jev = _JevPhone()
+        config = AIConfig(
+            api_key="test",
+            model="fake",
+            instructions="персона",
+            temperature=0.7,
+            max_output_tokens=1200,
+            phone_session=PhoneSessionConfig(enabled=True),
+            jev=JevConfig(enabled=True, api_key="test"),
+        )
+        service = MilanaService(
+            config=config,
+            model_client=SimpleNamespace(responses=responses),
+            memory=self.memory,
+            state=self.state,
+            routine=load_routine(),
+            rpc_server=SimpleNamespace(),
+            supervisor=self.supervisor,
+            jev_client=jev,
+            dev_mode=False,
+            now=lambda: SERVICE_NOW,
+        )
+        session = service.phone_sessions.start("test", SERVICE_NOW, 120)
+        planned = await service._plan_phone_session(session, None)
+        self.assertEqual(planned.remaining_plan[0].target_ref, "77")
+        self.assertEqual(planned.remaining_plan[0].intent, "reply")
+        self.assertEqual(
+            planned.next_decision_at, SERVICE_NOW + timedelta(seconds=300)
+        )
+        self.assertEqual(len(jev.requests), 1)
+        self.assertEqual(responses.requests, [])
 
     async def test_incoming_turn_plans_one_session_then_uses_existing_delivery(self):
         responses = _Responses(

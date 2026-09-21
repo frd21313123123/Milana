@@ -2,6 +2,7 @@ import json
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from milana import (
     MilanaAgent,
@@ -102,6 +103,7 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
         on_activate=None,
         tool_result_content=None,
         telegram_fast_enabled=False,
+        sticker_intent_classifier=None,
     ):
         registry = load_default_registry()
         core = _Executor()
@@ -122,8 +124,78 @@ class MilanaAgentTests(unittest.IsolatedAsyncioTestCase):
             core_executor=core,
             tool_result_content=tool_result_content,
             telegram_fast_enabled=telegram_fast_enabled,
+            sticker_intent_classifier=sticker_intent_classifier,
         )
         return agent, model, core, telegram, stickers
+
+    async def test_advisory_sticker_classifier_can_enable_sticker_route(self):
+        async def activate(_spec, _session):
+            return {
+                "target_token": "turn-only-token",
+                "target_ref": 10,
+                "messages": [
+                    {
+                        "message_id": 7,
+                        "text": "я бы не отказалась от котика в виде стикера",
+                    }
+                ],
+                "history": [],
+            }
+
+        classifier = AsyncMock(return_value=True)
+        agent, model, _, _, _ = self._agent(
+            [_final(_telegram_final())],
+            on_activate=activate,
+            telegram_fast_enabled=True,
+            sticker_intent_classifier=classifier,
+        )
+        result = await agent.run_turn(
+            TurnTrigger(
+                kind="telegram_notice",
+                occurred_at=datetime.now(timezone.utc),
+                metadata=_production_notice_metadata(),
+            )
+        )
+        self.assertEqual(classifier.await_count, 1)
+        self.assertIn("open_sticker_picker", _tool_names(model.responses.requests[0]))
+        self.assertEqual(result.active_skills, ("telegram", "telegram.stickers"))
+
+    async def test_local_sticker_command_bypasses_advisory_classifier(self):
+        async def activate(_spec, _session):
+            return {
+                "target_token": "turn-only-token",
+                "target_ref": 10,
+                "messages": [{"message_id": 7, "text": "/sticker"}],
+                "history": [],
+            }
+
+        classifier = AsyncMock(return_value=False)
+        agent, model, _, _, _ = self._agent(
+            [_final(_telegram_final())],
+            on_activate=activate,
+            telegram_fast_enabled=True,
+            sticker_intent_classifier=classifier,
+        )
+        await agent.run_turn(
+            TurnTrigger(
+                kind="telegram_notice",
+                occurred_at=datetime.now(timezone.utc),
+                metadata=_production_notice_metadata(),
+            )
+        )
+        self.assertEqual(classifier.await_count, 0)
+        self.assertIn("open_sticker_picker", _tool_names(model.responses.requests[0]))
+
+    async def test_jev_reflect_route_exposes_no_tools(self):
+        agent, model, *_ = self._agent([_final(empty_turn_payload())])
+        await agent.run_turn(
+            TurnTrigger(
+                kind="heartbeat",
+                occurred_at=datetime.now(timezone.utc),
+                metadata={"_jev_route": "reflect"},
+            )
+        )
+        self.assertEqual(model.responses.requests[0]["tools"], [])
 
     def test_provider_step_cannot_mix_tool_calls_with_final_payload(self):
         response = SimpleNamespace(
