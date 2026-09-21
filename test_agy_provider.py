@@ -22,6 +22,7 @@ from agy_provider import (
     AgyError,
     AgyModelClient,
     AgyQuotaError,
+    _AgyResponses,
     strip_ansi,
 )
 from milana.builtin_skills import SCHEDULE_MESSAGE_TOOL
@@ -41,6 +42,34 @@ class StripAnsiTests(unittest.TestCase):
 
     def test_empty_text_stays_empty(self) -> None:
         self.assertEqual(strip_ansi(""), "")
+
+
+class AgyEnvelopeCompatibilityTests(unittest.TestCase):
+    def test_legacy_telegram_envelope_is_expanded_to_active_schema(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "state_update": {
+                    "type": "object",
+                    "properties": {
+                        "current_intention": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}]
+                        }
+                    },
+                },
+                "future_actions": {"type": "array"},
+                "telegram": {"type": "object"},
+            },
+        }
+        output = _AgyResponses._normalize_legacy_telegram_output(
+            json.dumps({"messages": ["ответ"], "reaction": None}),
+            {"schema": schema},
+        )
+        payload = json.loads(output)
+        self.assertEqual(payload["telegram"]["messages"], ["ответ"])
+        self.assertIsNone(payload["telegram"]["target_token"])
+        self.assertEqual(payload["future_actions"], [])
+        self.assertIsNone(payload["state_update"]["current_intention"])
 
 
 class AgyModelClientTests(unittest.TestCase):

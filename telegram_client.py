@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from openai import AsyncOpenAI, BadRequestError, OpenAIError
 from telethon import TelegramClient, events, functions, types, utils
@@ -108,6 +108,14 @@ DEFAULT_MAX_OUTPUT_TOKENS = 1200
 SYSTEM_RANDOM = random.SystemRandom()
 LOGGER = logging.getLogger(__name__)
 _JEV_MISSING_KEY_WARNED = False
+# Keep provider failover inside the Gemini family.  Antigravity exposes several
+# Gemini aliases, but switching to Claude/OpenAI here would violate the
+# configured provider preference and hide a regional Gemini outage.
+DEFAULT_AGY_FAILOVER_MODELS = (
+    "gemini-3.8-flash-high",
+    "gemini-3.7-flash-medium",
+    "gemini-3.6-flash-medium",
+)
 SUPPORTED_IMAGE_MIME_TYPES = {
     "image/gif",
     "image/jpeg",
@@ -1763,16 +1771,34 @@ class _GeminiQuotaFallbackResponses:
         self._client = client
 
     async def create(self, **request: Any) -> Any:
-        try:
-            return await self._client.gemini_client.responses.create(**request)
-        except AgyError as exc:
+        clients = self._client._candidate_agy_clients()
+        primary_error: AgyError | None = None
+        for index, agy_client in clients:
+            try:
+                response = await agy_client.responses.create(**request)
+                if index != self._client._active_agy_index:
+                    self._client._active_agy_index = index
+                    print(
+                        "Основная модель agy недоступна; использую резервную "
+                        f"модель {self._client._agy_model_name(index)}",
+                        file=sys.stderr,
+                    )
+                return response
+            except AgyError as exc:
+                if primary_error is None:
+                    primary_error = exc
+                continue
+
+        if self._client.openai_client is not None:
             print(
-                "Gemini не смогла ответить; для этого вызова использую "
-                f"OpenAI ({self._client.openai_model}), а следующий снова "
-                f"отправлю в Gemini: {exc}",
+                "Модели agy недоступны; для этого вызова использую "
+                f"OpenAI ({self._client.openai_model})",
                 file=sys.stderr,
             )
             return await self._client._create_openai_response(request)
+        if primary_error is not None:
+            raise primary_error
+        raise AgyError("Резервные модели agy не вернули ответ")
 
 
 class GeminiQuotaFallbackClient:
@@ -1781,16 +1807,52 @@ class GeminiQuotaFallbackClient:
     def __init__(
         self,
         gemini_client: Any,
-        openai_client: Any,
+        openai_client: Any | None,
         *,
         openai_model: str,
+        agy_fallback_models: Sequence[str] = (),
+        agy_reasoning_effort: str = DEFAULT_AGY_REASONING_EFFORT,
+        agy_client_factory: Any = AgyModelClient,
     ) -> None:
         if not openai_model.strip():
             raise ValueError("Резервная модель OpenAI не может быть пустой")
         self.gemini_client = gemini_client
         self.openai_client = openai_client
         self.openai_model = openai_model.strip()
+        self._agy_clients = (gemini_client,)
+        self._agy_models = (getattr(gemini_client, "model", "gemini"),)
+        self._agy_fallback_models = tuple(
+            model.strip()
+            for model in agy_fallback_models
+            if isinstance(model, str) and model.strip()
+        )
+        self._agy_reasoning_effort = agy_reasoning_effort
+        self._agy_client_factory = agy_client_factory
+        self._active_agy_index = 0
         self.responses = _GeminiQuotaFallbackResponses(self)
+
+    def _candidate_agy_clients(self) -> tuple[tuple[int, Any], ...]:
+        if len(self._agy_clients) == 1 and self._agy_fallback_models:
+            for model in self._agy_fallback_models:
+                if model in self._agy_models:
+                    continue
+                self._agy_clients += (
+                    self._agy_client_factory(
+                        model=model,
+                        reasoning_effort=self._agy_reasoning_effort,
+                    ),
+                )
+                self._agy_models += (model,)
+        order = list(range(len(self._agy_clients)))
+        if self._active_agy_index in order and self._active_agy_index != 0:
+            order.remove(self._active_agy_index)
+            order.insert(0, self._active_agy_index)
+        return tuple((index, self._agy_clients[index]) for index in order)
+
+    def _agy_model_name(self, index: int) -> str:
+        if 0 <= index < len(self._agy_models):
+            return self._agy_models[index]
+        return "unknown"
 
     @classmethod
     def _openai_compatible_input(cls, value: Any) -> Any:
@@ -1828,14 +1890,13 @@ def create_model_client(config: AIConfig) -> Any:
             model=config.model,
             reasoning_effort=config.agy_reasoning_effort,
         )
-        return (
-            GeminiQuotaFallbackClient(
-                gemini_client,
-                AsyncOpenAI(api_key=config.api_key),
-                openai_model=config.openai_fallback_model,
-            )
-            if config.api_key
-            else gemini_client
+        openai_client = AsyncOpenAI(api_key=config.api_key) if config.api_key else None
+        return GeminiQuotaFallbackClient(
+            gemini_client,
+            openai_client,
+            openai_model=config.openai_fallback_model,
+            agy_fallback_models=DEFAULT_AGY_FAILOVER_MODELS,
+            agy_reasoning_effort=config.agy_reasoning_effort,
         )
     if config.provider == LM_STUDIO_LLM_CHOICE:
         return LMStudioModelClient(

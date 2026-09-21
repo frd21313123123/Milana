@@ -556,12 +556,15 @@ class _AgyResponses:
                 except asyncio.CancelledError:
                     pass
         format_name = ""
+        response_format: dict[str, Any] = {}
         if "text" in request:
-            format_name = str(
-                ((request.get("text") or {}).get("format") or {}).get("name", "")
+            candidate_format = (request.get("text") or {}).get("format") or {}
+            response_format = (
+                candidate_format if isinstance(candidate_format, dict) else {}
             )
+            format_name = str(response_format.get("name", ""))
             response_schema = (
-                ((request.get("text") or {}).get("format") or {}).get("schema") or {}
+                response_format.get("schema") or {}
             )
             schema_properties = (
                 response_schema.get("properties", {})
@@ -593,6 +596,9 @@ class _AgyResponses:
                         )
                     ),
                 )
+            )
+            output_text = self._normalize_legacy_telegram_output(
+                output_text, response_format
             )
         else:
             output_text = raw.strip()
@@ -657,6 +663,76 @@ class _AgyResponses:
             agy_sticker_actions=sticker_actions,
             agy_tool_calls=tool_calls,
         )
+
+    @classmethod
+    def _normalize_legacy_telegram_output(
+        cls, output_text: str, response_format: Mapping[str, Any]
+    ) -> str:
+        """Adapt the compact legacy envelope returned by alternate agy models."""
+
+        try:
+            payload = json.loads(output_text)
+        except (TypeError, json.JSONDecodeError):
+            return output_text
+        if not isinstance(payload, dict):
+            return output_text
+        schema = response_format.get("schema")
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if (
+            not isinstance(properties, dict)
+            or "telegram" not in properties
+            or "telegram" in payload
+            or set(payload) - {"messages", "reaction"}
+        ):
+            return output_text
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or any(
+            not isinstance(message, str) for message in messages
+        ):
+            return output_text
+        normalized = {
+            str(key): cls._schema_default(value)
+            for key, value in properties.items()
+            if key != "telegram"
+        }
+        normalized["telegram"] = {
+            "target_token": None,
+            "messages": messages,
+            "reaction": payload.get("reaction"),
+            "blacklist_sender": False,
+        }
+        return json.dumps(normalized, ensure_ascii=False)
+
+    @classmethod
+    def _schema_default(cls, schema: Any) -> Any:
+        if not isinstance(schema, dict):
+            return None
+        alternatives = schema.get("anyOf")
+        if isinstance(alternatives, list):
+            for alternative in alternatives:
+                if isinstance(alternative, dict) and alternative.get("type") == "null":
+                    return None
+            return cls._schema_default(alternatives[0]) if alternatives else None
+        schema_type = schema.get("type")
+        if schema_type == "object":
+            properties = schema.get("properties")
+            if not isinstance(properties, dict):
+                return {}
+            return {
+                str(key): cls._schema_default(value)
+                for key, value in properties.items()
+            }
+        if schema_type == "array":
+            return []
+        if schema_type == "boolean":
+            return False
+        if schema_type == "integer":
+            return 0
+        if schema_type == "number":
+            return 0.0
+        if schema_type == "string":
+            return ""
+        return None
 
 
 class AgyModelClient:

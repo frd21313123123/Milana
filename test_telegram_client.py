@@ -879,6 +879,39 @@ class SplitTelegramTextTests(unittest.TestCase):
 
 
 class GeminiQuotaFallbackClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agy_region_failure_switches_to_gemini_alternate_model(self) -> None:
+        gemini = MagicMock(model="gemini-3.8-flash-medium")
+        gemini.responses.create = AsyncMock(
+            side_effect=AgyError("Google отклонил запрос Gemini из-за сетевого региона")
+        )
+        alternate = MagicMock(model="gemini-3.8-flash-high")
+        expected = structured_response("Ответ через резервную модель")
+        alternate.responses.create = AsyncMock(return_value=expected)
+
+        def factory(*, model, reasoning_effort):
+            self.assertEqual(model, "gemini-3.8-flash-high")
+            self.assertEqual(reasoning_effort, "medium")
+            return alternate
+
+        client = GeminiQuotaFallbackClient(
+            gemini,
+            None,
+            openai_model="gpt-fallback",
+            agy_fallback_models=("gemini-3.8-flash-high",),
+            agy_reasoning_effort="medium",
+            agy_client_factory=factory,
+        )
+
+        with patch("builtins.print") as log:
+            first = await client.responses.create(model="gemini", input=[])
+            second = await client.responses.create(model="gemini", input=[])
+
+        self.assertIs(first, expected)
+        self.assertIs(second, expected)
+        gemini.responses.create.assert_awaited_once()
+        self.assertEqual(alternate.responses.create.await_count, 2)
+        self.assertEqual(log.call_count, 1)
+
     async def test_each_call_retries_gemini_and_falls_back_to_openai(self) -> None:
         gemini = MagicMock()
         gemini.responses.create = AsyncMock(
