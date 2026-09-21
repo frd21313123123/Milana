@@ -63,6 +63,7 @@ from milana_ipc import (
 from milana_memory import MilanaMemoryStore, PulseTask
 from milana_pulse import DelayedActionDispatcher
 from milana_schedule import ResponsePlan, WeeklyRoutine, load_routine
+from milana_life import LifePlanner
 from milana_scene import SceneEngine
 from milana_future_actions import FutureActionStore
 from milana_phone import PHONE_PLAN_SCHEMA, PhoneSession, PhoneSessionStore
@@ -432,12 +433,15 @@ class MilanaService:
         self.model_client = _RecoveringModelClient(model_client, self._recover_agy)
         self.memory = memory
         self.state = state
-        self.routine = routine
+        self.base_routine = routine
+        self.life = LifePlanner(state, routine, now=now, enabled=False if dev_mode else None)
+        self.schedule = self.life
+        self.routine = self.schedule
         self.rpc_server = rpc_server
         self.supervisor = supervisor
         self.dev_mode = bool(dev_mode)
         self._now = now
-        self.scene = SceneEngine(state, routine, now=now)
+        self.scene = SceneEngine(state, self.schedule, now=now)
         self.scene.tick()
         self.future_actions = FutureActionStore(state)
         self.future_actions.recover()
@@ -459,7 +463,7 @@ class MilanaService:
             )
         )
         self.staging = TurnStagingArea()
-        self.core_executor = CoreSkillExecutor(self.staging, routine, now=now)
+        self.core_executor = CoreSkillExecutor(self.staging, self.schedule, now=now)
         self.telegram_executor = TelegramSkillExecutor(
             self.staging,
             supervisor,
@@ -1119,7 +1123,7 @@ class MilanaService:
                     )
                     night_wake = len(notices) >= threshold
                 if not night_wake:
-                    plan = self.routine.plan_response(
+                    plan = self.schedule.plan_response(
                         received, last_attentive_at=attentive_at
                     )
                     plan = self.scene.adjust_response_plan(plan, now)
@@ -1427,7 +1431,7 @@ class MilanaService:
 
     def _sleep_context(self, session: PhoneSession) -> dict[str, Any]:
         now = self._now()
-        schedule = self.routine.state_at(now)
+        schedule = self.schedule.state_at(now)
         bedtime = schedule.current is not None and schedule.current.kind == "sleep"
         reminder = getattr(self.config, "phone_session", None)
         minimum = int(getattr(reminder, "sleep_reminder_min_seconds", 600))
@@ -1489,7 +1493,7 @@ class MilanaService:
             )
         if needs_plan:
             session = await self._plan_phone_session(session, trigger)
-        if self.routine.state_at(now).current is not None and self.routine.state_at(now).current.kind == "sleep":
+        if self.schedule.state_at(now).current is not None and self.schedule.state_at(now).current.kind == "sleep":
             self.scene.keep_phone_awake(session.next_decision_at, at=now)
 
         target = self._phone_target(trigger)
@@ -2160,9 +2164,11 @@ class MilanaService:
                         raise ValueError("Host did not resolve a durable sticker reference")
                     action.payload["sticker"] = dict(resolved["sticker"])
                     action.payload["_durable_reference"] = True
+        current_scene = self.scene.tick()
         future_plan = self.future_actions.stage_turn(
-            stage, result.payload, now=self._now(), scene=self.scene.tick(),
+            stage, result.payload, now=self._now(), scene=current_scene,
             schedule_end=self._next_transition_at(self._now()),
+            schedule_event_id=current_scene.metadata.get("planned_event_id"),
         )
         if telegram_turn and future_plan is not None:
             self.future_actions.prepare_plan(*future_plan)
@@ -2697,7 +2703,7 @@ class MilanaService:
         until = max(self._attention_until or now, now + timedelta(seconds=seconds))
         cursor = now
         while cursor < until:
-            state = self.routine.state_at(cursor)
+            state = self.schedule.state_at(cursor)
             if state.current is not None and state.current.kind == "sleep":
                 until = cursor
                 break
@@ -2726,7 +2732,7 @@ class MilanaService:
             if attention_version != self._attention_version:
                 attention_version = self._attention_version
                 now = self._now()
-                candidate = self.routine.plan_response(
+                candidate = self.schedule.plan_response(
                     now, last_attentive_at=self._attention_reference_at(now)
                 )
                 candidate = self.scene.adjust_response_plan(candidate, now)
@@ -2738,9 +2744,21 @@ class MilanaService:
                 message_count=len(notices), respond_at=plan.respond_at,
                 detail=plan.policy.label,
             )
-            delay = max(0.0, (plan.respond_at - self._now()).total_seconds())
+            now = self._now()
+            wake_at = plan.respond_at
+            transition = self._next_transition_at(now)
+            if transition is not None and now < transition < wake_at:
+                wake_at = transition
+            wakes_for_transition = wake_at < plan.respond_at
+            delay = max(0.0, (wake_at - now).total_seconds())
             if not delay:
-                return plan
+                if now >= plan.respond_at:
+                    return plan
+                candidate = self.schedule.plan_response(
+                    now, last_attentive_at=self._attention_reference_at(now)
+                )
+                plan = self.scene.adjust_response_plan(candidate, now)
+                continue
             timer = asyncio.create_task(asyncio.sleep(delay))
             activity = asyncio.create_task(changed.wait())
             try:
@@ -2748,7 +2766,15 @@ class MilanaService:
                     (timer, activity), return_when=asyncio.FIRST_COMPLETED
                 )
                 if timer in done:
-                    return plan
+                    if not wakes_for_transition:
+                        return plan
+                    now = self._now()
+                    if now >= plan.respond_at:
+                        return plan
+                    candidate = self.schedule.plan_response(
+                        now, last_attentive_at=self._attention_reference_at(now)
+                    )
+                    plan = self.scene.adjust_response_plan(candidate, now)
             finally:
                 for task in (timer, activity):
                     task.cancel()
@@ -2786,7 +2812,7 @@ class MilanaService:
             if self.phone_session_enabled:
                 active = self.phone_sessions.active()
                 if active is not None:
-                    scheduled = self.routine.state_at(now).current
+                    scheduled = self.schedule.state_at(now).current
                     if scheduled is not None and scheduled.kind == "sleep" and active.next_decision_at > now:
                         self.scene.keep_phone_awake(active.next_decision_at, at=now)
                     scene = self.scene.tick(now)
@@ -2883,7 +2909,7 @@ class MilanaService:
             self._start_attention_window(
                 max(1, int((session.next_decision_at - now).total_seconds()))
             )
-            if self.routine.state_at(now).current is not None and self.routine.state_at(now).current.kind == "sleep":
+            if self.schedule.state_at(now).current is not None and self.schedule.state_at(now).current.kind == "sleep":
                 self.scene.keep_phone_awake(session.next_decision_at, at=now)
             await self._set_presence(True)
 
@@ -3025,6 +3051,7 @@ class MilanaService:
     async def _state_context(self, trigger: TurnTrigger) -> Mapping[str, Any]:
         context_at = self._now()
         scene_context = self.scene.model_context(context_at)
+        scene_context["life_plan"] = self.life.model_context(context_at)
         if self.agent._is_compact_telegram_trigger(trigger):
             state = self.state.get_agent_state()
             chat_needs = {
@@ -3249,7 +3276,7 @@ class MilanaService:
         return content
 
     def _schedule_context(self, at: datetime) -> Mapping[str, Any]:
-        value = self.routine.state_at(at)
+        value = self.schedule.state_at(at)
         return {
             "now": value.now.isoformat(),
             "current": (
@@ -3271,16 +3298,16 @@ class MilanaService:
     def _is_sleeping(self, at: datetime) -> bool:
         if self.phone_session_enabled and self.phone_sessions.active() is not None:
             return False
-        current = self.routine.state_at(at).current
+        current = self.schedule.state_at(at).current
         return current is not None and current.kind == "sleep"
 
     def _next_transition_at(self, at: datetime) -> datetime | None:
-        return self.routine.state_at(at).next_at
+        return self.schedule.state_at(at).next_at
 
     def _next_awake_at(self, at: datetime) -> datetime | None:
         cursor = at
         for _ in range(32):
-            schedule = self.routine.state_at(cursor)
+            schedule = self.schedule.state_at(cursor)
             if schedule.current is None or schedule.current.kind != "sleep":
                 return cursor
             if schedule.next_at is None:
@@ -3292,7 +3319,7 @@ class MilanaService:
         cursor = window.started_at
         missed: list[dict[str, Any]] = []
         while cursor < window.ended_at and len(missed) < 64:
-            schedule = self.routine.state_at(cursor)
+            schedule = self.schedule.state_at(cursor)
             if schedule.current is not None:
                 item = {
                     "title": schedule.current.title,
@@ -3572,6 +3599,7 @@ class MilanaService:
                 "execute_future_action": lambda body: self.future_actions.reschedule_future_action(
                     require_id(body, "намерения"), self._now(), now=self._now()),
                 "scene": self.scene.snapshot,
+                "life_plan": self.life.snapshot,
                 "refresh_scene": self.scene.tick,
                 "end_scene": self.scene.end,
                 "next_scene": self.scene.generate_next,
@@ -3691,6 +3719,7 @@ class MilanaService:
         return {
             "service": "running",
             "scene": self.scene.snapshot(),
+            "life_plan": self.life.snapshot(self._now()),
             "future_actions": self.future_actions.snapshot(self._now()),
             "phone_session": self.phone_sessions.snapshot(),
             "dev_mode": self.dev_mode,

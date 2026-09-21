@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 from milana import TurnTrigger, empty_turn_payload
 from milana_future_actions import FutureActionStore, validate_operations
 from milana_heartbeat import MilanaHeartbeat, HeartbeatReason
+from milana_life import LifePlanner
+from milana_schedule import load_routine
 from milana_state import MilanaStateStore
 from milana_web import start_web_server
 import test_milana_service as service_tests
@@ -78,6 +80,29 @@ class FutureActionStorageTests(unittest.TestCase):
         self.assertIsNone(self.store.claim_due(NOW, busy=True))
         self.assertIsNotNone(self.store.claim_due(NOW + timedelta(minutes=6)))
         self.assertEqual(self.store.get(action_id)["attempts"], 1)
+
+    def test_schedule_event_tracks_linked_life_plan_event(self):
+        routine = load_routine()
+        planner = LifePlanner(self.state, routine, now=lambda: NOW, enabled=False)
+        event = planner.advance(NOW).current
+        action_id = self.store.create(
+            intention(trigger_type="schedule_event", due_at=(NOW + timedelta(minutes=1)).isoformat()),
+            target_id=77, now=NOW, schedule_end=event.actual_end,
+            origin={"planned_event_id": event.event_id},
+        )
+        moved_end = event.actual_end + timedelta(minutes=20)
+        with self.state.transaction() as db:
+            db.execute("UPDATE planned_events SET actual_end=?,updated_at=? WHERE event_id=?",
+                       (moved_end.timestamp(), NOW.timestamp(), event.event_id))
+        self.store.refresh_activity_ends()
+        self.assertEqual(datetime.fromisoformat(self.store.get(action_id)["due_at"]), moved_end)
+
+        cancelled_at = NOW + timedelta(minutes=2)
+        with self.state.transaction() as db:
+            db.execute("UPDATE planned_events SET status='cancelled',updated_at=? WHERE event_id=?",
+                       (cancelled_at.timestamp(), event.event_id))
+        self.store.refresh_activity_ends()
+        self.assertEqual(datetime.fromisoformat(self.store.get(action_id)["due_at"]), cancelled_at)
 
     def test_invalid_output(self):
         invalid = [None, {}, [{"intent": "hi"}], [operation(trigger_type="unknown", intent="hi")],

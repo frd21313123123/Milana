@@ -23,6 +23,28 @@
     "breaks_minutes": 90
   },
   "sport_hours": 0.5,
+  "life_planner": {
+    "enabled": true,
+    "daily_deviation_limit": 2,
+    "probabilities": {
+      "overslept": 0.10,
+      "commute_delay": 0.15,
+      "coffee_stop": 0.15,
+      "class_cancelled": 0.05,
+      "walk_extended": 0.20,
+      "store_visit": 0.15,
+      "series_late": 0.10
+    },
+    "durations_minutes": {
+      "overslept": [10, 30],
+      "commute_delay": [5, 20],
+      "coffee_stop": [10, 20],
+      "class_cancelled": [90, 90],
+      "walk_extended": [15, 40],
+      "store_visit": [15, 30],
+      "series_late": [20, 60]
+    }
+  },
   "response_behavior": {
     "default": {
       "available": true,

@@ -583,6 +583,10 @@ class WeeklyRoutine:
         self.online_behavior = _load_online_behavior(
             config.get("online_behavior", DEFAULT_ONLINE_BEHAVIOR)
         )
+        life_planner = config.get("life_planner", {})
+        if not isinstance(life_planner, Mapping):
+            raise ValueError("life_planner должен быть объектом")
+        self.life_planner = dict(life_planner)
         self.custom_events = self._load_custom_events(
             config.get("custom_events", {})
         )

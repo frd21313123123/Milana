@@ -55,6 +55,10 @@ class EmbeddedWebPanelTests(unittest.TestCase):
                     "session": {"id": "phone-1", "selected_chat": "77"},
                     "recent_actions": [],
                 },
+                "life_plan": lambda: {
+                    "enabled": True, "current": None, "next": None,
+                    "events": [], "decisions": [], "daily_deviation_limit": 2,
+                },
             },
             status_provider=lambda: self.service_status,
         )
@@ -89,6 +93,18 @@ class EmbeddedWebPanelTests(unittest.TestCase):
             html = response.read().decode("utf-8")
         self.assertIn('id="phone-status"', html)
         self.assertIn("renderPhone", html)
+
+    def test_life_plan_route_and_panel_block(self):
+        with urllib.request.urlopen(
+            self.panel.url + "api/life-plan", timeout=10
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(payload["enabled"])
+        self.assertEqual(payload["daily_deviation_limit"], 2)
+        with urllib.request.urlopen(self.panel.url, timeout=10) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn('id="life-plan-events"', html)
+        self.assertIn("renderLifePlan", html)
 
     def test_status_preserves_full_active_latency_distribution(self):
         self.service_status["telegram_latency"] = {

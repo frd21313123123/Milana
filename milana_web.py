@@ -1303,9 +1303,10 @@ class MilanaHandler(BaseHTTPRequestHandler):
             self.send_json(data)
             return
 
-        if path in {"/api/scene", "/api/future-actions", "/api/phone-session"}:
+        if path in {"/api/scene", "/api/life-plan", "/api/future-actions", "/api/phone-session"}:
             callback_name = {
                 "/api/scene": "scene",
+                "/api/life-plan": "life_plan",
                 "/api/future-actions": "future_actions",
                 "/api/phone-session": "phone_session",
             }[path]

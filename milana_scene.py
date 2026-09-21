@@ -87,18 +87,23 @@ TEMPLATES: Mapping[str, tuple[SceneTemplate, ...]] = {
         SceneTemplate("prepare", "занимаюсь домашними делами", .45),
     ),
     "sleep": (SceneTemplate("asleep", "сплю", 1, False, False),),
+    "coffee": (SceneTemplate("coffee", "зашла за кофе", .25),),
+    "store": (SceneTemplate("shopping", "выбираю продукты в магазине", .45),),
+    "series": (SceneTemplate("watching_series", "смотрю сериал", .4,
+                              fact=("watching", "сериал")),),
 }
 
 LOCATION_NAMES = {
     "home": "дома", "university": "в университете", "workplace": "на работе",
-    "outside": "на улице", "transit": "в дороге",
+    "outside": "на улице", "transit": "в дороге", "cafe": "в кофейне",
+    "shop": "в магазине",
 }
 ALLOWED_LOCATIONS = {
     "study": {"home", "university"}, "work": {"workplace"},
     "commute": {"transit"}, "walk": {"outside"}, "personal": {"home"},
-    "food": {"home", "university", "workplace"},
+    "food": {"home", "university", "workplace", "cafe"},
     "rest": {"home", "university", "workplace", "outside"},
-    "sport": {"home", "outside"}, "chores": {"home"}, "sleep": {"home"},
+    "sport": {"home", "outside"}, "chores": {"home", "shop"}, "sleep": {"home"},
 }
 MICRO_EVENTS = {
     "study": "сделала пометку в конспекте", "self_study": "перечитала сложный абзац",
@@ -106,6 +111,8 @@ MICRO_EVENTS = {
     "walk": "остановилась осмотреться", "personal": "ненадолго отвлеклась от своих дел",
     "food": "налила себе воды", "rest": "потянулась", "sport": "сделала короткую паузу",
     "chores": "убрала вещи на место",
+    "coffee": "сделала глоток кофе", "store": "положила покупку в корзину",
+    "series": "переключила следующую серию",
 }
 
 
@@ -210,7 +217,7 @@ class SceneEngine:
     """
 
     def __init__(
-        self, state: MilanaStateStore, routine: WeeklyRoutine,
+        self, state: MilanaStateStore, routine: Any,
         *, now: Callable[[], datetime] | None = None,
     ) -> None:
         self.state = state
@@ -253,30 +260,42 @@ class SceneEngine:
     def _choice(key: str, count: int) -> int:
         return int.from_bytes(hashlib.sha256(key.encode()).digest()[:4], "big") % count
 
-    def _block(self, at: datetime) -> tuple[str, str, datetime, str]:
-        schedule = self.routine.state_at(at)
+    def _block(self, at: datetime, db: sqlite3.Connection | None = None) -> tuple[str, str, datetime, str]:
+        try:
+            schedule = self.routine.state_at(at, db=db)
+        except TypeError:
+            schedule = self.routine.state_at(at)
         activity = schedule.current
         kind = activity.kind if activity else "personal"
         title = activity.title if activity else "Свободное время"
         end = schedule.next_at or at.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         # Includes end date: midnight-spanning blocks keep their identity.
-        key = f"{kind}:{title}:{activity.start if activity else '-'}:{end.isoformat()}"
+        key = getattr(activity, "event_id", None) or f"{kind}:{title}:{activity.start if activity else '-'}:{end.isoformat()}"
         return kind, title, end, key
 
     def _create(
         self, db: sqlite3.Connection, at: datetime, previous: SceneState | None,
         needs: Mapping[str, int], *, inferred: bool = False,
     ) -> SceneState:
-        kind, title, end, block_key = self._block(at)
-        family = "self_study" if kind == "study" and "самообуч" in title.lower() else kind
+        kind, title, end, block_key = self._block(at, db)
+        try:
+            planned = self.routine.state_at(at, db=db).current
+        except TypeError:
+            planned = self.routine.state_at(at).current
+        scenario = getattr(planned, "scenario", None)
+        family = {
+            "coffee_stop": "coffee", "store_visit": "store", "series_late": "series",
+        }.get(scenario, "self_study" if kind == "study" and "самообуч" in title.lower() else kind)
         old_location = previous.location_type if previous else "home"
         if old_location == "transit":
             old_location = previous.metadata.get("destination", "home") if previous else "home"
-        location = {
+        elif previous and previous.metadata.get("life_scenario") == "coffee_stop":
+            old_location = previous.metadata.get("destination", "home")
+        location = getattr(planned, "location", None) or {
             "study": "university", "self_study": "home", "work": "workplace",
             "commute": "transit", "walk": "outside",
         }.get(family, "home")
-        if kind in {"rest", "food"} and old_location in ALLOWED_LOCATIONS[kind]:
+        if getattr(planned, "location", None) is None and kind in {"rest", "food"} and old_location in ALLOWED_LOCATIONS[kind]:
             location = old_location
         energy = previous.energy if previous else 65.0
         hunger = previous.hunger if previous else 35.0
@@ -290,11 +309,31 @@ class SceneEngine:
         destination = None
         bridge = False
         if kind == "commute":
-            next_activity = self.routine.state_at(at).next_activity
-            destination = (
-                "university" if next_activity and next_activity.kind == "study"
-                and "самообуч" not in next_activity.title.lower()
-                else "workplace" if next_activity and next_activity.kind == "work" else "home"
+            try:
+                schedule_state = self.routine.state_at(at, db=db)
+            except TypeError:
+                schedule_state = self.routine.state_at(at)
+            next_activity = schedule_state.next_activity
+            if getattr(next_activity, "scenario", None) == "coffee_stop":
+                try:
+                    next_activity = self.routine.state_at(next_activity.actual_end, db=db).current
+                except TypeError:
+                    next_activity = self.routine.state_at(next_activity.actual_end).current
+            destination = getattr(next_activity, "location", None)
+            if destination in {None, "transit"}:
+                destination = (
+                    "university" if next_activity and next_activity.kind == "study"
+                    and "самообуч" not in next_activity.title.lower()
+                    else "workplace" if next_activity and next_activity.kind == "work" else "home"
+                )
+        elif scenario == "coffee_stop":
+            try:
+                after = self.routine.state_at(end, db=db).current
+            except TypeError:
+                after = self.routine.state_at(end).current
+            destination = getattr(after, "location", None) or (
+                "university" if after and after.kind == "study" else
+                "workplace" if after and after.kind == "work" else "home"
             )
         elif previous and old_location != location:
             # Explicit travel prevents a remote custom block from teleporting her.
@@ -313,12 +352,15 @@ class SceneEngine:
         if family == "personal" and needs.get("novelty", 0) >= 75:
             index = 0
         template = variants[index]
-        actual_kind = "study" if family == "self_study" else family
+        actual_kind = {"self_study": "study", "coffee": "food", "store": "chores",
+                       "series": "personal"}.get(family, family)
         metadata = {
             "block_key": block_key, "schedule_kind": kind, "schedule_title": title,
             "template_family": family, "variant": index, "phase_index": 0,
             "next_phase_at": (at + self._phase_duration(family, at, end)).isoformat(),
             "destination": destination, "bridge": bridge, "inferred": inferred,
+            "planned_event_id": getattr(planned, "event_id", None),
+            "life_scenario": scenario, "life_reason": getattr(planned, "reason", None),
             "micro_event_at": (at + min(timedelta(minutes=20), (end - at) / 2)).isoformat()
             if family in MICRO_EVENTS else None,
         }
@@ -390,7 +432,7 @@ class SceneEngine:
         metadata = dict(scene.metadata)
         family = metadata["template_family"]
         phase = metadata["phase_index"] + 1
-        if metadata["schedule_kind"] == "personal" and not metadata["bridge"]:
+        if metadata["schedule_kind"] == "personal" and not metadata["bridge"] and family == "personal":
             family = "food" if scene.hunger >= 70 else "rest" if scene.energy < 30 or needs.get("rest", 0) >= 80 else "personal"
         variants = TEMPLATES[family]
         index = (metadata["variant"] + 1) % len(variants)
@@ -407,7 +449,9 @@ class SceneEngine:
         template = variants[index]
         metadata.update(template_family=family, variant=index, phase_index=phase,
                         next_phase_at=(at + duration).isoformat())
-        scene = replace(scene, metadata=metadata, activity_type="study" if family == "self_study" else family,
+        actual_kind = {"self_study": "study", "coffee": "food", "store": "chores",
+                       "series": "personal"}.get(family, family)
+        scene = replace(scene, metadata=metadata, activity_type=actual_kind,
                         activity_title=template.title, activity_phase=template.key,
                         attention=template.attention, can_voice=scene.phone_available and template.can_voice,
                         can_photo=scene.phone_available and template.can_photo)
@@ -423,6 +467,9 @@ class SceneEngine:
         needs = self.state.get_agent_state().needs
         with self.state.transaction() as db:
             scene = self._current(db)
+            advance_plan = getattr(self.routine, "advance", None)
+            if callable(advance_plan):
+                advance_plan(now, energy=scene.energy if scene else 65.0, db=db)
             if scene is None:
                 row = db.execute("SELECT data FROM scenes ORDER BY started_at DESC,rowid DESC LIMIT 1").fetchone()
                 previous = SceneState.from_dict(json.loads(row[0])) if row else None
@@ -456,7 +503,7 @@ class SceneEngine:
                 else:
                     scene = self._phase(db, scene, boundary, needs)
             # Schedule edits/custom overrides may alter the current block early.
-            if self._block(now)[3] != scene.metadata["block_key"]:
+            if self._block(now, db)[3] != scene.metadata["block_key"]:
                 scene = self._evolve(db, scene, now)
                 scene = replace(scene, ended_at=now)
                 self._save(db, scene)
@@ -575,6 +622,8 @@ class SceneEngine:
                 f"Внимание занято на {scene.attention:.0%}; энергия {scene.energy:.0f}/100; голод {scene.hunger:.0f}/100.",
                 f"Телефон {'доступен' if scene.phone_available else 'недоступен'}, заряд {scene.phone_battery:.0f}%; голос {'можно' if scene.can_voice else 'нельзя'}, фото {'можно' if scene.can_photo else 'нельзя'}.",
                 f"До конца сцены около {minutes} мин.", *scene.micro_context]
+        if scene.metadata.get("life_reason"):
+            text.append(f"Причина отклонения от обычного расписания: {scene.metadata['life_reason']}.")
         for fact in snapshot["facts"][:8]:
             text.append(f"Временный факт: {fact['key']}={_dump(fact['value'])}.")
         for event in snapshot["events"][:5]:

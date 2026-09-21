@@ -208,7 +208,8 @@ class FutureActionStore:
             insert(db)
         return action_id
 
-    def stage_turn(self, stage, payload, *, now, scene, schedule_end):
+    def stage_turn(self, stage, payload, *, now, scene, schedule_end,
+                   schedule_event_id=None):
         """Validate capabilities and freeze relative triggers before any effects."""
         key = stage.action_key("final:messages")
         existing = self.plan(key)
@@ -263,7 +264,8 @@ class FutureActionStore:
                                          "origin_user_message_id": max(source_ids) if source_ids else None,
                                          "origin_turn_id": stage.turn_id,
                                          "origin_scene_id": scene.scene_id,
-                                         "origin_activity": scene.activity_title}})
+                                         "origin_activity": scene.activity_title,
+                                         "planned_event_id": schedule_event_id}})
             else:
                 action = self.get(op["id"])
                 if op["id"] in seen:
@@ -362,12 +364,18 @@ class FutureActionStore:
             rows = db.execute("SELECT id,record_json FROM future_actions WHERE status='pending' AND version=0").fetchall()
             for row in rows:
                 record = json.loads(row["record_json"])
-                if record.get("trigger_type") != "activity_end" or not record.get("origin_scene_id"):
-                    continue
-                scene = db.execute("SELECT ended_at FROM scenes WHERE scene_id=?", (record["origin_scene_id"],)).fetchone()
-                if scene and scene[0] is not None:
-                    due = timestamp(datetime.fromtimestamp(scene[0], timezone.utc))
-                    db.execute("UPDATE future_actions SET due_at=? WHERE id=?", (due, row["id"]))
+                if record.get("trigger_type") == "activity_end" and record.get("origin_scene_id"):
+                    scene = db.execute("SELECT ended_at FROM scenes WHERE scene_id=?", (record["origin_scene_id"],)).fetchone()
+                    if scene and scene[0] is not None:
+                        due = timestamp(datetime.fromtimestamp(scene[0], timezone.utc))
+                        db.execute("UPDATE future_actions SET due_at=? WHERE id=?", (due, row["id"]))
+                elif record.get("trigger_type") == "schedule_event" and record.get("planned_event_id"):
+                    event = db.execute("SELECT actual_end,status,updated_at FROM planned_events WHERE event_id=?",
+                                       (record["planned_event_id"],)).fetchone()
+                    if event:
+                        due_at = event[2] if event[1] == "cancelled" else event[0]
+                        due = timestamp(datetime.fromtimestamp(due_at, timezone.utc))
+                        db.execute("UPDATE future_actions SET due_at=? WHERE id=?", (due, row["id"]))
 
     def retry(self, action_id, now, error=None, *, postpone=False):
         with self.state.transaction() as db:
