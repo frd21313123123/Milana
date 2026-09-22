@@ -182,7 +182,11 @@ class TelegramAdapter(Protocol):
     async def set_presence(self, online: bool) -> None: ...
 
     async def read_messages(
-        self, target: str, limit: int
+        self,
+        target: str,
+        limit: int,
+        *,
+        message_ids: Sequence[int] | None = None,
     ) -> Sequence[Mapping[str, Any]]: ...
 
     async def list_dialogs(
@@ -835,11 +839,31 @@ class TelegramSkillHost:
         limit = payload.get("limit", 50)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise JsonRpcError(INVALID_PARAMS, "limit must be between 1 and 100")
+        raw_message_ids = payload.get("message_ids")
+        message_ids: tuple[int, ...] | None = None
+        if raw_message_ids is not None:
+            if (
+                not isinstance(raw_message_ids, list)
+                or not 1 <= len(raw_message_ids) <= 20
+                or any(
+                    isinstance(item, bool) or not isinstance(item, int) or item <= 0
+                    for item in raw_message_ids
+                )
+            ):
+                raise JsonRpcError(
+                    INVALID_PARAMS,
+                    "message_ids must contain between 1 and 20 positive integers",
+                )
+            message_ids = tuple(dict.fromkeys(raw_message_ids))
         reader = getattr(self.adapter, "read_messages", None)
         if not callable(reader):
             raise JsonRpcError(INTERNAL_ERROR, "Telegram adapter cannot read messages")
         try:
-            messages = reader(target, limit)
+            messages = (
+                reader(target, limit, message_ids=message_ids)
+                if message_ids is not None
+                else reader(target, limit)
+            )
             if inspect.isawaitable(messages):
                 messages = await messages
         except Exception as exc:
@@ -1134,12 +1158,24 @@ class TelethonTelegramAdapter:
         return tuple(notices[:limit])
 
     async def read_messages(
-        self, target: str, limit: int
+        self,
+        target: str,
+        limit: int,
+        *,
+        message_ids: Sequence[int] | None = None,
     ) -> Sequence[Mapping[str, Any]]:
         await self._ensure_connected()
         entity = await self.client.get_entity(target)
         messages: list[dict[str, Any]] = []
-        async for message in self.client.iter_messages(entity, limit=limit):
+        if message_ids is None:
+            source = [
+                message
+                async for message in self.client.iter_messages(entity, limit=limit)
+            ]
+        else:
+            fetched = await self.client.get_messages(entity, ids=list(message_ids))
+            source = [message for message in fetched if message is not None]
+        for message in source:
             message_id = getattr(message, "id", None)
             if isinstance(message_id, bool) or not isinstance(message_id, int):
                 continue

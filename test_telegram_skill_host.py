@@ -31,6 +31,7 @@ class _Adapter:
         self.materialize_calls = []
         self.terminal_acknowledged = []
         self.dialogs = []
+        self.read_calls = []
 
     async def start(self, callback):
         self.callback = callback
@@ -91,6 +92,10 @@ class _Adapter:
     async def list_dialogs(self, offset, limit):
         return self.dialogs[offset : offset + limit]
 
+    async def read_messages(self, target, limit, *, message_ids=None):
+        self.read_calls.append((target, limit, message_ids))
+        return [{"message_id": item, "text": f"message {item}"} for item in (message_ids or ())]
+
 
 def _request(method, *, key=None):
     return RequestContext(
@@ -111,6 +116,25 @@ class TelegramSkillHostTests(unittest.IsolatedAsyncioTestCase):
         for turn_id in tuple(self.host._turn_dirs):
             await self.host.cleanup_turn(turn_id)
         self.tmp.cleanup()
+
+    async def test_read_messages_can_fetch_exact_linked_ids(self):
+        result = await self.host._handle_read_messages(
+            {
+                "target": "@nova_txt",
+                "limit": 2,
+                "message_ids": [154802, 154802, 154803],
+            },
+            _request("telegram.read_messages"),
+        )
+
+        self.assertEqual(
+            self.adapter.read_calls,
+            [("@nova_txt", 2, (154802, 154803))],
+        )
+        self.assertEqual(
+            [message["message_id"] for message in result["messages"]],
+            [154802, 154803],
+        )
 
     async def test_open_issues_turn_scoped_token_then_authorizes_action(self):
         opened = await self.host._handle_open(

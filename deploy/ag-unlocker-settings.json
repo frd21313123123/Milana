@@ -1,0 +1,16 @@
+{
+  "client_patch": false,
+  "auto_patch": true,
+  "patch_declined": false,
+  "dns": true,
+  "local_proxy": true,
+  "builtin_exits": false,
+  "disabled_providers": [],
+  "rotate_providers": true,
+  "provider_order": [],
+  "vpn_detect": true,
+  "verify_tls": true,
+  "own_proxy": "",
+  "own_proxy_enabled": false,
+  "manual_paths": []
+}

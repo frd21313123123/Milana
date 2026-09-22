@@ -34,6 +34,7 @@ from agy_provider import (
     AgyModelClient,
     AgyQuotaError,
 )
+from agy_recovery import is_unlocker_recoverable_error
 from lm_studio_provider import LMStudioModelClient
 from jev_provider import (
     DEFAULT_JEV_BASE_URL,
@@ -1787,6 +1788,8 @@ class _GeminiQuotaFallbackResponses:
             except AgyError as exc:
                 if primary_error is None:
                     primary_error = exc
+                if is_unlocker_recoverable_error(exc):
+                    break
                 continue
 
         if self._client.openai_client is not None:

@@ -39,8 +39,10 @@ from agy_recovery import (
     DEFAULT_UNLOCKER_PATH,
     activate_unlocker_async,
     extract_unlocker_key,
+    extract_unlocker_message_ids,
     installed_unlocker_version,
     is_unlocker_recoverable_error,
+    restart_unlocker_proxy_async,
 )
 from milana import (
     MilanaAgent,
@@ -697,7 +699,15 @@ class MilanaService:
         now = time.monotonic()
         async with self._agy_recovery_lock:
             now = time.monotonic()
-            if now - self._agy_recovered_at < 90.0:
+            if now - self._agy_recovered_at < 3.0:
+                return True
+            if await restart_unlocker_proxy_async():
+                self._agy_recovered_at = time.monotonic()
+                print(
+                    "Antigravity proxy restarted after a regional denial; "
+                    "retrying Gemini",
+                    file=sys.stderr,
+                )
                 return True
             if now - self._agy_recovery_attempt_at < 300.0:
                 return False
@@ -727,6 +737,32 @@ class MilanaService:
             if not isinstance(messages, list):
                 return False
             key = extract_unlocker_key(messages, version)
+            if not key:
+                message_ids = extract_unlocker_message_ids(messages)
+                if message_ids:
+                    try:
+                        linked = await self.supervisor.request(
+                            "telegram.read_messages",
+                            {
+                                "target": "@nova_txt",
+                                "limit": len(message_ids),
+                                "message_ids": list(message_ids),
+                            },
+                            timeout=30.0,
+                        )
+                    except Exception as exc:
+                        print(
+                            "Antigravity recovery could not read the linked "
+                            f"Telegram key: {type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
+                        return False
+                    if isinstance(linked, Mapping):
+                        linked_messages = linked.get("messages", [])
+                        if isinstance(linked_messages, list):
+                            key = extract_unlocker_key(
+                                [*messages, *linked_messages], version
+                            )
             if not key:
                 return False
             activated = await activate_unlocker_async(binary, key)
