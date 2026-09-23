@@ -879,6 +879,18 @@ class SplitTelegramTextTests(unittest.TestCase):
 
 
 class GeminiQuotaFallbackClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_gemini_agy_models_cannot_be_automatic_fallbacks(self) -> None:
+        for model in ("claude-sonnet-4-6", "gpt-oss-120b-medium"):
+            with self.subTest(model=model), self.assertRaisesRegex(
+                ValueError, "должны быть вариантами Gemini"
+            ):
+                GeminiQuotaFallbackClient(
+                    MagicMock(model="gemini-3.8-flash-medium"),
+                    None,
+                    openai_model="unused",
+                    agy_fallback_models=(model,),
+                )
+
     async def test_agy_generic_failure_switches_to_gemini_alternate_model(self) -> None:
         gemini = MagicMock(model="gemini-3.8-flash-medium")
         gemini.responses.create = AsyncMock(

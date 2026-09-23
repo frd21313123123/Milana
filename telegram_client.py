@@ -1824,11 +1824,22 @@ class GeminiQuotaFallbackClient:
         self.openai_model = openai_model.strip()
         self._agy_clients = (gemini_client,)
         self._agy_models = (getattr(gemini_client, "model", "gemini"),)
-        self._agy_fallback_models = tuple(
+        fallback_models = tuple(
             model.strip()
             for model in agy_fallback_models
             if isinstance(model, str) and model.strip()
         )
+        non_gemini_models = [
+            model
+            for model in fallback_models
+            if not model.startswith("gemini-") or model not in AGY_MODEL_ALIASES
+        ]
+        if non_gemini_models:
+            raise ValueError(
+                "Автоматические резервные модели agy должны быть вариантами Gemini: "
+                + ", ".join(non_gemini_models)
+            )
+        self._agy_fallback_models = fallback_models
         self._agy_reasoning_effort = agy_reasoning_effort
         self._agy_client_factory = agy_client_factory
         self._active_agy_index = 0
